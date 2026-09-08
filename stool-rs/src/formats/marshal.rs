@@ -68,10 +68,8 @@ impl<'a> Marshal<'a> {
                 }
                 return Ok(v);
             }
-            if c <= 127 {
-                return Ok(c as i64 - 5);
-            }
-            return Err(format!("marshal long 非法字节 0x{c:02x} @{}", self.pos));
+            // i8 上限即 127（0x7F），到此处必然是直接值区间 0x05..=0x7F
+            return Ok(c as i64 - 5);
         }
         // c < 0
         let mag = -(c as i16);

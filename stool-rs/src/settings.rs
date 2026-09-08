@@ -14,6 +14,22 @@ pub struct Config {
     pub unrpyc: String,
     pub python: String,
     pub proxy: String,
+    /// 机翻引擎（OpenAI 兼容）配置
+    #[serde(default)]
+    pub mtl_base_url: String,
+    #[serde(default)]
+    pub mtl_key: String,
+    #[serde(default)]
+    pub mtl_model: String,
+    #[serde(default = "default_mtl_batch")]
+    pub mtl_batch: u32,
+    /// 术语表：每行一条 `原文=译文`，注入机翻 system prompt 保证译名一致
+    #[serde(default)]
+    pub mtl_glossary: String,
+}
+
+fn default_mtl_batch() -> u32 {
+    20
 }
 
 impl Default for Config {
@@ -28,6 +44,11 @@ impl Default for Config {
             unrpyc: String::new(),
             python: String::new(),
             proxy: "http://127.0.0.1:7892".into(),
+            mtl_base_url: String::new(),
+            mtl_key: String::new(),
+            mtl_model: String::new(),
+            mtl_batch: default_mtl_batch(),
+            mtl_glossary: String::new(),
         }
     }
 }

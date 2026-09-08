@@ -78,7 +78,24 @@ impl Engine for RpgMakerMvPlugin {
         Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
     }
     fn capabilities(&self) -> Vec<Op> {
-        vec![Op::Extract, Op::Repack, Op::TextExtract, Op::TextImport, Op::Save]
+        vec![Op::Extract, Op::Repack, Op::TextExtract, Op::TextImport, Op::TextInject, Op::Save]
+    }
+    fn text_inject(&self, ctx: &Ctx, json_path: &Path) -> OpOutcome {
+        // 未指定或指定的 JSON 不存在时，回退到游戏目录下的 MTool 默认文件名
+        let json = match json_path.exists() {
+            true => json_path.to_path_buf(),
+            false => ctx.root.join("translation.json"),
+        };
+        if !json.exists() {
+            return OpOutcome::fail(format!(
+                "未找到翻译 JSON（{} 不存在）。格式：{{\"原文\":\"译文\"}}，可从“文本提取”的 CSV 生成",
+                json.display()
+            ));
+        }
+        match crate::features::inject::install(ctx.root, &json, self.id()) {
+            Ok(m) => OpOutcome::ok(m),
+            Err(e) => OpOutcome::fail(e),
+        }
     }
     fn describe(&self, root: &Path) -> String {
         match Self::data_dir(root) {
@@ -1247,7 +1264,22 @@ impl Engine for HtmlGamePlugin {
         Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
     }
     fn capabilities(&self) -> Vec<Op> {
-        vec![Op::Extract, Op::Repack]
+        vec![Op::Extract, Op::Repack, Op::TextInject]
+    }
+
+    /// JSON 注入汉化：入口 HTML 挂脚本标签 + DOM 文本节点运行时替换（Canvas 除外）。
+    fn text_inject(&self, ctx: &Ctx, json_path: &Path) -> OpOutcome {
+        let json = match json_path.exists() {
+            true => json_path.to_path_buf(),
+            false => ctx.root.join("translation.json"),
+        };
+        if !json.exists() {
+            return OpOutcome::fail(format!("未找到翻译 JSON（{} 不存在）", json.display()));
+        }
+        match crate::features::inject::install(ctx.root, &json, self.id()) {
+            Ok(m) => OpOutcome::ok(m),
+            Err(e) => OpOutcome::fail(e),
+        }
     }
     fn describe(&self, root: &Path) -> String {
         if !list_files_by_ext(root, &["asar"]).is_empty() { "Electron asar".into() } else { "明文前端代码".into() }

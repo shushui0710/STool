@@ -69,6 +69,8 @@ struct StoolApp {
     worker: Option<JoinHandle<()>>,
     csv_path: PathBuf,
     csv_path_str: String,
+    inj_json_str: String,
+    inj_status: Option<(bool, usize, String)>, // (已注入, 条目数, JSON 路径)
     save_locations: Vec<(String, PathBuf)>,
     mod_name: String,
     mods: Vec<crate::features::mods::ModEntry>,
@@ -130,6 +132,25 @@ struct StoolApp {
     // ---- 外部工具下载 ----
     dl_busy: Arc<AtomicBool>,
     dl_result: Arc<Mutex<Option<(String, Result<PathBuf, String>)>>>,
+
+    // ---- 机器翻译 ----
+    mtl_base_url: String,
+    mtl_key: String,
+    mtl_model: String,
+    mtl_batch: String,
+    mtl_glossary: String,
+
+    // ---- 备份还原 / 双档案切换 ----
+    bak_list: Vec<PathBuf>,
+    bak_scan_done: bool,
+
+    // ---- 后台检测 / 后台加载（拖放与检测不阻塞界面） ----
+    det_busy: Arc<AtomicBool>,
+    det_result: Arc<Mutex<Option<(Vec<Detection>, Vec<(String, PathBuf)>, Vec<crate::features::mods::ModEntry>, PathBuf)>>>,
+    save_load_result: Arc<Mutex<Option<Result<saves::SaveDoc, String>>>>,
+    pv_list_result: Arc<Mutex<Option<(PathBuf, Vec<PathBuf>)>>>,
+    /// 启动时是否已尝试自动检测（STOOL_GAME 环境变量指定目录）
+    boot_detect_done: bool,
 }
 
 impl Default for StoolApp {
@@ -165,10 +186,12 @@ impl Default for StoolApp {
             worker: None,
             csv_path: PathBuf::from("stool_text.csv"),
             csv_path_str: "stool_text.csv".into(),
+            inj_json_str: String::new(),
+            inj_status: None,
             save_locations: Vec::new(),
             mod_name: String::new(),
             mods: Vec::new(),
-            cfg,
+            cfg: cfg.clone(),
             settings_saved_at: None,
             toast: None,
             start: std::time::Instant::now(),
@@ -221,26 +244,81 @@ impl Default for StoolApp {
 
             dl_busy: Arc::new(AtomicBool::new(false)),
             dl_result: Arc::new(Mutex::new(None)),
+
+            mtl_base_url: cfg.mtl_base_url.clone(),
+            mtl_key: cfg.mtl_key.clone(),
+            mtl_model: cfg.mtl_model.clone(),
+            mtl_batch: cfg.mtl_batch.to_string(),
+            mtl_glossary: cfg.mtl_glossary.clone(),
+
+            bak_list: Vec::new(),
+            bak_scan_done: false,
+
+            det_busy: Arc::new(AtomicBool::new(false)),
+            det_result: Arc::new(Mutex::new(None)),
+            save_load_result: Arc::new(Mutex::new(None)),
+            pv_list_result: Arc::new(Mutex::new(None)),
+            boot_detect_done: false,
         }
     }
 }
 
 impl StoolApp {
+    /// 引擎检测改为后台执行：立即返回并提示，避免大目录拖放/检测时界面假死。
     fn refresh_detections(&mut self) {
         self.game_root = PathBuf::from(self.game_root_str.trim());
         self.csv_path = PathBuf::from(self.csv_path_str.trim());
-        self.detections = self.registry.detect_all(&self.game_root);
-        self.selected = self.detections.iter().position(|d| d.ok()).or(Some(0));
-        self.save_locations = crate::features::saves::find_save_locations(&self.game_root);
-        self.mods = crate::features::mods::list_mods(&self.game_root);
-        self.rt_auto_tried = false;
-        self.log(format!("已检测 {}", self.game_root.display()));
+        if self.game_root.as_os_str().is_empty() {
+            return;
+        }
+        if self.det_busy.load(Ordering::Relaxed) {
+            self.toast = Some(("检测正在进行中，请稍候…".into(), std::time::Instant::now()));
+            return;
+        }
+        self.det_busy.store(true, Ordering::Relaxed);
+        self.toast = Some(("正在后台检测引擎…".into(), std::time::Instant::now()));
+        self.log(format!("▶ 后台检测 {}", self.game_root.display()));
+        let root = self.game_root.clone();
+        let result = self.det_result.clone();
+        std::thread::spawn(move || {
+            // 检测器无状态，在线程内新建，避免跨线程共享
+            let registry = Registry::new();
+            let dets = registry.detect_all(&root);
+            let saves = crate::features::saves::find_save_locations(&root);
+            let mods = crate::features::mods::list_mods(&root);
+            if let Ok(mut r) = result.lock() {
+                *r = Some((dets, saves, mods, root));
+            }
+        });
+    }
+
+    /// 轮询后台检测结果（每帧调用）。
+    fn poll_det_result(&mut self) {
+        let ready = self.det_result.lock().ok().and_then(|mut r| r.take());
+        if let Some((dets, saves, mods, root)) = ready {
+            self.det_busy.store(false, Ordering::Relaxed);
+            if root == self.game_root {
+                // 期间目录没被再次更换才应用结果
+                self.detections = dets;
+                self.selected = self.detections.iter().position(|d| d.ok()).or(Some(0));
+                self.save_locations = saves;
+                self.mods = mods;
+                self.rt_auto_tried = false;
+                self.log(format!("✔ 检测完成 {}", root.display()));
+                self.toast = Some(("检测完成".into(), std::time::Instant::now()));
+            }
+        }
     }
 
     fn log(&self, msg: String) {
         if let Ok(mut logs) = self.shared.logs.lock() {
             let el = self.start.elapsed().as_secs();
             logs.push(format!("[{:02}:{:02}] {}", el / 60, el % 60, msg));
+            // 日志封顶：只保留最近 500 条，避免日志页越来越卡
+            if logs.len() > 500 {
+                let over = logs.len() - 500;
+                logs.drain(0..over);
+            }
         }
     }
 
@@ -249,6 +327,15 @@ impl StoolApp {
     }
 
     fn spawn(&mut self, name: &str, f: impl FnOnce(Arc<Shared>, PathBuf, PathBuf) -> OpOutcome + Send + 'static) {
+        // 执行前环境预检：目录有效性 + 可写性，避免任务跑到一半才失败
+        if !self.game_root.exists() {
+            self.toast = Some((format!("游戏目录不存在，请先在首页选择有效目录: {}", self.game_root.display()), std::time::Instant::now()));
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(self.out_dir.clone()) {
+            self.toast = Some((format!("输出目录不可用: {e}"), std::time::Instant::now()));
+            return;
+        }
         if self.worker.as_ref().map(|h| !h.is_finished()).unwrap_or(false) {
             self.toast = Some(("已有任务在执行，请等待或取消".into(), std::time::Instant::now()));
             return;
@@ -338,22 +425,42 @@ fn exec_op(
         Op::Unlock => engine.unlock(&ctx),
         Op::TextExtract => engine.text_extract(&ctx, csv.unwrap_or(&out.join("text.csv"))),
         Op::TextImport => engine.text_import(&ctx, csv.unwrap_or(&out.join("text.csv"))),
+        Op::TextInject => engine.text_inject(&ctx, csv.unwrap_or(&root.join("translation.json"))),
     }
 }
 
 impl eframe::App for StoolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // STOOL_GAME=<目录>：启动即自动检测（调试/截图/自动化用）
+        if !self.boot_detect_done {
+            self.boot_detect_done = true;
+            if let Ok(g) = std::env::var("STOOL_GAME") {
+                if !g.trim().is_empty() && self.game_root_str.trim().is_empty() {
+                    self.game_root_str = g.trim().to_string();
+                    self.refresh_detections();
+                }
+            }
+        }
+
         self.poll_worker();
 
-        // 拖放：文件夹 → 首页检测；文件 → 存档编辑器加载
+        // 拖放：立即给出加载反馈，重活全部放后台线程，避免界面假死
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped.iter() {
             if let Some(p) = &f.path {
                 if self.page == Page::Preview {
                     if p.is_dir() {
                         self.pv_dir_str = p.display().to_string();
-                        self.pv_files = preview::list_media(p);
                         self.pv_sel = None;
+                        self.toast = Some(("已收到目录，正在后台扫描媒体文件…".into(), std::time::Instant::now()));
+                        let dir = p.clone();
+                        let result = self.pv_list_result.clone();
+                        std::thread::spawn(move || {
+                            let files = preview::list_media(&dir);
+                            if let Ok(mut r) = result.lock() {
+                                *r = Some((dir, files));
+                            }
+                        });
                     } else if p.is_file() {
                         self.pv_sel = Some(p.clone());
                         if let Some(parent) = p.parent() {
@@ -367,25 +474,51 @@ impl eframe::App for StoolApp {
                 }
                 if p.is_dir() {
                     self.game_root_str = p.display().to_string();
-                    self.refresh_detections();
                     self.page = Page::Home;
-                    self.toast = Some((format!("已检测拖入的游戏目录"), std::time::Instant::now()));
+                    self.toast = Some(("已收到游戏目录，正在后台检测…".into(), std::time::Instant::now()));
+                    self.refresh_detections();
                 } else if p.is_file() {
                     self.save_path_str = p.display().to_string();
-                    match saves::SaveDoc::load(p) {
-                        Ok(d) => {
-                            self.save_doc = Some(d);
-                            self.save_hits.clear();
-                            self.save_sel = None;
-                            self.save_dirty = false;
-                            self.save_edit_bufs.clear();
-                            self.page = Page::Save;
-                            self.toast = Some(("存档已加载（拖放）".into(), std::time::Instant::now()));
+                    self.page = Page::Save;
+                    self.toast = Some(("已收到文件，正在后台加载存档…".into(), std::time::Instant::now()));
+                    let sp = p.clone();
+                    let result = self.save_load_result.clone();
+                    std::thread::spawn(move || {
+                        let res = saves::SaveDoc::load(&sp).map_err(|e| e.to_string());
+                        if let Ok(mut r) = result.lock() {
+                            *r = Some(res);
                         }
-                        Err(e) => self.toast = Some((format!("加载失败: {e}"), std::time::Instant::now())),
-                    }
+                    });
                 }
             }
+        }
+
+        // 后台检测结果 / 存档加载结果 / 预览目录扫描结果
+        self.poll_det_result();
+        if let Ok(mut r) = self.save_load_result.lock() {
+            if let Some(res) = r.take() {
+                match res {
+                    Ok(d) => {
+                        self.save_doc = Some(d);
+                        self.save_hits.clear();
+                        self.save_sel = None;
+                        self.save_dirty = false;
+                        self.save_edit_bufs.clear();
+                        self.toast = Some(("存档加载完成".into(), std::time::Instant::now()));
+                    }
+                    Err(e) => self.toast = Some((format!("存档加载失败: {e}"), std::time::Instant::now())),
+                }
+            }
+        }
+        if let Ok(mut r) = self.pv_list_result.lock() {
+            if let Some((dir, files)) = r.take() {
+                if PathBuf::from(self.pv_dir_str.trim()) == dir {
+                    self.pv_files = files;
+                }
+            }
+        }
+        if self.det_busy.load(Ordering::Relaxed) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
         // 内存扫描后台任务完成提醒 + 保持重绘
@@ -636,6 +769,64 @@ impl StoolApp {
                 }
             }
         });
+        // ---- 推荐流程卡（按检测到的引擎给出下一步） ----
+        if let Some(d) = self.selected_det() {
+            let (flow, go_page, go_label) = match d.plugin_id.as_str() {
+                "rpgmaker_mv" => (
+                    "该游戏可直接运行时汉化：① 文本页提取 → 机翻/人工翻译 → 注入 JSON（不用改游戏文件）；改数值请用“运行时修改”页连接游戏。",
+                    Page::Text,
+                    "去文本汉化页",
+                ),
+                "renpy" => (
+                    "Ren'Py 游戏：解包页反编译脚本 → 文本页提取 CSV → 机翻 → 回填；或直接写 {\"原文\":\"译文\"} JSON 注入。",
+                    Page::Text,
+                    "去文本汉化页",
+                ),
+                "kirikiri" => (
+                    "KiriKiri 游戏：解包页解出数据 → 文本页提取 → 机翻 → 回填 → 解包页“封包”写回（自动备份，可用设置页“切换原版/汉化封包”）。",
+                    Page::Extract,
+                    "去解包页",
+                ),
+                "rpgmaker_rgss" => (
+                    "RGSS（XP/VX/VX Ace）游戏：解包页解包 → 文本页提取 CSV → 机翻 → 回填；改数值可用“内存扫描”。",
+                    Page::Text,
+                    "去文本汉化页",
+                ),
+                "html_game" => (
+                    "HTML/Electron 游戏：写 {\"原文\":\"译文\"} 的 JSON → 文本页注入，运行时替换文本。",
+                    Page::Text,
+                    "去文本汉化页",
+                ),
+                "nscripter" => (
+                    "NScripter 游戏：文本页提取 nscript.dat 对白 → 翻译 → 回填（自动重新加密，原文件备份）。",
+                    Page::Text,
+                    "去文本汉化页",
+                ),
+                "wolf" | "unity" | "godot" => (
+                    "该引擎经外部工具（WolfDec/AssetRipper/GDRE）解包：先到“设置”页点“⬇ 下载”获取工具，再回解包页解包，之后走文本汉化流程。",
+                    Page::Settings,
+                    "去设置页下载工具",
+                ),
+                _ => (
+                    "已识别引擎。左侧页面按用途排列：解包资源、文本汉化、存档编辑、MOD 补丁。",
+                    Page::Extract,
+                    "去解包页",
+                ),
+            };
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("💡 推荐流程").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button(go_label).clicked() {
+                            self.page = go_page;
+                        }
+                    });
+                });
+                ui.label(RichText::new(flow).small());
+            });
+        }
     }
 
     fn page_extract(&mut self, ui: &mut egui::Ui) {
@@ -655,7 +846,13 @@ impl StoolApp {
         ui.horizontal_wrapped(|ui| {
             for cap in caps {
                 let enabled = matches!(cap, Op::Extract | Op::Decompile | Op::Save | Op::Unlock);
-                let tip = if enabled { "" } else { "（请用 CLI 执行）" };
+                let tip = if enabled {
+                    ""
+                } else if matches!(cap, Op::TextExtract | Op::TextImport | Op::TextInject) {
+                    "（见文本汉化页）"
+                } else {
+                    "（请用 CLI 执行）"
+                };
                 let btn = egui::Button::new(format!("{}{}", cap.label(), tip));
                 if ui.add_enabled(enabled || matches!(cap, Op::Repack), btn).clicked() {
                     self.run_plugin_op(cap, HashMap::new());
@@ -886,44 +1083,308 @@ impl StoolApp {
     }
 
     fn page_text(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, "对话文本提取 / 翻译回填", "提取台词到 CSV → 翻译 → 回填，实现汉化");
+        page_header(ui, "文本 / 汉化", "两条汉化通道：左=CSV 回填（改动游戏资源文件）；右=JSON 运行时注入（MTool 式，不改游戏文件）");
         let Some(d) = self.selected_det().cloned() else {
             ui.label("请先在首页完成检测。");
             return;
         };
         ui.label(format!("当前引擎: {} ({})", d.name, d.plugin_id));
-        ui.add_space(4.0);
+        ui.add_space(6.0);
+
+        // ---- 共享：机翻引擎配置（两条通道共用） ----
+        ui.label(RichText::new("机翻引擎（两条通道共用；也可不用机翻，人工翻译后直接走通道第 3 步）").strong());
         ui.horizontal(|ui| {
-            ui.label("CSV:");
-            ui.add_sized([ui.available_width() - 110.0, 22.0], egui::TextEdit::singleline(&mut self.csv_path_str));
-            if ui.button("...").clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).save_file() {
-                    self.csv_path_str = p.display().to_string();
-                    self.csv_path = p;
+            if ui.small_button("预设: DeepSeek").clicked() {
+                self.mtl_base_url = "https://api.deepseek.com".into();
+                self.mtl_model = "deepseek-chat".into();
+            }
+            if ui.small_button("预设: 智谱（glm-4-flash 免费）").clicked() {
+                self.mtl_base_url = "https://open.bigmodel.cn/api/paas/v4".into();
+                self.mtl_model = "glm-4-flash".into();
+            }
+            if ui.small_button("预设: 本地 Ollama（免 Key）").clicked() {
+                self.mtl_base_url = "http://127.0.0.1:11434/v1".into();
+                self.mtl_model = "qwen2.5:7b".into();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("API 地址:");
+            ui.add_sized([170.0, 22.0], egui::TextEdit::singleline(&mut self.mtl_base_url));
+            ui.label("Key:");
+            ui.add_sized([140.0, 22.0], egui::TextEdit::singleline(&mut self.mtl_key).password(true));
+            ui.label("模型:");
+            ui.add_sized([130.0, 22.0], egui::TextEdit::singleline(&mut self.mtl_model));
+            ui.label("每批:");
+            ui.add_sized([42.0, 22.0], egui::TextEdit::singleline(&mut self.mtl_batch));
+        });
+        egui::CollapsingHeader::new(RichText::new("📖 术语表（可选，强制人名/地名/术语译名全文一致）").small())
+            .id_salt("mtl_glossary")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(RichText::new("每行一条，格式：原文=译文。示例：アリス=爱丽丝。机翻时逐条强制遵守。").weak().small());
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.mtl_glossary)
+                        .desired_rows(4)
+                        .desired_width(ui.available_width())
+                        .hint_text("アリス=爱丽丝\nポーション=药水"),
+                );
+            });
+        // 配置有变化就落盘
+        {
+            let c = &mut self.cfg;
+            let dirty = c.mtl_base_url != self.mtl_base_url
+                || c.mtl_key != self.mtl_key
+                || c.mtl_model != self.mtl_model
+                || c.mtl_glossary != self.mtl_glossary;
+            c.mtl_base_url = self.mtl_base_url.clone();
+            c.mtl_key = self.mtl_key.clone();
+            c.mtl_model = self.mtl_model.clone();
+            c.mtl_glossary = self.mtl_glossary.clone();
+            c.mtl_batch = self.mtl_batch.trim().parse().unwrap_or(c.mtl_batch);
+            if dirty {
+                let _ = crate::settings::save(&self.cfg);
+            }
+        }
+        let batch = self.mtl_batch.trim().parse::<usize>().unwrap_or(20).clamp(1, 100);
+        let mtl_ready = !self.mtl_base_url.trim().is_empty() && !self.mtl_model.trim().is_empty();
+
+        // ---- 两条通道并排 ----
+        ui.add_space(6.0);
+        ui.columns(2, |cols| {
+            // ============ 左：CSV 通道 ============
+            {
+                let ui = &mut cols[0];
+                ui.label(RichText::new("📄 CSV 通道 · 回填式汉化").strong());
+                ui.label(RichText::new(
+                    "数据流：游戏文件 → ①提取 → CSV → ②机翻/人工翻译 → ③回填 → 输出目录（按提示放回游戏）",
+                ).weak().small());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("CSV 文件:");
+                    ui.add_sized([ui.available_width() - 40.0, 22.0], egui::TextEdit::singleline(&mut self.csv_path_str));
+                    if ui.button("...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).save_file() {
+                            self.csv_path_str = p.display().to_string();
+                            self.csv_path = p;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                // ① 提取
+                if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("① 提取文本 → CSV")).clicked() {
+                    let plugin_id = d.plugin_id.clone();
+                    let csv = self.csv_path.clone();
+                    self.spawn("text_extract", move |shared, root, out| {
+                        let opts: HashMap<String, String> = HashMap::new();
+                        exec_op(Op::TextExtract, &plugin_id, shared, &root, &out, &opts, Some(&csv))
+                    });
+                }
+                // ② 机翻
+                if ui.add_enabled(mtl_ready, egui::Button::new("② 机翻 CSV（自动填充 translation 列）")).clicked() {
+                    let csv = self.csv_path.clone();
+                    let base = self.mtl_base_url.clone();
+                    let key = self.mtl_key.clone();
+                    let model = self.mtl_model.clone();
+                    let glossary = self.mtl_glossary.clone();
+                    self.spawn("机翻 CSV", move |shared, _root, _out| {
+                        let tr = crate::features::translate::OpenAiCompat { base_url: base, api_key: key, model, glossary };
+                        let cancel = shared.cancel.clone();
+                        let ps = shared.clone();
+                        let progress = move |f: f32, m: &str| {
+                            if let Ok(mut p) = ps.progress.lock() {
+                                *p = (f, m.to_string());
+                            }
+                        };
+                        match crate::features::translate::translate_csv(&csv, &tr, batch, &progress, &cancel) {
+                            Ok((a, t)) if a == 0 && t == 0 => crate::engines::OpOutcome::ok("没有待翻条目（译文已全部就绪）"),
+                            Ok((a, t)) => crate::engines::OpOutcome::okn(format!("机翻完成 {a}/{t} 条 → {}", csv.display()), a),
+                            Err(e) => crate::engines::OpOutcome::fail(e),
+                        }
+                    });
+                }
+                // ③ 回填
+                if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("③ 回填翻译（按 CSV translation 列写回）")).clicked() {
+                    let plugin_id = d.plugin_id.clone();
+                    let csv = self.csv_path.clone();
+                    self.spawn("text_import", move |shared, root, out| {
+                        let opts: HashMap<String, String> = HashMap::new();
+                        exec_op(Op::TextImport, &plugin_id, shared, &root, &out, &opts, Some(&csv))
+                    });
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(
+                    "适合：能改游戏资源文件的场景（回填后把输出目录内容放回游戏）。\
+                     人工翻译：用 Excel/WPS 打开 CSV 填 translation 列即可；机翻支持断点续翻。",
+                ).weak().small());
+            }
+            // ============ 右：JSON 通道 ============
+            {
+                let ui = &mut cols[1];
+                ui.label(RichText::new("💉 JSON 通道 · 运行时注入（MTool 式）").strong());
+                ui.label(RichText::new(
+                    "数据流：原文 → JSON（键=原文，值=译文）→ 机翻填空译文 → 注入 → 启动游戏即在内存里替换文本；移除注入即还原",
+                ).weak().small());
+                ui.add_space(6.0);
+                if self.inj_json_str.is_empty() {
+                    self.inj_json_str = self.game_root.join("translation.json").display().to_string();
+                }
+                ui.label(RichText::new("原文 JSON 从哪来（三选一）：").strong().small());
+                ui.label(RichText::new(
+                    "① 点下方\"从 CSV 生成\"——把左通道提取的 CSV 一键转成 JSON，原文自动去重（推荐）；\
+                     ② 手写 {\"原文\":\"译文\"}；③ 直接用 MTool 的 translation.json（格式兼容）",
+                ).weak().small());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("JSON 文件:");
+                    ui.add_sized([ui.available_width() - 40.0, 22.0], egui::TextEdit::singleline(&mut self.inj_json_str));
+                    if ui.button("...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                            self.inj_json_str = p.display().to_string();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                // ① 从 CSV 生成 JSON（原文来源主入口）
+                if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("① 从 CSV 生成 JSON 骨架（原文为键）")).clicked() {
+                    let csv = self.csv_path.clone();
+                    let jp = PathBuf::from(self.inj_json_str.trim());
+                    if !csv.exists() {
+                        self.toast = Some((
+                            format!("CSV 不存在，请先在左侧通道 ① 提取文本: {}", csv.display()),
+                            std::time::Instant::now(),
+                        ));
+                    } else {
+                        match crate::features::inject::csv_to_json_skeleton(&csv, &jp) {
+                            Ok((total, filled)) => {
+                                let msg = format!(
+                                    "已生成 {total} 条原文 → {}（{filled} 条已带译文，其余留空待机翻）",
+                                    jp.display()
+                                );
+                                self.log(format!("✔ {msg}"));
+                                self.toast = Some((msg, std::time::Instant::now()));
+                            }
+                            Err(e) => self.toast = Some((format!("生成失败: {e}"), std::time::Instant::now())),
+                        }
+                    }
+                }
+                // ② 机翻 JSON
+                if ui.add_enabled(mtl_ready, egui::Button::new("② 机翻 JSON（填充空译文）")).clicked() {
+                    let json = PathBuf::from(self.inj_json_str.trim());
+                    let base = self.mtl_base_url.clone();
+                    let key = self.mtl_key.clone();
+                    let model = self.mtl_model.clone();
+                    let glossary = self.mtl_glossary.clone();
+                    self.spawn("机翻注入 JSON", move |shared, _root, _out| {
+                        let tr = crate::features::translate::OpenAiCompat { base_url: base, api_key: key, model, glossary };
+                        let cancel = shared.cancel.clone();
+                        let ps = shared.clone();
+                        let progress = move |f: f32, m: &str| {
+                            if let Ok(mut p) = ps.progress.lock() {
+                                *p = (f, m.to_string());
+                            }
+                        };
+                        match crate::features::translate::translate_json(&json, &tr, batch, &progress, &cancel) {
+                            Ok((a, t)) if a == 0 && t == 0 => crate::engines::OpOutcome::ok("没有待翻条目（译文已全部就绪）"),
+                            Ok((a, t)) => crate::engines::OpOutcome::okn(format!("机翻完成 {a}/{t} 条 → {}", json.display()), a),
+                            Err(e) => crate::engines::OpOutcome::fail(e),
+                        }
+                    });
+                }
+                // ③ 注入 / ④ 移除 / 刷新
+                if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("③ 注入翻译（运行时替换，不改游戏文件）")).clicked() {
+                    let plugin_id = d.plugin_id.clone();
+                    let json = PathBuf::from(self.inj_json_str.trim());
+                    self.spawn("text_inject", move |shared, root, out| {
+                        let opts: HashMap<String, String> = HashMap::new();
+                        exec_op(Op::TextInject, &plugin_id, shared, &root, &out, &opts, Some(&json))
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("④ 移除注入（完全还原）").clicked() {
+                        let plugin_id = d.plugin_id.clone();
+                        self.spawn("text_uninject", move |shared, root, out| {
+                            let _ = (&shared, &out);
+                            match crate::features::inject::uninstall(&root, &plugin_id) {
+                                Ok(m) => crate::engines::OpOutcome::ok(m),
+                                Err(e) => crate::engines::OpOutcome::fail(e),
+                            }
+                        });
+                    }
+                    if ui.button("刷新状态").clicked() {
+                        let st = crate::features::inject::status(&self.game_root, &d.plugin_id);
+                        self.inj_status = Some((st.installed, st.entries, st.json_path));
+                    }
+                });
+                if let Some((installed, entries, jp)) = &self.inj_status {
+                    let tip = if *installed { "✔ 已注入" } else { "未注入" };
+                    ui.label(RichText::new(format!(
+                        "{tip} · {entries} 条译文 · 生效 JSON: {}",
+                        if jp.is_empty() { "（游戏目录下未发现）" } else { jp.as_str() }
+                    )).small());
+                }
+                ui.label(RichText::new(
+                    "说明：注入会在游戏 js/plugins.js 登记汉化插件（原件自动备份为 plugins.js.stool.bak），\
+                     翻译文件复制为游戏目录下的 stool_translate.json；启动游戏即生效。未命中映射的文本保留原文。",
+                ).weak().small());
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(RichText::new("机翻断点续翻：进度自动保存在旁车文件 <文件>.mtl.json，中断/失败后重跑自动从断点继续，全部完成后自动删除。本地 Ollama 需先运行 ollama serve。").weak().small());
+        ui.add_space(8.0);
+        ui.separator();
+
+        // ---- 翻译包：整包备份 / 迁移 / 分享 ----
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("翻译包").strong());
+            ui.label(RichText::new("把 CSV + 注入 JSON + 清单打包成单个 zip；导入后自动归位（JSON 进游戏目录可直接注入，CSV 进输出目录可回填/继续机翻）").weak().small());
+        });
+        ui.horizontal(|ui| {
+            let game_name = self
+                .game_root
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "game".into());
+            if ui.button("📦 导出翻译包...").clicked() {
+                let suggested = format!("{game_name}.stoolpack.zip");
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("翻译包 (zip)", &["zip"])
+                    .set_file_name(&suggested)
+                    .save_file()
+                {
+                    let json = PathBuf::from(self.inj_json_str.trim());
+                    match crate::features::tpack::export_pack(Some(&self.csv_path), Some(&json), &p, &d.plugin_id, &game_name) {
+                        Ok((n, filled)) => {
+                            let msg = format!("已打包 {n} 个文件 → {}（JSON 已填 {filled} 条译文）", p.display());
+                            self.log(format!("✔ {msg}"));
+                            self.toast = Some((msg, std::time::Instant::now()));
+                        }
+                        Err(e) => self.toast = Some((format!("导出失败: {e}"), std::time::Instant::now())),
+                    }
+                }
+            }
+            if ui.button("📥 导入翻译包...").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("翻译包 (zip)", &["zip"]).pick_file() {
+                    match crate::features::tpack::import_pack(&p, &self.game_root, &self.out_dir) {
+                        Ok(imp) => {
+                            let mut parts: Vec<String> = Vec::new();
+                            if let Some(jp) = &imp.json_path {
+                                self.inj_json_str = jp.display().to_string();
+                                parts.push(format!("JSON → {}（已填 {} 条译文，可点\"③ 注入翻译\"）", jp.display(), imp.json_filled));
+                            }
+                            if let Some(cp) = &imp.csv_path {
+                                self.csv_path_str = cp.display().to_string();
+                                self.csv_path = cp.clone();
+                                parts.push(format!("CSV → {}（可回填/继续机翻）", cp.display()));
+                            }
+                            let msg = format!("翻译包已导入（目标引擎: {}）: {}", imp.engine, parts.join("；"));
+                            self.log(format!("✔ {msg}"));
+                            self.toast = Some((msg, std::time::Instant::now()));
+                        }
+                        Err(e) => self.toast = Some((format!("导入失败: {e}"), std::time::Instant::now())),
+                    }
                 }
             }
         });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("① 提取文本 → CSV").clicked() {
-                let plugin_id = d.plugin_id.clone();
-                let csv = self.csv_path.clone();
-                self.spawn("text_extract", move |shared, root, out| {
-                    let opts: HashMap<String, String> = HashMap::new();
-                    exec_op(Op::TextExtract, &plugin_id, shared, &root, &out, &opts, Some(&csv))
-                });
-            }
-            if ui.button("② 回填翻译（CSV translation 列）").clicked() {
-                let plugin_id = d.plugin_id.clone();
-                let csv = self.csv_path.clone();
-                self.spawn("text_import", move |shared, root, out| {
-                    let opts: HashMap<String, String> = HashMap::new();
-                    exec_op(Op::TextImport, &plugin_id, shared, &root, &out, &opts, Some(&csv))
-                });
-            }
-        });
-        ui.add_space(8.0);
-        ui.label(RichText::new("流程：提取 → 在 Excel/WPS 中翻译 translation 列 → 回填 → 按提示将输出目录放回游戏。").weak());
     }
 
     // -----------------------------------------------------------------
@@ -1729,6 +2190,53 @@ impl StoolApp {
         }
         ui.add_space(12.0);
         ui.separator();
+        ui.label(RichText::new("备份与还原").strong());
+        ui.label(RichText::new(
+            "所有会改写游戏文件的操作（回填/封包/注入/存档回写）都会先在原文件旁留 .stool.bak 备份；\
+             对 repack 过的封包（xp3/pck/asar/rpa）可一键在 原版/汉化 之间切换，无需重新封包。",
+        ).weak().small());
+        ui.horizontal(|ui| {
+            if ui.button("🔍 扫描游戏目录备份").clicked() {
+                self.bak_list = crate::features::restore::find_backups(&self.game_root);
+                self.bak_scan_done = true;
+            }
+            if ui.button("⇄ 切换 原版/汉化 封包").clicked() {
+                match crate::features::restore::archive_toggle(&self.game_root) {
+                    Ok(m) => self.toast = Some((m, std::time::Instant::now())),
+                    Err(e) => self.toast = Some((format!("切换失败: {e}"), std::time::Instant::now())),
+                }
+            }
+            if self.bak_scan_done {
+                ui.label(RichText::new(format!("共 {} 个备份", self.bak_list.len())).weak().small());
+            }
+        });
+        if self.bak_scan_done {
+            if self.bak_list.is_empty() {
+                ui.label(RichText::new("未发现 .stool.bak 备份（做过回填/封包/注入后会出现）").weak().small());
+            } else {
+                egui::ScrollArea::vertical().max_height(180.0).auto_shrink([false, false]).show(ui, |ui| {
+                    let mut restore_idx: Option<usize> = None;
+                    for (i, bak) in self.bak_list.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(bak.display().to_string()).small());
+                            if ui.small_button("还原").clicked() {
+                                restore_idx = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = restore_idx {
+                        let bak = self.bak_list[i].clone();
+                        match crate::features::restore::restore_one(&bak) {
+                            Ok(m) => self.toast = Some((m, std::time::Instant::now())),
+                            Err(e) => self.toast = Some((format!("还原失败: {e}"), std::time::Instant::now())),
+                        }
+                        self.bak_list = crate::features::restore::find_backups(&self.game_root);
+                    }
+                });
+            }
+        }
+        ui.add_space(12.0);
+        ui.separator();
         ui.label(RichText::new("外部工具说明").strong());
         ui.label("推荐直接点上方“⬇ 下载”按钮：工具会从官方 GitHub Release 自动下载、解压到 ~/.stool/tools/ 并自动填好路径。下载不动时检查上方代理设置。手动安装的话：把可执行文件完整路径填到上方保存即可。");
     }
@@ -1742,7 +2250,9 @@ impl StoolApp {
             ]),
             ("📦 解包与汉化", vec![
                 "资源解包页：点按钮即可把封包里的图片/音频/脚本提取到输出目录，不会动游戏原文件",
-                "文本/汉化页：① 提取文本到 CSV → ② 在 Excel/WPS 里翻译 translation 列 → 回填",
+                "文本/汉化页分左右两条通道：CSV 通道=提取→机翻/人工→回填（改游戏资源文件）；JSON 通道=运行时注入（不改游戏文件）",
+                "JSON 通道的原文来源：点\"从 CSV 生成 JSON 骨架\"自动把提取结果转成 {\"原文\":\"译文\"}（兼容 MTool 的 translation.json），也可手写",
+                "机翻支持断点续翻与术语表（人名/术语译名全文一致）；人工翻译用 Excel/WPS 填 CSV 的 translation 列即可",
             ]),
             ("💾 存档编辑", vec![
                 "打开存档文件（MV 的在游戏目录 save/ 下，后缀 .rpgsave）→ 自动识别格式",
@@ -1968,9 +2478,11 @@ fn render_container(
     depth: usize,
 ) -> bool {
     let mut changed = false;
+    // 默认全部折叠：大存档（上千字段）全量展开会让每帧布局慢到卡顿；
+    // egui 会记住每项的展开状态，点开需要浏览的分支即可
     egui::CollapsingHeader::new(RichText::new(title).strong())
         .id_salt(ptr)
-        .default_open(depth < 1)
+        .default_open(false)
         .show(ui, |ui| {
             changed = render_json_node(ui, bufs, ptr, node, depth + 1);
         });

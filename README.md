@@ -33,6 +33,29 @@
 | Unity | 3D / 手游向游戏 | ✔（借助 AssetRipper 工具） | — | — | — | 存档位置定位 | 需要在设置页填写 AssetRipper 的路径 |
 | 识别不出的游戏 | — | 借助 GARbro 工具兜底 | — | — | — | — | 同时给出文件后缀特征提示，方便人工判断 |
 
+## MTool 式汉化（JSON 注入，不改游戏文件）
+
+除了"提取 CSV → 翻译 → 回填"这种会改写游戏数据文件的方式，还支持 **MTool 同款的运行时注入**：
+
+1. 准备一个翻译 JSON（兼容 MTool 的 `translation.json` 格式）：
+   ```json
+   { "原文": "中文译文", "Hello world": "你好，世界" }
+   ```
+   整句精确匹配；也允许分组嵌套（如 `{ "对话": { "原文": "译文" } }`，加载时自动拍平）。
+2. 打开"文本汉化"页，点 **③ 注入翻译**（或命令行 `stool-cli text-inject <游戏目录> -o 翻译.json`）。
+3. 启动游戏即生效：程序在内存里把命中的文本替换为中文，**不修改任何原始资源文件**；
+   没匹配到的文本自动保留原文。
+
+约定与还原：
+
+- 翻译文件会被复制为游戏目录下的 `stool_translate.json`（游戏运行时读取；Ren'Py 例外：映射直接写进 .rpy）；
+- 注入只新增/登记汉化文件（MV/MZ 登记 `js/plugins.js` 并自动备份原件；Ren'Py 新增独立 .rpy）；
+- 点"移除注入"（或 `stool-cli text-uninject <游戏目录>`）即可还原（MV/MZ 字节级还原）；
+- 支持的引擎：**RPG Maker MV / MZ**（NW.js 插件注入）、**Ren'Py**（`config.replace_text` 运行时替换）、
+  **HTML / Electron**（DOM 文本节点 MutationObserver 替换，Canvas 画面内的文本除外）；
+  其余引擎（RGSS/吉里吉里/Godot/NScripter/Unity/Wolf）文本封在私有封包或编译脚本里、无运行时注入点，
+  会明确提示改用"翻译回填"。
+
 ## 怎么修改存档？（存档编辑器）
 
 打开图形界面的"💾 存档编辑"页：
@@ -128,7 +151,33 @@ stool-cli save-edit <存档文件> --set /system/gold=99999 --set /items/1/count
 # 安装 / 管理 MOD（卸载时会自动还原被覆盖的原文件）
 stool-cli mod-install <游戏目录> <补丁目录> -n 补丁名称
 stool-cli mod-list / mod-enable / mod-disable / mod-uninstall <游戏目录> [补丁名称]
+
+# MTool 式 JSON 注入汉化（MV/MZ，运行时替换，不改游戏文件）
+stool-cli text-inject <游戏目录> -o 翻译.json
+stool-cli text-uninject <游戏目录>   # 移除注入，字节级还原
+
+# 把文本提取的 CSV 转成注入 JSON 骨架（原文为键；已有译文自动带入，其余留空待机翻）
+# GUI：文本/汉化页 → JSON 通道 → ① 从 CSV 生成 JSON 骨架
+stool-cli text-mtl text.csv --preset deepseek --key sk-xxx   # 先机翻 CSV
+# （GUI 里同样支持"从 CSV 生成"，生成后直接机翻 JSON → 注入）
+
+# 机器翻译（自动填充 CSV translation 列或注入 JSON 的空译文，断点续翻）
+stool-cli text-mtl text.csv --preset deepseek --key sk-xxx
+stool-cli text-mtl 翻译.json --base-url https://open.bigmodel.cn/api/paas/v4 --model glm-4-flash --key xxx
+# 预设：deepseek / zhipu / ollama（本地模型免 Key）；中断重跑自动从 <文件>.mtl.json 断点继续
+
+# 备份还原与 原版/汉化 封包切换
+stool-cli restore <游戏目录>            # 列出目录里所有 .stool.bak 备份
+stool-cli restore <备份文件.stool.bak>   # 用备份还原该文件（备份保留，可反复还原）
+stool-cli archive-toggle <游戏目录>      # repack 过的封包一键在 原版/汉化 间切换
+
+# 翻译包：CSV + 注入 JSON + 清单 打包成单个 zip（备份 / 换机 / 分享给同游戏玩家）
+stool-cli pack-export -o 包.stoolpack.zip --csv text.csv --json 翻译.json --engine rpgmaker_mv --game 游戏名
+stool-cli pack-import 包.stoolpack.zip <游戏目录>   # JSON 自动进游戏目录（可注入）、CSV 进输出目录
 ```
+
+**完整汉化工作流**：`text-extract` 提取 → `text-mtl` 机翻（或人工翻译 CSV）
+→ `text-import` 回填；或写好 JSON 后 `text-mtl` 机翻 → `text-inject` 运行时注入。
 
 ## 程序结构（给想参与开发的你）
 
@@ -137,7 +186,7 @@ src/
 ├── formats/   # 各种游戏文件格式的"读 / 写"实现，每个格式一个独立模块，可以单独拿去复用
 ├── engines/   # 引擎插件：每个引擎一个插件（如何识别它、它能做哪些事），统一注册进插件列表
 ├── features/  # 通用功能：文本表格读写、存档编辑器、运行时修改（MV/MZ 调试协议 + 内存扫描）、
-│              #   补丁管理、资源预览（图片/音频）、外部工具一键下载
+│              #   补丁管理、资源预览（图片/音频）、外部工具一键下载、MTool 式 JSON 注入汉化
 ├── cli.rs     # 命令行入口
 ├── gui.rs     # 图形界面（自动加载系统里的中文字体，界面不乱码）
 └── settings.rs# 配置文件（~/.stool/config.json，存放外部工具的路径）
@@ -163,7 +212,7 @@ src/
 
 ## 测试情况
 
-运行 `cargo test` 共 23 项测试，全部通过：
+运行 `cargo test` 共 39 项测试，全部通过：
 
 - 2 项：Ren'Py 进度记录文件的解析测试（内置在源码里）
 - 11 项：对每种游戏封包格式做"生成测试样本 → 解析 → 与原文件逐字节比对"的回环测试，
@@ -172,6 +221,13 @@ src/
 - 2 项：存档压缩算法（lz-string）与官方 Python 实现逐字节一致性 + 中文/emoji/长文本回环
 - 8 项：存档编辑器（加载/搜索/定位/修改/回写/备份）、未知格式嗅探、
   运行时修改的 JS 参数转义
+- 8 项：MTool 式 JSON 注入（MV plugins.js 补丁幂等、翻译 JSON 校验/拍平、
+  注入↔卸载字节级还原回环、Ren'Py .rpy 生成与转义、HTML 脚本注入与还原）；
+  游戏端 Hook 插件另经 Node 仿真环境 11 项断言验证
+- 3 项：机器翻译管线（CSV 批量填充与断点续翻、取消后从断点恢复、注入 JSON 嵌套拍平）
+- 2 项：备份还原（.stool.bak 单文件还原）与双档案切换（repack 后 原版/汉化 一键翻转，无关备份自动跳过）
+- 1 项：翻译包导出/导入回环（CSV+JSON 打包 → 新目录导入 → 内容逐字节一致、清单正确）
+- 1 项：CSV → 注入 JSON 骨架（原文去重为键、已有译文优先带入、空原文跳过）
 - 交叉验证：用 Python 生成真实 Ren'Py 游戏风格的封包索引文件，再用本程序
   识别并解包，提取结果与原文件逐字节一致
 

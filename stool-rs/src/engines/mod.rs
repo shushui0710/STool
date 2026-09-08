@@ -54,6 +54,7 @@ pub enum Op {
     Decompile,
     TextExtract,
     TextImport,
+    TextInject,
     Save,
     Unlock,
 }
@@ -66,6 +67,7 @@ impl Op {
             Op::Decompile => "脚本反编译",
             Op::TextExtract => "文本提取",
             Op::TextImport => "翻译回填",
+            Op::TextInject => "JSON 注入汉化",
             Op::Save => "存档编辑",
             Op::Unlock => "解锁辅助",
         }
@@ -121,6 +123,11 @@ pub trait Engine: Send + Sync {
     }
     fn text_import(&self, _ctx: &Ctx, _csv_path: &Path) -> OpOutcome {
         OpOutcome::fail("未实现")
+    }
+    /// JSON 注入汉化（运行时替换，不改游戏文件）。json_path 为翻译 JSON；
+    /// 传不存在/空路径时回退到 <游戏目录>/translation.json。
+    fn text_inject(&self, _ctx: &Ctx, _json_path: &Path) -> OpOutcome {
+        OpOutcome::fail("该引擎不支持运行时 JSON 注入（当前支持：RPG Maker MV/MZ、Ren'Py、HTML/Electron）")
     }
     fn save(&self, _ctx: &Ctx) -> OpOutcome {
         OpOutcome::fail("未实现")

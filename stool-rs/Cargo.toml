@@ -1,6 +1,6 @@
 [package]
 name = "stool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "STool — 多引擎成人游戏一站式综合工具（解包/封包/文本提取/本地化/MOD/存档）"
 license = "MIT"

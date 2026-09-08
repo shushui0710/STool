@@ -71,7 +71,23 @@ impl Engine for RenpyPlugin {
     }
 
     fn capabilities(&self) -> Vec<Op> {
-        vec![Op::Extract, Op::Repack, Op::Decompile, Op::TextExtract, Op::TextImport, Op::Save, Op::Unlock]
+        vec![Op::Extract, Op::Repack, Op::Decompile, Op::TextExtract, Op::TextImport, Op::TextInject, Op::Save, Op::Unlock]
+    }
+
+    /// MTool 式 JSON 注入：生成 game/stool_translate.rpy，利用 Ren'Py 的
+    /// config.replace_text 在文本显示前整句替换，不修改任何原始脚本。
+    fn text_inject(&self, ctx: &Ctx, json_path: &Path) -> OpOutcome {
+        let json = match json_path.exists() {
+            true => json_path.to_path_buf(),
+            false => ctx.root.join("translation.json"),
+        };
+        if !json.exists() {
+            return OpOutcome::fail(format!("未找到翻译 JSON（{} 不存在）", json.display()));
+        }
+        match crate::features::inject::install(ctx.root, &json, self.id()) {
+            Ok(m) => OpOutcome::ok(m),
+            Err(e) => OpOutcome::fail(e),
+        }
     }
 
     fn describe(&self, root: &Path) -> String {
