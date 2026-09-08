@@ -213,8 +213,15 @@ impl Engine for UnityPlugin {
                 )
             }
         };
+        // AssetRipper Console（0.3.x）的用法：<输入路径> -o <输出目录> -q，
+        // 不支持 -i；-q 让它在批处理/重定向下处理完直接退出，不等待按键。
         match Command::new(&ripper)
-            .args(["-i", ctx.root.to_string_lossy().as_ref(), "-o", ctx.out_dir.to_string_lossy().as_ref()])
+            .args([
+                ctx.root.to_string_lossy().as_ref(),
+                "-o",
+                ctx.out_dir.to_string_lossy().as_ref(),
+                "-q",
+            ])
             .output()
         {
             Ok(o) if o.status.success() => OpOutcome::ok(format!("AssetRipper 导出完成 → {}", ctx.out_dir.display())),
