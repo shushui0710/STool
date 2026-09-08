@@ -1,0 +1,24 @@
+# 构建产物
+stool-rs/target/
+
+# 真实游戏验证数据（体积大且含版权内容，不入库）
+verify/
+
+# 下载的外部辅助工具
+tools/
+
+# 项目本地数据
+.workbuddy/
+
+# 测试自动生成的样本
+tests/_fixtures/
+
+# 日志与临时文件
+*.log
+*.txt
+_launch.vbs
+__pycache__/
+.venv/
+
+# 依赖锁定文件
+Cargo.lock

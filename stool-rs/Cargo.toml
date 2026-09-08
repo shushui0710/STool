@@ -1,0 +1,43 @@
+[package]
+name = "stool"
+version = "0.1.0"
+edition = "2021"
+description = "STool — 多引擎成人游戏一站式综合工具（解包/封包/文本提取/本地化/MOD/存档）"
+license = "MIT"
+
+# 两个二进制：stool.exe = 图形界面（release 不弹控制台），stool-cli.exe = 命令行
+[[bin]]
+name = "stool"
+path = "src/main.rs"
+
+[[bin]]
+name = "stool-cli"
+path = "src/cli_main.rs"
+
+[dependencies]
+eframe = "0.29"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+walkdir = "2"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "gif", "tga", "tiff"] }
+rodio = { version = "0.19", default-features = false, features = ["wav", "vorbis", "mp3", "flac"] }
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip", "json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
