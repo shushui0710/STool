@@ -22,3 +22,6 @@ __pycache__/
 
 # 依赖锁定文件
 Cargo.lock
+
+# 本机专用 MSVC 链接器配置（路径写死本机版本，不应入库）
+stool-rs/.cargo/config.toml
