@@ -25,7 +25,7 @@ rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "gif", "tga", "tiff"] }
 rodio = { version = "0.19", default-features = false, features = ["wav", "vorbis", "mp3", "flac"] }
 ureq = { version = "2", default-features = false, features = ["native-tls", "gzip", "json"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 encoding_rs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
