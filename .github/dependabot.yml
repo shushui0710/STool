@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Rust 依赖：每周检查一次
+  - package-ecosystem: "cargo"
+    directory: "/stool-rs"
+    schedule:
+      interval: "weekly"
+  # CI 用到的 GitHub Actions 也保持更新
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

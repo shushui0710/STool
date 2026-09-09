@@ -1,0 +1,52 @@
+name: "🐛 Bug 报告"
+description: "某项功能不工作、报错或行为与预期不符"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先确认：程序版本是否为最新，问题是否能在最小步骤下复现。
+  - type: input
+    id: version
+    attributes:
+      label: "程序版本"
+      description: "STool 窗口左下角显示的版本号（如 v0.2.0）"
+      placeholder: "v0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: "游戏 / 引擎"
+      description: "游戏名（可打码）与首页检测到的引擎，如 RPG Maker MV"
+      placeholder: "某游戏 / RPG Maker MV"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: "复现步骤"
+      description: "从打开 STool 开始，一步步写清楚点了什么"
+      placeholder: |
+        1. 首页选择游戏目录并检测
+        2. 文本/汉化页点 ① 提取
+        3. 报错：xxx
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "期望行为与实际行为"
+      placeholder: "期望提取出文本，实际提示 xxx"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: "运行日志"
+      description: "“运行日志”页的内容（点右上角可复制），或命令行输出"
+  - type: input
+    id: os
+    attributes:
+      label: "系统版本"
+      placeholder: "Windows 11 23H2"

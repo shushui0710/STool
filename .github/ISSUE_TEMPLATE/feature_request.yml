@@ -1,0 +1,21 @@
+name: "💡 功能建议"
+description: "希望 STool 支持的新引擎、新格式或新功能"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: "想要什么功能"
+      description: "解决什么问题？越具体越好"
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: "涉及的游戏 / 引擎（如有）"
+      placeholder: "某 Galgame / KiriKiri"
+  - type: textarea
+    id: sample
+    attributes:
+      label: "相关线索"
+      description: "例如：同类工具的做法、能找到的格式资料、愿意提供的样本文件"

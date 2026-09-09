@@ -2,7 +2,7 @@
 name = "stool"
 version = "0.2.0"
 edition = "2021"
-description = "STool — 多引擎成人游戏一站式综合工具（解包/封包/文本提取/本地化/MOD/存档）"
+description = "STool — 多引擎 Galgame / 视觉小说一站式综合工具（解包/封包/文本提取/本地化/MOD/存档）"
 license = "MIT"
 
 # 两个二进制：stool.exe = 图形界面（release 不弹控制台），stool-cli.exe = 命令行
