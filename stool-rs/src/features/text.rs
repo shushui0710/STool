@@ -29,7 +29,7 @@ pub fn write_csv(out: &Path, rows: &[[String; 4]]) -> Result<(), String> {
     w.write_record(HEADERS).map_err(|e| e.to_string())?;
     for r in rows {
         // file 列必须是真实文件名（text_import 用它直接打开文件），而不是 id 的副本
-        w.write_record(&[&r[0], file_col_from_id(&r[0]), &r[1], &r[2], &r[3]])
+        w.write_record([&r[0], file_col_from_id(&r[0]), &r[1], &r[2], &r[3]])
             .map_err(|e| e.to_string())?;
     }
     w.flush().map_err(|e| e.to_string())?;
@@ -46,6 +46,23 @@ pub fn write_csv_rows(out: &Path, rows: &[[String; 5]]) -> Result<(), String> {
     }
     w.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn read_csv(path: &Path) -> Result<Vec<[String; 5]>, String> {
+    let mut r = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(path)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for rec in r.records() {
+        let rec = rec.map_err(|e| e.to_string())?;
+        let mut row: [String; 5] = Default::default();
+        for (i, cell) in rec.iter().enumerate().take(5) {
+            row[i] = cell.to_string();
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -76,21 +93,4 @@ mod tests {
         assert_eq!(rows[3][1], "nscript.dat");
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-pub fn read_csv(path: &Path) -> Result<Vec<[String; 5]>, String> {
-    let mut r = csv::ReaderBuilder::new()
-        .flexible(true)
-        .from_path(path)
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for rec in r.records() {
-        let rec = rec.map_err(|e| e.to_string())?;
-        let mut row: [String; 5] = Default::default();
-        for (i, cell) in rec.iter().enumerate().take(5) {
-            row[i] = cell.to_string();
-        }
-        out.push(row);
-    }
-    Ok(out)
 }

@@ -5,6 +5,7 @@
 //! - position 递减到 0 时重载下一个字符
 //! - 前导 2 位：0 → 8 位字面量，1 → 16 位字面量，2 → 结束
 //! - 字典槽 0~2 为占位（"0"/"1"/"2"），槽 3 = 首字符，dictSize 从 4 起
+//!
 //! 使用 UTF-16 码元（Vec<u16>）保持与 JS String 的语义一致（含增补平面代理对）。
 
 fn key_index(c: u8) -> i32 {
@@ -102,7 +103,7 @@ pub fn decompress_from_base64(input: &str) -> Option<String> {
             return Some(String::new());
         }
         let c = r.read_bits(num_bits);
-        let entry: Vec<u16>;
+        
         match c {
             0 => {
                 let ch = r.read_bits(8) as u16;
@@ -128,14 +129,14 @@ pub fn decompress_from_base64(input: &str) -> Option<String> {
             enlarge_in = 1usize << num_bits;
             num_bits += 1;
         }
-        if c_idx < dictionary.len() && !dictionary[c_idx].is_empty() {
-            entry = dictionary[c_idx].clone();
+        let entry: Vec<u16> = if c_idx < dictionary.len() && !dictionary[c_idx].is_empty() {
+            dictionary[c_idx].clone()
         } else if c_idx == dict_size {
             // 特殊情形：引用刚要创建的词条 w + w[0]
-            entry = [w.as_slice(), &[w[0]]].concat();
+            [w.as_slice(), &[w[0]]].concat()
         } else {
             return None;
-        }
+        };
         result.extend_from_slice(&entry);
         // 新词条：w + entry[0]
         dictionary.push([w.as_slice(), &[entry[0]]].concat());

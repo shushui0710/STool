@@ -1,0 +1,11 @@
+# STool 代码风格（宽行风格，非 rustfmt 默认）
+#
+# 本项目历史代码使用手工维护的「宽行」风格：函数签名 / 方法链 / println! 参数
+# 等常超过 rustfmt 默认的 100 列。此配置把宽度对齐到 120 并放开小启发式，
+# 使编辑器「保存时格式化」与 `cargo fmt` 尽量贴近既有风格，而不是反过来。
+#
+# 注意：CI 不对 rustfmt 做门禁（见 .github/workflows/ci.yml 的说明）。
+# 因为全量 `cargo fmt` 会产生约 2000 行、跨越 37 个文件的改动，
+# 与「保持既有代码风格一致」的目标冲突，故仅作为风格指引保留。
+max_width = 120
+use_small_heuristics = "Max"

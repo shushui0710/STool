@@ -6,6 +6,7 @@
 //!   ...（子命令与 stool 相同）
 
 fn main() {
+    stool::diag::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         println!("STool 命令行版 —— 图形界面请双击 stool.exe");

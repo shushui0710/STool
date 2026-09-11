@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{safe_out_path, Ctx, Detection, Engine, Op, OpOutcome};
+use super::scan::ScanCtx;
+use super::{Ctx, Detection, Engine, Op, OpOutcome};
 use crate::formats::rpa;
 
 pub struct RenpyPlugin;
@@ -41,33 +42,36 @@ impl Engine for RenpyPlugin {
         90
     }
 
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        if root.join("renpy").is_dir() {
-            score += 40;
-            ev.push("renpy/ 引擎目录".into());
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        if scan.has_root_dir("renpy") {
+            d.hit(45, "renpy/ 引擎目录");
         }
-        let rpa_count = count_ext(&root.join("game"), "rpa");
-        if rpa_count > 0 {
-            score += 30;
-            ev.push(format!("{rpa_count} 个 .rpa 封包"));
+        let rpa = scan.ext_count("rpa");
+        if rpa > 0 {
+            d.hit(30, format!("{rpa} 个 .rpa 封包"));
         }
-        if count_ext(&root.join("game"), "rpyc") > 0 {
-            score += 25;
-            ev.push("game/*.rpyc 脚本".into());
+        // .rpyc/.rpym 是编译后的脚本；两者都算运行时脚本特征
+        let rpyc = scan.ext_sum(&["rpyc", "rpym"]);
+        if rpyc > 0 {
+            d.hit(25, format!("{rpyc} 个 .rpyc/.rpym 脚本"));
         }
-        if fs::read_dir(root.join("lib"))
-            .map(|rd| {
-                rd.flatten()
-                    .any(|d| d.file_name().to_string_lossy().starts_with("py"))
-            })
-            .unwrap_or(false)
-        {
-            score += 15;
-            ev.push("lib/py*-windows-* 运行时".into());
+        // 旧版漏判点：纯源码分发（未打包、只留 .rpy）时应仍能识别
+        let rpy = scan.ext_count("rpy");
+        if rpy > 0 {
+            d.hit(20, format!("{rpy} 个 .rpy 源码"));
         }
-        Detection { plugin_id: "renpy".into(), name: "Ren'Py".into(), score, evidence: ev, notes: String::new() }
+        if scan.has_root_dir("lib") && scan.has_dir_starting_with("py") {
+            d.hit(15, "lib/py*-windows-* 运行时");
+        }
+        // 目录名兜底：有些发行版把引擎文件改名，但 game/ 与 gui/ 结构仍在
+        if scan.has_dir("gui") && scan.has_dir("images") {
+            d.hit(10, "game/gui + game/images 资源结构");
+        }
+        if d.score > 0 && d.score < 60 {
+            d.note("证据不足：确认游戏目录是否指到了 Ren'Py 根目录（应含 renpy/ 与 game/）");
+        }
+        d
     }
 
     fn capabilities(&self) -> Vec<Op> {
@@ -103,30 +107,47 @@ impl Engine for RenpyPlugin {
             return OpOutcome::fail("未找到 .rpa 封包");
         }
         let mut done = 0usize;
+        let mut failed = 0usize;
+        let mut resume = crate::engines::Resume::open(ctx.out_dir, "extract", ctx.root).configured(ctx);
         for (i, rpa) in rpas.iter().enumerate() {
             if ctx.cancelled() {
+                resume.flush();
                 return OpOutcome::fail("已取消");
             }
             ctx.report(i as f32 / rpas.len() as f32, &rpa.display().to_string());
             let index = match rpa::read_index(rpa) {
                 Ok(ix) => ix,
-                Err(_) => return self.extract_via_unrpa(rpa, ctx.out_dir),
-            };
-            let total = index.entries.len().max(1);
-            for (j, (name, chunks)) in index.entries.iter().enumerate() {
-                match rpa::read_file(rpa, chunks) {
-                    Ok(data) => {
-                        let dst = safe_out_path(ctx.out_dir, name);
-                        if fs::write(&dst, &data).is_ok() {
-                            done += 1;
-                        }
-                    }
-                    Err(e) => ctx.report(j as f32 / total as f32, &format!("跳过 {name}: {e}")),
+                Err(_) => {
+                    resume.flush();
+                    return self.extract_via_unrpa(rpa, ctx.out_dir);
                 }
-                ctx.report(j as f32 / total as f32, name);
+            };
+            // 命中续传：读盘（read_file 走 seek）也一并省掉
+            let mut jobs: Vec<crate::engines::Job<&[rpa::Chunk]>> = Vec::new();
+            let mut skipped_here = 0usize;
+            for (name, chunks) in index.entries.iter() {
+                if resume.already_done(ctx.out_dir, name) {
+                    skipped_here += 1;
+                } else {
+                    jobs.push(crate::engines::Job { rel: name.clone(), item: chunks.as_slice() });
+                }
             }
+            let (w, f) = crate::engines::parallel_extract(
+                &jobs,
+                ctx.out_dir,
+                crate::engines::worker_count(ctx),
+                ctx,
+                || Ok::<(), String>(()),
+                |_s, chunks| rpa::read_file(rpa, chunks),
+                &mut resume,
+            );
+            done += w + skipped_here;
+            failed += f;
         }
-        OpOutcome::okn(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), done)
+        let skipped = resume.finish(failed == 0);
+        let msg = crate::engines::with_fail_note(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), failed);
+        let msg = crate::engines::with_resume_note(msg, skipped);
+        OpOutcome::okn(msg, done)
     }
 
     fn repack(&self, ctx: &Ctx, src_dir: &Path) -> OpOutcome {
@@ -280,6 +301,7 @@ impl Engine for RenpyPlugin {
             }
         }
         let mut done = 0usize;
+        let mut failed = 0usize;
         for (fname, map) in &edits {
             let src = base.join(fname);
             if !src.exists() {
@@ -294,10 +316,20 @@ impl Engine for RenpyPlugin {
                 }
             }
             let dst = out_root.join(fname);
-            let _ = fs::create_dir_all(dst.parent().unwrap());
-            let _ = fs::write(&dst, lines.join("\n") + "\n");
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    failed += 1;
+                    crate::diag::log("WARN", &format!("建目录失败 {}: {e}", parent.display()));
+                    continue;
+                }
+            }
+            if let Err(e) = fs::write(&dst, lines.join("\n") + "\n") {
+                failed += 1;
+                crate::diag::log("WARN", &format!("回写失败 {}: {e}", dst.display()));
+            }
         }
-        OpOutcome::okn(format!("回填 {done} 条 → {}（把目录复制回 game/ 生效）", out_root.display()), done)
+        let msg = crate::engines::with_fail_note(format!("回填 {done} 条 → {}（把目录复制回 game/ 生效）", out_root.display()), failed);
+        OpOutcome::okn(msg, done)
     }
 
     fn save(&self, ctx: &Ctx) -> OpOutcome {
@@ -313,7 +345,23 @@ impl Engine for RenpyPlugin {
         OpOutcome { success: true, message: "存档目录已定位".into(), files_done: locs.len(), logs: detail }
     }
 
-    fn unlock(&self, ctx: &Ctx) -> OpOutcome {
+    fn unlock_impl(
+        &self,
+        route: crate::features::unlock::UnlockRoute,
+        ctx: &Ctx,
+    ) -> Option<OpOutcome> {
+        if route != crate::features::unlock::UnlockRoute::SaveFileFlag {
+            return None;
+        }
+        Some(self.unlock_persistent(ctx))
+    }
+}
+
+impl RenpyPlugin {
+    /// Ren'Py 的 persistent 解锁实现（由统一调度器在 `SaveFileFlag` 路线下调用）。
+    ///
+    /// 缺省只读列出可解锁布尔键，`--opt:set_true_all=1` 才写回（写前备份原文件）。
+    fn unlock_persistent(&self, ctx: &Ctx) -> OpOutcome {
         let target = match ctx.opt("persistent").map(PathBuf::from) {
             Some(p) => p,
             None => {
@@ -413,9 +461,12 @@ fn patch_false_to_true(data: &[u8], candidates: &[String]) -> Vec<u8> {
     out
 }
 
+/// 写回 persistent 前的备份（委托 `settings::backup_once`：**已存在则绝不覆盖**）。
+///
+/// 旧实现是裸 `fs::copy`，重复解锁第二次就把备份从"原始存档"顶成"已解锁存档"，
+/// 原始状态再无法恢复。这里统一走全局策略。
 fn backup_file(path: &Path) -> Option<PathBuf> {
-    let bak = path.with_extension("stool.bak");
-    fs::copy(path, &bak).ok().map(|_| bak)
+    crate::settings::backup_once(path).ok()
 }
 
 fn python_exe() -> String {

@@ -1,6 +1,7 @@
 //! STool 库根。
 
 pub mod cli;
+pub mod diag;
 pub mod engines;
 pub mod features;
 pub mod formats;

@@ -9,10 +9,13 @@ use flate2::read::ZlibDecoder;
 
 use super::pickle::{self, Value};
 
+/// RPA 单个数据块：`(前缀字节, 数据偏移, 数据长度)`。
+pub type Chunk = (Vec<u8>, u64, u64);
+
 pub struct RpaIndex {
     pub version: String,
-    /// name -> [(prefix_bytes, data_offset, data_len)]
-    pub entries: BTreeMap<String, Vec<(Vec<u8>, u64, u64)>>,
+    /// name -> [Chunk]（prefix_bytes, data_offset, data_len）
+    pub entries: BTreeMap<String, Vec<Chunk>>,
 }
 
 pub fn is_rpa(path: &Path) -> bool {
@@ -116,7 +119,7 @@ fn read_at(f: &mut fs::File, off: u64, len: u64) -> Result<Vec<u8>, String> {
 }
 
 /// 读取一个文件的全部数据（前缀字节 + 各数据块）。
-pub fn read_file(archive: &Path, chunks: &[(Vec<u8>, u64, u64)]) -> Result<Vec<u8>, String> {
+pub fn read_file(archive: &Path, chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     let mut f = fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for (prefix, off, len) in chunks {
@@ -144,7 +147,7 @@ pub fn write_archive(archive: &Path, files: &BTreeMap<String, Vec<u8>>, key: u32
     };
     let index_offset = body.len() as u64 + HEADER_LEN;
     let mut f = fs::File::create(archive).map_err(|e| e.to_string())?;
-    write!(f, "RPA-3.0 {index_offset:016x} {key:08x}\n").map_err(|e| e.to_string())?;
+    writeln!(f, "RPA-3.0 {index_offset:016x} {key:08x}").map_err(|e| e.to_string())?;
     f.write_all(&body).map_err(|e| e.to_string())?;
     f.write_all(&compressed).map_err(|e| e.to_string())?;
     Ok(())

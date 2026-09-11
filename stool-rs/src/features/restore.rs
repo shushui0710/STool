@@ -40,6 +40,42 @@ pub fn restore_one(bak: &Path) -> Result<String, String> {
     Ok(format!("已还原 {}（备份保留，可再次还原）", orig.display()))
 }
 
+/// 回填一键闭环（P2-5）：用「重新打包出的新封包」替换游戏里的原封包。
+///
+/// 覆盖前 `backup_once` 留底（**已存在则保留首次原版，绝不覆盖**），这次留底恰好也是
+/// 双档案切换所需的 `.stool.bak`，所以替换完即可直接用 `archive-toggle` 在原版/汉化间切换。
+/// `target` 必须由调用方显式指定，避免"认错封包"造成误替换。
+pub fn apply_repack(target: &Path, new_archive: &Path) -> Result<String, String> {
+    if !target.exists() {
+        return Err(format!("原封包不存在: {}", target.display()));
+    }
+    if !new_archive.exists() {
+        return Err(format!("新封包不存在: {}", new_archive.display()));
+    }
+    let same = match (target.canonicalize(), new_archive.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => target == new_archive,
+    };
+    if same {
+        return Err("原封包与新封包是同一个文件".into());
+    }
+    let ext = target.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if !TOGGLE_EXTS.contains(&ext.as_str()) {
+        return Err(format!("只支持 {} 类型封包，收到 .{ext}", TOGGLE_EXTS.join("/")));
+    }
+    // 备份（首次原版；已存在则不覆盖）——同时满足双档案切换的前提
+    let bak = crate::settings::backup_or_abort(target)?;
+    crate::settings::ensure_parent(target);
+    fs::copy(new_archive, target).map_err(|e| format!("写入 {} 失败: {e}", target.display()))?;
+    let name = |p: &Path| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok(format!(
+        "已用 {} 替换 {}（原版备份 {} 已保留，可用 archive-toggle 切换原版/汉化）",
+        name(new_archive),
+        name(target),
+        bak.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    ))
+}
+
 /// 双档案切换：对 root 下所有可切换封包执行一次 原版 ↔ 汉化 翻转。
 /// 首次调用会把当前 备份→.stool.orig、正式文件→.stool.trans 固化下来；
 /// 之后每次调用把非激活副本写回正式文件，并用 .stool.side 记录当前激活态。
@@ -61,9 +97,9 @@ pub fn archive_toggle(root: &Path) -> Result<String, String> {
             skipped.push(format!("{}（原文件缺失）", orig.display()));
             continue;
         }
-        match toggle_one(&orig, bak) {
-            Ok(state) => done.push(format!("{} → 当前 {}", orig.display(), state)),
-            Err(e) => return Err(e),
+        {
+            let state = toggle_one(&orig, bak)?;
+            done.push(format!("{} → 当前 {}", orig.display(), state))
         }
     }
     if done.is_empty() {
@@ -122,8 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_toggle() {
-        let dir = std::env::temp_dir().join(format!("stool_tgl_{}", std::process::id()));
+    fn test_archive_toggle() {        let dir = std::env::temp_dir().join(format!("stool_tgl_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let orig = dir.join("data.xp3");
         let bak = dir.join("data.xp3.stool.bak");
@@ -142,5 +177,61 @@ mod tests {
         // 存档备份未被当成封包
         assert_eq!(fs::read(&save).unwrap(), b"save");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("stool_rp_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn apply_repack_replaces_and_backs_up() {
+        let d = tmp("apply");
+        let orig = d.join("data.xp3");
+        let new = d.join("stool_repack.xp3");
+        fs::write(&orig, b"original").unwrap();
+        fs::write(&new, b"translated").unwrap();
+
+        let msg = apply_repack(&orig, &new).unwrap();
+        assert!(msg.contains("data.xp3"));
+        assert_eq!(fs::read(&orig).unwrap(), b"translated"); // 已替换
+        // 备份即首次原版，且恰好满足双档案切换
+        assert_eq!(fs::read(orig.with_file_name("data.xp3.stool.bak")).unwrap(), b"original");
+        let m = archive_toggle(&d).unwrap();
+        assert!(m.contains("原版"));
+        assert_eq!(fs::read(&orig).unwrap(), b"original");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn apply_repack_backup_never_overwritten() {
+        let d = tmp("bakkeep");
+        let orig = d.join("a.rpa");
+        fs::write(&orig, b"v1").unwrap();
+        for (payload, tag) in [(b"v2", "n2"), (b"v3", "n3")] {
+            let new = d.join(format!("{tag}.rpa"));
+            fs::write(&new, payload).unwrap();
+            apply_repack(&orig, &new).unwrap();
+        }
+        assert_eq!(fs::read(&orig).unwrap(), b"v3");
+        // 备份必须仍是首次的原版 v1，不能被后来的替换覆盖
+        assert_eq!(fs::read(orig.with_file_name("a.rpa.stool.bak")).unwrap(), b"v1");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn apply_repack_rejects_same_and_unsupported() {
+        let d = tmp("reject");
+        let orig = d.join("data.xp3");
+        fs::write(&orig, b"x").unwrap();
+        assert!(apply_repack(&orig, &orig).is_err(), "同一文件应被拒绝");
+        let txt = d.join("readme.txt");
+        fs::write(&txt, b"y").unwrap();
+        assert!(apply_repack(&txt, &orig).is_err(), "不支持的扩展名应被拒绝");
+        let missing = d.join("nope.rpa");
+        assert!(apply_repack(&missing, &orig).is_err(), "原封包缺失应被拒绝");
+        let _ = fs::remove_dir_all(&d);
     }
 }

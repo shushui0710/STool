@@ -112,7 +112,7 @@ pub fn mv_save_decode(data: &[u8]) -> Result<String, String> {
 /// MZ 存档（zlib）→ JSON 字符串。
 pub fn mz_save_decode(data: &[u8]) -> Result<String, String> {
     if data.first() == Some(&0x78) {
-        let mut z = flate2::read::ZlibDecoder::new(&data[..]);
+        let mut z = flate2::read::ZlibDecoder::new(data);
         let mut out = String::new();
         std::io::Read::read_to_string(&mut z, &mut out).map_err(|e| e.to_string())?;
         Ok(out)

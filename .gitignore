@@ -20,8 +20,9 @@ _launch.vbs
 __pycache__/
 .venv/
 
-# 依赖锁定文件
-Cargo.lock
+# 依赖锁定文件：本项目是二进制应用（stool / stool-cli），
+# 按 Rust 官方建议 **入库** Cargo.lock 以固化依赖版本、保证可复现构建。
+# （仅库 crate 才建议忽略 Cargo.lock）
 
 # 本机专用 MSVC 链接器配置（路径写死本机版本，不应入库）
 stool-rs/.cargo/config.toml

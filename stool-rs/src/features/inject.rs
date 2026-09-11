@@ -1,12 +1,22 @@
 //! 运行时 JSON 注入汉化（MTool 兼容；按引擎分派，不修改任何原始资源文件）。
 //!
-//! 支持的引擎与机制：
+//! 支持的引擎与机制（目标范围 = "文本走 JS/DOM/脚本，且引擎提供运行时替换入口"的引擎）：
 //! - **RPG Maker MV / MZ**：往游戏里安装小型插件 `js/plugins/stool_translate.js`
 //!   （备份 `js/plugins.js` 后登记），启动后读取翻译 JSON，在内存里替换数据库与显示文本；
 //! - **Ren'Py**：新增 `game/stool_translate.rpy`，利用引擎自带的 `config.replace_text`
 //!   在文本显示前做整句替换（只新增文件，原有脚本不动；删除该文件即还原）；
+//! - **TyranoBuilder / TyranoScript**：在 `index.html` 末尾追加 `stool_translate.js`
+//!   （原文件备份）。TyranoScript 的 KAG 把文本渲染进 DOM（非 Canvas），因此
+//!   DOM 文本节点替换即可覆盖；Hook 额外挂了 jQuery `html/text` 兜底（Tyrano 是 jQuery 系）；
 //! - **HTML / Electron**：在入口 HTML 末尾追加 `<script src="stool_translate.js">`
 //!   （原文件备份），DOM 文本节点经 MutationObserver 运行时替换（Canvas 渲染的内容除外）。
+//!
+//! 不在范围内（以及原因）：KiriKiri / Siglus / BGI / Majesty 等的脚本与文本封在私有封包里，
+//! 且 xp3/pak 解包后常为加密 `.ks/.tjs`，运行时没有稳定的替换注入点 —— 这类引擎请走
+//! "解包 → 文本提取 → 翻译 → 封包回填"（`Op::TextImport` / `Op::Repack`）。
+//! 其中 **KiriKiri 系另有更省事的做法**：`features::xp3patch` 的运行时补丁包
+//! （打成 `patchN.xp3`，引擎按搜索顺序优先加载，原封包一个字节都不用动、删除即还原），
+//! CLI 为 `stool xp3-patch`，GUI 在「运行时修改」页。
 //!
 //! JSON 格式约定（与 MTool 兼容，全引擎统一）：
 //! - 扁平映射：`{ "原文": "译文", ... }`；也允许一层分组嵌套（如 `{ "对话": { "原文": "译文" } }`），
@@ -16,6 +26,8 @@
 //!   映射直接写进 .rpy，游戏目录不落 JSON）。
 //!
 //! 未命中映射的文本一律保留原文。
+//! 幂等与可还原：所有会改动的原文件（`plugins.js`、入口 HTML）首次注入前都做
+//! `*.stool.bak` 备份，卸载时优先按备份字节级还原。
 
 use std::path::{Path, PathBuf};
 
@@ -23,16 +35,63 @@ pub const HOOK_NAME: &str = "stool_translate";
 pub const JSON_IN_GAME: &str = "stool_translate.json";
 
 /// 支持注入的引擎插件 id（engines 注册表里的 id）。
-pub const SUPPORTED: [&str; 3] = ["rpgmaker_mv", "renpy", "html_game"];
+pub const SUPPORTED: [&str; 4] = ["rpgmaker_mv", "renpy", "html_game", "tyrano"];
+
+/// 单个引擎的注入适配说明（供 GUI/CLI 明确展示"支持谁、怎么注入、有什么限制"）。
+pub struct InjectSupport {
+    pub plugin_id: &'static str,
+    pub engine: &'static str,
+    /// 注入适配方式
+    pub mechanism: &'static str,
+    /// 兼容性/稳定性边界
+    pub limits: &'static str,
+}
+
+/// 注入能力总表：UI 用它来解释注入范围，避免用户对"支持哪些引擎"产生误解。
+///
+/// 排序即推荐展示顺序（覆盖面 / 稳定性由高到低）。
+pub const SUPPORT_TABLE: &[InjectSupport] = &[
+    InjectSupport {
+        plugin_id: "renpy",
+        engine: "Ren'Py",
+        mechanism: "新增 game/stool_translate.rpy，走引擎原生 config.replace_text 在显示前整句替换",
+        limits: "只新增文件、不改原脚本；不改动游戏资源，删除该文件（含 .rpyc）即完全还原，兼容性最好",
+    },
+    InjectSupport {
+        plugin_id: "rpgmaker_mv",
+        engine: "RPG Maker MV / MZ",
+        mechanism: "安装 js/plugins/stool_translate.js 并登记进 plugins.js，运行时在内存里替换数据库与显示文本",
+        limits: "首次注入会备份 plugins.js 后追加一条；仅覆盖 JS 文本，图片内文字不在范围内",
+    },
+    InjectSupport {
+        plugin_id: "tyrano",
+        engine: "TyranoBuilder / TyranoScript",
+        mechanism: "在 index.html 追加 stool_translate.js；DOM 文本节点 + jQuery html/text 双层替换（KAG 渲染到 DOM，非 Canvas）",
+        limits: "只改入口 HTML（有备份）；Canvas/WebGL 里画的文字无法替换；已打包的 .ks 剧本请改用文本提取/回填",
+    },
+    InjectSupport {
+        plugin_id: "html_game",
+        engine: "HTML / Electron",
+        mechanism: "在入口 HTML 追加 stool_translate.js，MutationObserver 替换 DOM 文本节点",
+        limits: "只改入口 HTML（有备份）；Canvas 渲染的文字无法替换；Electron 需对 app 目录有写权限",
+    },
+];
+
+/// 该引擎是否支持运行时注入。
+pub fn is_supported(plugin_id: &str) -> bool {
+    SUPPORTED.contains(&plugin_id)
+}
+
+/// 取某个引擎的注入适配说明。
+pub fn support_of(plugin_id: &str) -> Option<&'static InjectSupport> {
+    SUPPORT_TABLE.iter().find(|s| s.plugin_id == plugin_id)
+}
 
 /// 一个游戏的 js 目录（MV/MZ：游戏根 或 www/ 下）。
 fn js_dir(root: &Path) -> Option<PathBuf> {
-    for c in [root.join("www").join("js"), root.join("js")] {
-        if c.join("plugins.js").exists() {
-            return Some(c);
-        }
-    }
-    None
+    [root.join("www").join("js"), root.join("js")]
+        .into_iter()
+        .find(|c| c.join("plugins.js").exists())
 }
 
 /// Ren'Py 的 game 目录。
@@ -124,7 +183,14 @@ pub fn install(root: &Path, json_path: &Path, plugin_id: &str) -> Result<String,
         "rpgmaker_mv" => install_mv(root, json_path),
         "renpy" => install_renpy(root, json_path),
         "html_game" => install_html(root, json_path),
-        _ => Err("该引擎暂不支持运行时 JSON 注入（当前支持：RPG Maker MV/MZ、Ren'Py、HTML/Electron；其余引擎文本封在私有封包里，请用“翻译回填”）".into()),
+        "tyrano" => install_tyrano(root, json_path),
+        _ => Err(format!(
+            "「{plugin_id}」暂不支持运行时 JSON 注入。当前注入范围：Ren'Py、RPG Maker MV/MZ、\
+             TyranoBuilder、HTML/Electron（文本在 JS/DOM/脚本层、引擎留了运行时替换入口）。\
+             其他引擎（KiriKiri/Siglus/BGI/RPG Maker 2000 等）的文本封在私有封包里，\
+             请改用「文本提取 → 翻译 → 翻译回填/封包回写」这套离线流程；\
+             其中 KiriKiri 系还可用运行时补丁包（CLI `stool xp3-patch`）免去重写原封包。"
+        )),
     }
 }
 
@@ -133,7 +199,8 @@ pub fn uninstall(root: &Path, plugin_id: &str) -> Result<String, String> {
     match plugin_id {
         "rpgmaker_mv" => uninstall_mv(root),
         "renpy" => uninstall_renpy(root),
-        "html_game" => uninstall_html(root),
+        // TyranoBuilder 与 HTML 系的注入痕迹相同（入口 HTML + stool_translate.js + JSON）
+        "html_game" | "tyrano" => uninstall_html(root),
         _ => Err("该引擎不支持注入，无需卸载".into()),
     }
 }
@@ -147,7 +214,7 @@ pub struct Status {
 }
 
 pub fn status(root: &Path, plugin_id: &str) -> Status {
-    let mut st = Status { supported: SUPPORTED.contains(&plugin_id), installed: false, entries: 0, json_path: String::new() };
+    let mut st = Status { supported: is_supported(plugin_id), installed: false, entries: 0, json_path: String::new() };
     match plugin_id {
         "rpgmaker_mv" => {
             let jsd = js_dir(root);
@@ -178,7 +245,7 @@ pub fn status(root: &Path, plugin_id: &str) -> Status {
                 }
             }
         }
-        "html_game" => {
+        "html_game" | "tyrano" => {
             let hook = root.join(format!("{HOOK_NAME}.js"));
             st.installed = hook.exists();
             let f = root.join(JSON_IN_GAME);
@@ -219,10 +286,8 @@ pub fn install_mv(root: &Path, json_path: &Path) -> Result<String, String> {
     if registered(&content) {
         return Ok(format!("注入已更新：{total} 条翻译（{skipped} 条空译文跳过）。重新启动游戏生效。"));
     }
-    let bak = jsd.join("plugins.js.stool.bak");
-    if !bak.exists() {
-        std::fs::write(&bak, &content).map_err(|e| format!("备份 plugins.js 失败: {e}"))?;
-    }
+    // 首次注入前备份原件（已存在则保留，绝不覆盖 → 保证备份永远是"原始状态"）
+    crate::settings::backup_once(&plugins_js).map_err(|e| format!("备份 plugins.js 失败: {e}"))?;
     let patched = patch_plugins_js(&content)?;
     std::fs::write(&plugins_js, patched).map_err(|e| format!("写入 plugins.js 失败: {e}"))?;
     Ok(format!("注入完成：{total} 条翻译已挂载（{skipped} 条空译文跳过，保留原文）。重新启动游戏生效。"))
@@ -232,7 +297,7 @@ pub fn install_mv(root: &Path, json_path: &Path) -> Result<String, String> {
 pub fn uninstall_mv(root: &Path) -> Result<String, String> {
     let jsd = js_dir(root).ok_or("未找到 js/plugins.js")?;
     let plugins_js = jsd.join("plugins.js");
-    let bak = jsd.join("plugins.js.stool.bak");
+    let bak = crate::settings::backup_path_for(&plugins_js);
 
     let mut msgs: Vec<String> = Vec::new();
     if bak.exists() {
@@ -312,36 +377,56 @@ pub fn uninstall_renpy(root: &Path) -> Result<String, String> {
 
 /// 注入：写 stool_translate.js + 翻译 JSON，并在入口 HTML 末尾挂上脚本标签（原文件备份）。
 pub fn install_html(root: &Path, json_path: &Path) -> Result<String, String> {
+    install_html_like(root, json_path, HTML_HOOK_JS, "刷新/重启游戏生效。注意：Canvas 画面内的文本无法替换。")
+}
+
+/// 注入（TyranoBuilder）：机制与 HTML 系相同，但 Hook 额外挂了 jQuery `html/text` 兜底
+/// —— TyranoScript 的 KAG 消息是用 jQuery 写进 DOM 的（不是 Canvas），DOM 替换即可覆盖。
+pub fn install_tyrano(root: &Path, json_path: &Path) -> Result<String, String> {
+    if !root.join("tyrano").is_dir() {
+        return Err(format!(
+            "未找到 tyrano/ 目录（{}）—— 请把游戏目录选成 TyranoBuilder 游戏的根目录（应同时含 index.html 与 tyrano/）",
+            root.display()
+        ));
+    }
+    install_html_like(
+        root,
+        json_path,
+        TYRANO_HOOK_JS,
+        "刷新/重启游戏生效。Tyrano 的对话文本在 DOM 里，可替换；若个别文本画在 Canvas 上则无法替换（可改用“文本提取 → 回填 .ks”）。",
+    )
+}
+
+/// HTML 系（HTML/Electron 与 TyranoBuilder）的共用注入流程。
+fn install_html_like(root: &Path, json_path: &Path, hook_js: &str, tail_hint: &str) -> Result<String, String> {
     let entry = html_entry(root).ok_or("未找到入口 HTML（index.html）")?;
     let (map, total, skipped) = load_map(json_path)?;
 
     // 1) Hook 与翻译 JSON
     let json_text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).map_err(|e| e.to_string())?;
     std::fs::write(root.join(JSON_IN_GAME), json_text).map_err(|e| format!("写入翻译 JSON 失败: {e}"))?;
-    std::fs::write(root.join(format!("{HOOK_NAME}.js")), HTML_HOOK_JS).map_err(|e| format!("写入 Hook 失败: {e}"))?;
+    std::fs::write(root.join(format!("{HOOK_NAME}.js")), hook_js).map_err(|e| format!("写入 Hook 失败: {e}"))?;
 
     // 2) 入口 HTML 挂脚本（幂等；首次备份）
     let html = std::fs::read_to_string(&entry).map_err(|e| format!("读取 {} 失败: {e}", entry.display()))?;
     if html.contains(&format!("{HOOK_NAME}.js")) {
-        return Ok(format!("注入已更新：{total} 条翻译（{skipped} 条空译文跳过）。刷新/重启游戏生效。"));
+        return Ok(format!("注入已更新：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}"));
     }
-    let bak = entry.with_extension("html.stool.bak");
-    if !bak.exists() {
-        std::fs::write(&bak, &html).map_err(|e| format!("备份入口 HTML 失败: {e}"))?;
-    }
+    // 首次注入前备份入口 HTML（已存在则保留，绝不覆盖）
+    crate::settings::backup_once(&entry).map_err(|e| format!("备份入口 HTML 失败: {e}"))?;
     let tag = format!("<script src=\"{HOOK_NAME}.js\"></script>");
     let patched = match html.to_ascii_lowercase().rfind("</body>") {
         Some(pos) => format!("{}{}{}", &html[..pos], tag, &html[pos..]),
         None => format!("{html}{tag}"),
     };
     std::fs::write(&entry, patched).map_err(|e| format!("写入入口 HTML 失败: {e}"))?;
-    Ok(format!("注入完成：{total} 条翻译（{skipped} 条空译文跳过）。刷新/重启游戏生效。注意：Canvas 画面内的文本无法替换。"))
+    Ok(format!("注入完成：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}"))
 }
 
 /// 卸载：还原入口 HTML，删除 Hook 与翻译 JSON。
 pub fn uninstall_html(root: &Path) -> Result<String, String> {
     let entry = html_entry(root).ok_or("未找到入口 HTML")?;
-    let bak = entry.with_extension("html.stool.bak");
+    let bak = crate::settings::backup_path_for(&entry);
     let mut msgs: Vec<String> = Vec::new();
     if bak.exists() {
         let orig = std::fs::read_to_string(&bak).map_err(|e| format!("读取备份失败: {e}"))?;
@@ -624,6 +709,173 @@ const HTML_HOOK_JS: &str = r#"/* STool HTML 运行时汉化注入 —— 由 STo
 })();
 "#;
 
+/// TyranoBuilder / TyranoScript 游戏端 Hook。
+///
+/// 与 HTML Hook 的差别（Tyrano 是 jQuery + KAG 体系）：
+/// 1. 保留 MutationObserver 的 DOM 文本节点替换（KAG 消息最终落到 DOM，不是 Canvas）；
+/// 2. **额外**包装 jQuery 的 `$.fn.html` / `$.fn.text`，在 Tyrano 用 jQuery 写消息时做整串替换
+///    —— 这能覆盖"整段文本被一次性 html() 写入"导致文本节点被 `<br>` 拆开、单节点匹配不中的情况；
+/// 3. 对带 `message`/`text` 类名的元素做元素级 textContent 兜底匹配。
+const TYRANO_HOOK_JS: &str = r#"/* STool TyranoBuilder 运行时汉化注入 —— 由 STool 自动生成，请勿手改
+ * 读取：<index.html 同目录>/stool_translate.json（{"原文":"译文"}，允许分组嵌套）
+ * 规则：整句精确匹配；未命中保留原文；不修改任何游戏文件（仅本脚本 + JSON 是新增的）。
+ * 覆盖：DOM 文本节点（MutationObserver）+ jQuery html/text + message 元素 textContent。
+ * 注意：Tyrano 若把文字画进 Canvas，则不在覆盖范围内。
+ */
+(function () {
+    "use strict";
+    var MAP = null;
+    var DONE = false;
+
+    function flatten(obj, out) {
+        out = out || {};
+        for (var k in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+            var v = obj[k];
+            if (v && typeof v === "object") flatten(v, out);
+            else if (typeof v === "string") out[k] = v;
+        }
+        return out;
+    }
+
+    function parseJsonText(txt) {
+        try { return flatten(JSON.parse(txt.replace(/^\uFEFF/, ""))); } catch (e) { return null; }
+    }
+
+    function loadMap() {
+        var files = ["stool_translate.json", "translation.json"];
+        // Electron / node 环境：直接用 fs 同步读，兼容路径里的中文
+        try {
+            if (typeof require === "function" && typeof process !== "undefined" &&
+                process.versions && process.versions.node && typeof location !== "undefined") {
+                var fs = require("fs");
+                var p = require("path");
+                var root = decodeURIComponent(location.pathname).replace(/\\/g, "/");
+                root = root.slice(0, root.lastIndexOf("/"));
+                if (/^\/[A-Za-z]:/.test(root)) root = root.slice(1);
+                for (var i = 0; i < files.length; i++) {
+                    var f = p.join(root, files[i]);
+                    if (fs.existsSync(f)) {
+                        MAP = parseJsonText(fs.readFileSync(f, "utf8"));
+                        if (MAP) { console.log("[STool] Tyrano 汉化映射已加载: " + files[i]); return; }
+                    }
+                }
+            }
+        } catch (e) { /* 转 XHR */ }
+        for (var j = 0; j < files.length; j++) {
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open("GET", files[j], false);
+                xhr.overrideMimeType("application/json");
+                xhr.send(null);
+                if (xhr.status === 200 || (xhr.status === 0 && xhr.responseText)) {
+                    MAP = parseJsonText(xhr.responseText);
+                    if (MAP) return;
+                }
+            } catch (e2) { /* 试下一个 */ }
+        }
+        if (!MAP) console.warn("[STool] 未找到翻译 JSON，本次运行不做替换");
+    }
+
+    function tr(s) {
+        if (!MAP || typeof s !== "string") return s;
+        var m = MAP[s];
+        if (typeof m === "string" && m.length > 0) return m;
+        var t = s.trim();
+        if (t !== s) {
+            var m2 = MAP[t];
+            if (typeof m2 === "string" && m2.length > 0) return m2;
+        }
+        return s;
+    }
+
+    // ---- 1) DOM 文本节点 ----
+
+    function translateNode(n) {
+        var t = n.nodeValue;
+        if (typeof t !== "string" || !t.trim()) return;
+        var m = tr(t);
+        if (m !== t) n.nodeValue = m;
+    }
+
+    function walkDom(root) {
+        if (!root) return;
+        try {
+            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+            var nodes = [];
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            nodes.forEach(translateNode);
+        } catch (e) { /* 忽略 */ }
+    }
+
+    // ---- 2) message 元素级兜底（文本被 <br> 拆成多节点时） ----
+
+    function translateElem(el) {
+        if (!el || el.nodeType !== 1) return;
+        var cls = (el.className && typeof el.className === "string") ? el.className : "";
+        if (!/(^|\s|-)(message|text|name|serif|glink|tyrano)(\s|-|$)/i.test(cls)) return;
+        var t = el.textContent;
+        if (typeof t !== "string" || !t.trim()) return;
+        var m = tr(t);
+        if (m !== t) el.textContent = m;
+    }
+
+    function walkElems(root) {
+        if (!root || root.nodeType !== 1) return;
+        var list = root.querySelectorAll ? root.querySelectorAll(".message,[class*=message]") : [];
+        for (var i = 0; i < list.length; i++) translateElem(list[i]);
+    }
+
+    // ---- 3) jQuery html/text 包装（Tyrano KAG 写消息的主通道） ----
+
+    function installJqHook() {
+        if (typeof window.jQuery !== "function") return;
+        var fn = window.jQuery.fn;
+        ["html", "text"].forEach(function (name) {
+            if (typeof fn[name] !== "function" || fn[name].__stool) return;
+            var orig = fn[name];
+            var wrapped = function (v) {
+                // 只有"写入"（带参数）且是字符串时才尝试替换；读取原样透传
+                if (arguments.length > 0 && typeof v === "string") {
+                    var m = tr(v);
+                    if (m !== v) arguments[0] = m;
+                }
+                return orig.apply(this, arguments);
+            };
+            wrapped.__stool = true;
+            fn[name] = wrapped;
+        });
+    }
+
+    function start() {
+        if (DONE || !MAP) return;
+        DONE = true;
+        walkDom(document.body || document.documentElement || document);
+        walkElems(document.body || document.documentElement || document);
+        var mo = new MutationObserver(function (muts) {
+            muts.forEach(function (m) {
+                if (m.type === "characterData" && m.target.nodeType === 3) translateNode(m.target);
+                m.addedNodes.forEach(function (n) {
+                    if (n.nodeType === 3) translateNode(n);
+                    else if (n.nodeType === 1) { walkDom(n); walkElems(n); }
+                });
+            });
+        });
+        mo.observe(document.documentElement || document, { childList: true, subtree: true, characterData: true });
+    }
+
+    loadMap();
+    // jQuery 可能比本脚本晚加载（脚本顺序不保证），DOMContentLoaded 再补挂一次
+    installJqHook();
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", function () { installJqHook(); start(); });
+    } else {
+        installJqHook();
+        start();
+    }
+})();
+"#;
+
 /// 从文本提取的 CSV 生成注入 JSON 骨架（注入 JSON 的"原文"来源）：
 /// 键 = CSV 的 source 列原文；值 = 已有译文（translation 列非空时带入），否则留空串待机翻。
 /// 同一原文去重（已有译文的行优先于空译文行）。
@@ -670,7 +922,7 @@ mod tests {
         assert!(out.trim_end().ends_with(';'));
         // 原有条目之间补了逗号，且仍以 ] 结尾
         let close = out.rfind(']').unwrap();
-        assert_eq!(out[..close].trim_end().ends_with('}'), true);
+        assert!(out[..close].trim_end().ends_with('}'));
     }
 
     #[test]
@@ -840,5 +1092,56 @@ mod tests {
         assert_eq!(v["こんにちは"], "你好"); // 已有译文优先带入
         assert_eq!(v["選択肢"], ""); // 空译文留空待机翻
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tyrano_install_uninstall() {
+        let game = std::env::temp_dir().join(format!("stool_inject_tyrano_{}", std::process::id()));
+        std::fs::create_dir_all(game.join("tyrano").join("plugins")).unwrap();
+        std::fs::create_dir_all(game.join("data").join("scenario")).unwrap();
+        std::fs::write(
+            game.join("index.html"),
+            "<html><body><div class=\"message\">こんにちは</div></body></html>",
+        )
+        .unwrap();
+        let json = game.join("trans.json");
+        std::fs::write(&json, "{\"こんにちは\":\"你好\"}").unwrap();
+
+        // 目录选错（缺 tyrano/）应明确报错，而不是往错的目录注入
+        let wrong = game.join("data");
+        let err = install(&wrong, &json, "tyrano").unwrap_err();
+        assert!(err.contains("tyrano/"), "报错应点明缺 tyrano/ 目录，实得: {err}");
+
+        let msg = install(&game, &json, "tyrano").unwrap();
+        assert!(msg.contains("1 条"));
+        assert!(game.join("stool_translate.js").exists());
+        assert!(game.join(JSON_IN_GAME).exists());
+        let hook = std::fs::read_to_string(game.join("stool_translate.js")).unwrap();
+        assert!(hook.contains("jQuery"), "Tyrano Hook 应带 jQuery 兜底");
+        let html = std::fs::read_to_string(game.join("index.html")).unwrap();
+        assert!(html.contains("<script src=\"stool_translate.js\"></script></body>"));
+        assert!(std::fs::read_to_string(game.join("index.html.stool.bak")).unwrap().contains("こんにちは"));
+        // 幂等：重复注入不重复挂标签
+        install(&game, &json, "tyrano").unwrap();
+        let html2 = std::fs::read_to_string(game.join("index.html")).unwrap();
+        assert_eq!(html2.matches("stool_translate.js").count(), 1);
+        let st = status(&game, "tyrano");
+        assert!(st.supported && st.installed && st.entries == 1);
+
+        uninstall(&game, "tyrano").unwrap();
+        assert!(!game.join("stool_translate.js").exists());
+        assert!(!game.join("index.html.stool.bak").exists());
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
+    #[test]
+    fn test_support_table_consistent() {
+        for id in SUPPORTED {
+            assert!(support_of(id).is_some(), "{id} 在 SUPPORTED 里却不在 SUPPORT_TABLE");
+        }
+        assert_eq!(SUPPORT_TABLE.len(), SUPPORTED.len(), "两表条目数应一致");
+        assert!(is_supported("tyrano") && is_supported("renpy"));
+        // 封包型引擎明确不在注入范围内
+        assert!(!is_supported("kirikiri") && !is_supported("rpgmaker_rgss"));
     }
 }

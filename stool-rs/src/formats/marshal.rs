@@ -293,7 +293,7 @@ pub fn rb_to_json(v: &Rb) -> serde_json::Value {
 /// 供导出用的辅助：marshal 对象 → JSON 字符串。
 pub fn to_json_string(data: &[u8]) -> Result<String, String> {
     let v = load(data)?;
-    Ok(serde_json::to_string_pretty(&rb_to_json(&v)).map_err(|e| e.to_string())?)
+    serde_json::to_string_pretty(&rb_to_json(&v)).map_err(|e| e.to_string())
 }
 
 // HashMap 引用避免 unused 警告（占位）

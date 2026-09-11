@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use super::scan::ScanCtx;
 use super::{Ctx, Detection, Engine, Op, OpOutcome};
 use crate::settings;
 
@@ -18,18 +19,22 @@ impl Engine for WolfPlugin {
     fn priority(&self) -> i32 {
         72
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let wolves = crate::engines::others::list_files_by_ext_pub(&root.join("Data"), &["wolf"]);
-        let mut score = 0;
-        let mut ev = Vec::new();
-        if !wolves.is_empty() {
-            score += 75;
-            ev.push(format!("{} 个 .wolf 封包", wolves.len()));
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        let wolf = scan.ext_count("wolf");
+        if wolf > 0 {
+            d.hit(75, format!("{wolf} 个 .wolf 封包（如 {}）", scan.first_ext_name("wolf")));
         }
-        if root.join("Game.exe").exists() && !wolves.is_empty() {
-            score += 10;
+        // 已解包的情况：Data/BasicData/ 是 Wolf 独有的数据布局（旧版完全识别不出）。
+        // Game.exe + Data/ 单独并不足以说明是 Wolf（RPG Maker 也长这样），
+        // 所以只作为 BasicData 的附带证据，避免给别的引擎刷出无关低分。
+        if scan.has_root_dir("data") && scan.has_dir("basicdata") {
+            d.hit(45, "Data/BasicData 目录（Wolf 数据布局）");
+            if scan.has_root_file("game.exe") {
+                d.hit(15, "Game.exe 运行时");
+            }
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::TextExtract]
@@ -171,37 +176,41 @@ impl Engine for UnityPlugin {
     fn priority(&self) -> i32 {
         78
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        let data_dirs: Vec<_> = std::fs::read_dir(root)
-            .map(|rd| rd.flatten().filter(|d| d.path().is_dir() && d.file_name().to_string_lossy().ends_with("_Data")).map(|d| d.path()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        if !data_dirs.is_empty() || root.join("UnityPlayer.dll").exists() {
-            score += 75;
-            ev.push("UnityPlayer.dll / *_Data".into());
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        let data_dirs = scan.root_dirs_ending("_data");
+        if !data_dirs.is_empty() {
+            d.hit(70, format!("{}/ 目录（Unity 数据目录）", data_dirs[0]));
         }
-        if let Some(dd) = data_dirs.first() {
-            if dd.join("Managed").join("Assembly-CSharp.dll").exists() {
-                ev.push("Mono 版（Assembly-CSharp.dll）".into());
-            }
+        if scan.has_root_file("unityplayer.dll") {
+            d.hit(60, "UnityPlayer.dll 运行时");
         }
-        if !crate::engines::others::list_files_by_ext_pub(root, &["dll"]).is_empty() {
-            // 仅提示
+        if scan.has_file_named("assembly-csharp.dll") {
+            d.hit(25, "Managed/Assembly-CSharp.dll（Mono 版）");
+        } else if scan.has_file_named("gameassembly.dll") {
+            d.hit(25, "GameAssembly.dll（IL2CPP 版）");
+            d.note("IL2CPP 版：需处理 global-metadata.dat 或走 AssetRipper，汉化难度高于 Mono 版");
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
-        vec![Op::Extract]
+        vec![Op::Extract, Op::Unlock]
     }
     fn describe(&self, root: &Path) -> String {
-        let mono = std::fs::read_dir(root)
-            .map(|rd| {
-                rd.flatten()
-                    .any(|d| d.path().join("Managed").join("Assembly-CSharp.dll").exists())
-            })
-            .unwrap_or(false);
-        if mono { "Mono 版".into() } else { "IL2CPP 版（或未知）".into() }
+        let scan = ScanCtx::build(root);
+        let kind = if scan.has_file_named("assembly-csharp.dll") {
+            "Mono 版"
+        } else if scan.has_file_named("gameassembly.dll") {
+            "IL2CPP 版"
+        } else {
+            "未知（或未解包）"
+        };
+        let dirs = scan.root_dirs_ending("_data");
+        if dirs.is_empty() {
+            format!("Player: {kind}")
+        } else {
+            format!("Player: {kind}；数据目录: {}/", dirs[0])
+        }
     }
     fn extract(&self, ctx: &Ctx) -> OpOutcome {
         let cfg = settings::load();
@@ -230,6 +239,25 @@ impl Engine for UnityPlugin {
                 String::from_utf8_lossy(&if o.stderr.is_empty() { o.stdout } else { o.stderr })
             )),
             Err(e) => OpOutcome::fail(format!("AssetRipper 调用失败: {e}")),
+        }
+    }
+    /// 全 CG 解锁（Unity **私有**手段）：PlayerPrefs 注册表路线
+    /// （Mono / IL2CPP 通用，不动游戏文件）。
+    ///
+    /// 由统一调度器 [`crate::features::unlock::run`] 按路线分派：仅 `Registry`
+    /// 走这里；若游戏目录自带《全CG存档》，调度器会优先走通用替换路线。
+    /// 缺省只读扫描（报告候选键名与哈希自检结果），`--opt:apply=1` 才真正写入。
+    /// 详见 `crate::features::gallery`。
+    fn unlock_impl(
+        &self,
+        route: crate::features::unlock::UnlockRoute,
+        ctx: &Ctx,
+    ) -> Option<OpOutcome> {
+        match route {
+            crate::features::unlock::UnlockRoute::Registry => {
+                Some(crate::features::gallery::unlock(ctx))
+            }
+            _ => None,
         }
     }
 }

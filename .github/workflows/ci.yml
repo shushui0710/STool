@@ -14,6 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      # 质量门禁（P1-3）：lint 不达标直接失败，
+      # 避免"零警告"只靠人工维持、随时间腐化。
+      #
+      # 说明：本项目历史代码为手工维护的「宽行」风格（见 stool-rs/rustfmt.toml），
+      # 全量 `cargo fmt` 会产生约 2000 行、跨越 37 个文件的改动，与「保持既有代码
+      # 风格一致」的目标冲突，因此 **不设置** `cargo fmt --check` 门禁。
+      # 若日后统一格式化一次，可在此处恢复该门禁。
+      - name: "Clippy 门禁 cargo clippy -D warnings"
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 用 --tests 而非全量 cargo test：本项目无 doctest（doc 里的代码块都标了 ```text），
+      # 显式限定可避免 Windows 上 doctest 执行器的环境差异（DLL 解析）造成假失败。
       - name: "运行全部测试"
-        run: cargo test --release
+        run: cargo test --tests

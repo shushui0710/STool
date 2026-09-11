@@ -19,71 +19,152 @@ pub fn parse(path: &Path) -> Result<Vec<PckEntry>, String> {
 }
 
 pub fn parse_bytes(data: &[u8]) -> Result<Vec<PckEntry>, String> {
+    use crate::formats::safe as sf;
     if data.len() < 24 || !data.starts_with(b"GDPC") {
         return Err("不是 PCK 封包".into());
     }
-    let fmt_ver = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let fmt_ver = sf::u32_le(data, 4).ok_or("PCK 头部截断")?;
+    // 头部布局：magic(4) + fmt_ver(4) + ver_major(4) + ver_minor(4) + 16×u32 保留(64)
     let mut pos = 20usize;
     let file_base: u64 = if fmt_ver == 2 {
-        let (flags, base) = (
-            u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()),
-            u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap()),
-        );
-        pos += 4 + 8;
+        let flags = sf::u32_le(data, pos).ok_or("PCK v2 头部截断")?;
+        let base = sf::u64_le(data, pos + 4).ok_or("PCK v2 头部截断")?;
         if flags & 2 != 0 {
             return Err("PCK 目录加密（Godot 加密包暂不支持）".into());
         }
-        pos += 64; // 16 个 u32 保留区（v2 同样存在）
+        // flags(4) + file_base(8) + 16×u32 保留(64)
+        pos = pos.checked_add(4 + 8 + 64).ok_or("PCK 头部越界")?;
         base
     } else {
-        pos += 64; // v1: 16 个 u32 保留
+        pos = pos.checked_add(64).ok_or("PCK 头部越界")?;
         0
     };
-    if pos + 4 > data.len() {
-        return Err("PCK 头部越界".into());
-    }
-    let count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    let count = sf::u32_le(data, pos).ok_or("PCK 头部越界（文件计数缺失）")?;
     pos += 4;
+
     let mut out = Vec::new();
     for _ in 0..count {
-        if pos + 4 > data.len() {
-            break;
-        }
-        let plen = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        // 容错：任何一处截断都停止解析已读条目（而不是 panic），已解析部分仍然有效
+        let plen = match sf::u32_le(data, pos) {
+            Some(v) => v as usize,
+            None => break,
+        };
         pos += 4;
-        if pos + plen > data.len() {
-            break;
-        }
-        let path = String::from_utf8_lossy(&data[pos..pos + plen])
-            .trim_end_matches('\0')
-            .to_string();
+        let raw = match sf::slice(data, pos, plen) {
+            Some(s) => s,
+            None => break,
+        };
+        let path = String::from_utf8_lossy(raw).trim_end_matches('\0').to_string();
         pos += plen;
-        if pos + 16 > data.len() {
-            break;
-        }
-        let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        let size = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
-        pos += 16 + 16; // offset + md5
+        let offset = match sf::u64_le(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        let size = match sf::u64_le(data, pos + 8) {
+            Some(v) => v,
+            None => break,
+        };
+        pos += 16 + 16; // offset(8) + size(8) + md5(16)
         if fmt_ver == 2 {
             // v2 每条目附加 4 字节 flags（bit0 = 单文件加密）
-            let eflags = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            let eflags = match sf::u32_le(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos += 4;
             if eflags & 1 != 0 {
                 // 单文件加密：保留条目但标记为不可读（offset 置 0 尺寸 0）
                 out.push(PckEntry { path, offset: 0, size: 0 });
-                pos += 4;
                 continue;
             }
-            pos += 4;
         }
-        out.push(PckEntry { path, offset: file_base + offset, size });
+        out.push(PckEntry { path, offset: file_base.wrapping_add(offset), size });
     }
     Ok(out)
 }
 
+// ---------- 流式 API（P2-1）：只读索引 + 按需读条目 ----------
+
+/// 只读索引（不整包读入）。条目截断即停止解析（已解析部分仍有效）。
+pub fn parse_index(src: &mut super::source::Source) -> Result<Vec<PckEntry>, String> {
+    let len = src.len();
+    if len < 24 {
+        return Err("不是 PCK 封包".into());
+    }
+    let head = src.read_exact_at(0, 20)?;
+    if !head.starts_with(b"GDPC") {
+        return Err("不是 PCK 封包".into());
+    }
+    let fmt_ver = u32::from_le_bytes(head[4..8].try_into().unwrap());
+    // 头部布局：magic(4) + fmt_ver(4) + ver_major(4) + ver_minor(4) + 16×u32 保留(64)
+    let mut pos = 20u64;
+    let file_base: u64 = if fmt_ver == 2 {
+        let h = src.read_exact_at(pos, 12)?;
+        let flags = u32::from_le_bytes(h[0..4].try_into().unwrap());
+        let base = u64::from_le_bytes(h[4..12].try_into().unwrap());
+        if flags & 2 != 0 {
+            return Err("PCK 目录加密（Godot 加密包暂不支持）".into());
+        }
+        pos += 4 + 8 + 64;
+        base
+    } else {
+        pos += 64;
+        0
+    };
+    let count = u32::from_le_bytes(src.read_exact_at(pos, 4)?.try_into().unwrap());
+    pos += 4;
+
+    let mut out = Vec::new();
+    for _ in 0..count {
+        // 容错：任何一处截断都停止解析已读条目（而不是 panic）
+        let plen = match src.read_at(pos, 4) {
+            Ok(v) if v.len() == 4 => u32::from_le_bytes(v.try_into().unwrap()) as usize,
+            _ => break,
+        };
+        pos += 4;
+        let raw = match src.read_at(pos, plen) {
+            Ok(v) if v.len() == plen => v,
+            _ => break,
+        };
+        let path = String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string();
+        pos += plen as u64;
+        let meta = match src.read_at(pos, 32) {
+            Ok(v) if v.len() == 32 => v,
+            _ => break,
+        };
+        let offset = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+        pos += 32; // offset(8) + size(8) + md5(16)
+        if fmt_ver == 2 {
+            // v2 每条目附加 4 字节 flags（bit0 = 单文件加密）
+            let eflags = match src.read_at(pos, 4) {
+                Ok(v) if v.len() == 4 => u32::from_le_bytes(v.try_into().unwrap()),
+                _ => break,
+            };
+            pos += 4;
+            if eflags & 1 != 0 {
+                out.push(PckEntry { path, offset: 0, size: 0 });
+                continue;
+            }
+        }
+        out.push(PckEntry { path, offset: file_base.wrapping_add(offset), size });
+    }
+    Ok(out)
+}
+
+/// 按需读取一个条目。
+pub fn read_entry(src: &mut super::source::Source, e: &PckEntry) -> Result<Vec<u8>, String> {
+    if e.size == 0 {
+        return Ok(Vec::new());
+    }
+    src.read_at(e.offset, e.size as usize)
+}
+
 pub fn read_file(data: &[u8], e: &PckEntry) -> Vec<u8> {
-    let start = e.offset as usize;
-    let end = (start + e.size as usize).min(data.len());
-    data[start.min(data.len())..end].to_vec()
+    // 用饱和加法 + min 夹取，避免伪造 offset/size 触发整数溢出 panic
+    let start = (e.offset as usize).min(data.len());
+    let end = start.saturating_add(e.size as usize).min(data.len());
+    data[start..end].to_vec()
 }
 
 /// 供测试：写出 v1 PCK。
@@ -117,7 +198,7 @@ pub fn write_v1(archive: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<(),
         out.extend_from_slice(&((raw_len + pad) as u32).to_le_bytes());
         out.extend_from_slice(pb);
         out.push(0u8);
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
         out.extend_from_slice(&(base + off).to_le_bytes());
         out.extend_from_slice(&(content.len() as u64).to_le_bytes());
         out.extend_from_slice(&[0u8; 16]); // md5 占位
@@ -138,9 +219,6 @@ pub fn write_v1_paths(archive: &Path, files: &BTreeMap<String, std::path::PathBu
     let mut est = 0usize;
     for (path_str, p) in files {
         let size = fs::metadata(p).map_err(|e| e.to_string())?.len();
-        if size > u64::MAX {
-            unreachable!()
-        }
         let n = path_str.len() + 1;
         est += 4 + n + (4 - n % 4) % 4 + 16 + 16;
         sizes.push((path_str.clone(), p.clone(), size));

@@ -1,4 +1,5 @@
-//! 命令行入口：detect / extract / repack / decompile / text-extract / text-import / text-inject / text-uninject / save / unlock / mod-* / gui。
+//! 命令行入口：detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support /
+//! extract / repack / decompile / text-extract / text-import / text-inject / text-uninject / save / unlock / mod-* / gui。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,18 @@ fn print_progress(frac: f32, msg: &str) {
 }
 
 fn run_op(reg: &Registry, det_id: &str, op: Op, root: &Path, out: &Path, opts: HashMap<String, String>) -> crate::engines::OpOutcome {
+    // 环境预检（P1-2）：写操作前置检查 目录可写 / 文件占用 / 磁盘空间，
+    // 失败直接返回「原因 + 修法」，而不是跑到一半才失败（几 GB 解包尤其致命）。
+    let scope = crate::features::precheck::scope_for_op(op, &opts);
+    let rep = crate::features::precheck::run(root, Some(out), scope);
+    if rep.worst() != crate::features::precheck::Level::Ok {
+        for line in rep.lines() {
+            eprintln!("[预检] {line}");
+        }
+    }
+    if !rep.ok() {
+        return crate::engines::OpOutcome::fail(rep.fail_summary());
+    }
     let engine = match reg.get(det_id) {
         Some(e) => e,
         None => return crate::engines::OpOutcome::fail("插件不存在"),
@@ -24,6 +37,8 @@ fn run_op(reg: &Registry, det_id: &str, op: Op, root: &Path, out: &Path, opts: H
         progress: &print_progress,
         cancel: &cancel,
     };
+    // 解包并行化（P2-2）：每次操作前清空「已建目录」缓存，避免上一操作删过目录后缓存失真。
+    crate::engines::clear_dir_cache();
     match op {
         Op::Extract => engine.extract(&ctx),
         Op::Repack => {
@@ -37,6 +52,88 @@ fn run_op(reg: &Registry, det_id: &str, op: Op, root: &Path, out: &Path, opts: H
         Op::Save => engine.save(&ctx),
         Op::Unlock => engine.unlock(&ctx),
     }
+}
+
+/// xp3-patch 子命令：KiriKiri / 吉里吉里 运行时补丁包（不改原封包、删除即还原）。
+///
+/// 用法:
+///   stool xp3-patch <游戏目录> --list
+///   stool xp3-patch <游戏目录> --src <改动目录> [--name patchN.xp3]
+///   stool xp3-patch <游戏目录> --remove <patchN.xp3>
+fn xp3_patch(args: &[String]) -> i32 {
+    let root = PathBuf::from(&args[0]);
+    let mut list = false;
+    let mut remove: Option<String> = None;
+    let mut src: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--remove" => {
+                i += 1;
+                remove = args.get(i).cloned();
+            }
+            "--src" => {
+                i += 1;
+                src = args.get(i).map(PathBuf::from);
+            }
+            "--name" => {
+                i += 1;
+                name = args.get(i).cloned();
+            }
+            other => eprintln!("未知参数: {other}"),
+        }
+        i += 1;
+    }
+
+    if let Some(n) = remove {
+        return match crate::features::xp3patch::remove(&root, &n) {
+            Ok(m) => {
+                println!("✔ {m}");
+                0
+            }
+            Err(e) => {
+                eprintln!("✘ {e}");
+                1
+            }
+        };
+    }
+
+    if let Some(src) = src {
+        return match crate::features::xp3patch::build(&root, &src, name.as_deref()) {
+            Ok(m) => {
+                println!("✔ {m}");
+                0
+            }
+            Err(e) => {
+                eprintln!("✘ {e}");
+                1
+            }
+        };
+    }
+
+    // 默认（含 --list）：列出封包与搜索顺序
+    let _ = list;
+    let items = crate::features::xp3patch::list(&root);
+    if items.is_empty() {
+        eprintln!("✘ {} 下没有找到 data*.xp3 / patch*.xp3", root.display());
+        return 1;
+    }
+    println!("{} 下的封包（引擎搜索顺序，越靠后优先级越高）：", root.display());
+    for it in &items {
+        let tag = if it.ours { "本工具创建" } else { "非本工具创建" };
+        let mut extra = String::new();
+        if let Some(n) = it.entries {
+            extra.push_str(&format!("，{n} 条目"));
+        }
+        if it.encrypted {
+            extra.push_str("，内容加密");
+        }
+        println!("  · {}（{}，{}{})", it.name, crate::features::precheck::human_bytes(it.bytes), tag, extra);
+    }
+    println!("下一个可用的补丁包名: {}", crate::features::xp3patch::next_name(&root));
+    0
 }
 
 fn opts_from(pairs: &[String]) -> HashMap<String, String> {
@@ -162,11 +259,11 @@ fn save_edit(args: &[String]) -> i32 {
 /// 机翻子命令：翻译文本提取 CSV 或注入 JSON 的空译文。
 /// 用法:
 ///   stool text-mtl <文件.csv|.json> [--preset deepseek|zhipu|ollama]
-///                  [--base-url URL --model 模型名 --key KEY] [--batch 20]
+///                  [--base-url URL --model 模型名 --key KEY] [--batch 20] [--jobs 4]
 fn text_mtl(args: &[String]) -> i32 {
     if args.is_empty() {
         eprintln!(
-            "用法: stool text-mtl <文件.csv|.json> [--preset deepseek|zhipu|ollama] [--base-url URL --model 名 --key KEY] [--batch 20]"
+            "用法: stool text-mtl <文件.csv|.json> [--preset deepseek|zhipu|ollama] [--base-url URL --model 名 --key KEY] [--batch 20] [--jobs 4]"
         );
         eprintln!("预设: deepseek=https://api.deepseek.com deepseek-chat | zhipu=https://open.bigmodel.cn/api/paas/v4 glm-4-flash | ollama=http://127.0.0.1:11434/v1 本地模型名");
         return 1;
@@ -175,6 +272,7 @@ fn text_mtl(args: &[String]) -> i32 {
     let (mut base_url, mut model, mut key) = (String::new(), String::new(), String::new());
     let mut glossary = String::new();
     let mut batch = 20usize;
+    let mut jobs = 4usize;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -221,6 +319,10 @@ fn text_mtl(args: &[String]) -> i32 {
                 i += 1;
                 batch = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(20);
             }
+            "--jobs" => {
+                i += 1;
+                jobs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(4).clamp(1, 32);
+            }
             other => eprintln!("未知参数: {other}"),
         }
         i += 1;
@@ -230,12 +332,12 @@ fn text_mtl(args: &[String]) -> i32 {
         return 1;
     }
     let tr = crate::features::translate::OpenAiCompat { base_url, api_key: key, model, glossary };
-    println!("机翻引擎: {} ({})", tr.model, tr.base_url);
+    println!("机翻引擎: {} ({}) 并发 {} 批", tr.model, tr.base_url, jobs);
     let cancel = AtomicBool::new(false);
     let r = if path.extension().map(|e| e == "json").unwrap_or(false) {
-        crate::features::translate::translate_json(&path, &tr, batch, &print_progress, &cancel)
+        crate::features::translate::translate_json(&path, &tr, batch, jobs, &print_progress, &cancel)
     } else {
-        crate::features::translate::translate_csv(&path, &tr, batch, &print_progress, &cancel)
+        crate::features::translate::translate_csv(&path, &tr, batch, jobs, &print_progress, &cancel)
     };
     match r {
         Ok((0, 0)) => {
@@ -253,23 +355,381 @@ fn text_mtl(args: &[String]) -> i32 {
     }
 }
 
+/// 校验各子命令的必填位置参数。返回 `Some(用法)` 表示参数不足，
+/// 调用方据此打印用法并返回退出码 2，避免直接索引 `args[n]` 触发 panic。
+fn missing_arg_usage(args: &[String]) -> Option<&'static str> {
+    let n = args.len();
+    match args[0].as_str() {
+        "detect" => (n < 2).then_some("stool detect <游戏目录>"),
+        "batch" => (n < 2).then_some("stool batch <根目录> [--depth N] [--op detect|extract|decompile|text-extract|save|unlock] [-o 输出基目录] [--csv 报告.csv]"),
+        "precheck" => (n < 2).then_some("stool precheck <游戏目录> [-o 输出目录] [--out-only|--root-only|--read-only]"),
+        "doctor" => (n < 2).then_some("stool doctor <游戏目录>"),
+        "selfcheck" => (n < 2).then_some("stool selfcheck <游戏目录|封包文件> [-o 工作目录]"),
+        "extract" | "decompile" | "save" | "unlock" | "text-extract" | "text-import"
+        | "text-inject" => (n < 2).then_some(
+            "stool <命令> <游戏目录> [-o 输出目录] [-p 插件id] [--opt:key=value]",
+        ),
+        "repack" => (n < 2).then_some("stool repack <游戏目录> [--opt:src_dir=<解包目录>]"),
+        "text-uninject" => (n < 2).then_some("stool text-uninject <游戏目录>"),
+        "restore" => (n < 2).then_some("stool restore <文件|.stool.bak 路径|目录>"),
+        "pack-apply" => (n < 3).then_some("stool pack-apply <原封包> <新封包>"),
+        "archive-toggle" => (n < 2).then_some("stool archive-toggle <游戏目录>"),
+        "mod-install" => (n < 3).then_some("stool mod-install <游戏目录> <补丁目录> [-n 名称] [--force]"),
+        "mod-list" | "mod-conflicts" => (n < 2).then_some("stool mod-list|mod-conflicts <游戏目录>"),
+        "mod-uninstall" | "mod-enable" | "mod-disable" => {
+            (n < 3).then_some("stool mod-<动作> <游戏目录> <MOD名称>")
+        }
+        "xp3-patch" => (n < 2).then_some(
+            "stool xp3-patch <游戏目录> --list | --src <改动目录> [--name patchN.xp3] | --remove <patchN.xp3>",
+        ),
+        _ => None,
+    }
+}
+
 pub fn main_args(args: Vec<String>) -> i32 {
     if args.is_empty() {
         return crate::gui::run();
     }
+    if let Some(usage) = missing_arg_usage(&args) {
+        eprintln!("✘ 参数不足。用法: {usage}");
+        return 2;
+    }
     match args[0].as_str() {
+        "xp3-patch" => xp3_patch(&args[1..]),
         "gui" => crate::gui::run(),
         "save-edit" => save_edit(&args[1..]),
         "text-mtl" => text_mtl(&args[1..]),
         "detect" => {
             let root = PathBuf::from(&args[1]);
             let reg = Registry::new();
-            for d in reg.detect_all(&root) {
-                if d.ok() {
-                    println!("★ {} [{}] 置信度 {} — {}", d.name, d.plugin_id, d.score, d.evidence.join("; "));
+            let all = reg.detect_all(&root);
+            // 选定引擎（已按 (分数, 优先级) 降序，取第一条），未达判定线时明确标注
+            let chosen = Registry::pick_from(&all);
+            let confirmed: Vec<_> = all.iter().filter(|d| d.ok()).collect();
+            for d in &confirmed {
+                println!(
+                    "★ {} [{}] {} 分 · {} — {}",
+                    d.name, d.plugin_id, d.score, d.confidence().label(), d.evidence.join("; ")
+                );
+                if !d.notes.is_empty() {
+                    println!("   备注: {}", d.notes);
+                }
+            }
+            if confirmed.is_empty() {
+                let sus: Vec<_> = all.iter().filter(|d| d.score > 0).take(3).collect();
+                if sus.is_empty() {
+                    println!("○ 未识别：没有任何引擎特征命中。请确认目录选到了含主程序 exe 的那一层（不是上一级、也不是子目录）。");
+                } else {
+                    println!("○ 未确认（无引擎达到 {} 分判定线），分数最高的疑似：", crate::engines::DETECT_LINE);
+                    for d in sus {
+                        println!("  · {} [{}] {} 分 — {}", d.name, d.plugin_id, d.score, d.evidence.join("; "));
+                    }
+                }
+            }
+            if let Some((d, confident)) = &chosen {
+                println!(
+                    "\n→ 选定: {} [{}] {} 分（{}）",
+                    d.name,
+                    d.plugin_id,
+                    d.score,
+                    if *confident {
+                        "已确认"
+                    } else {
+                        "未达判定线，仅供预览；可用 -p <id> 强制指定"
+                    }
+                );
+            }
+            0
+        }
+        "batch" => {
+            // 用法: stool batch <根目录> [--depth N] [--op detect|...] [-o 输出基目录] [--csv 报告.csv] [--opt:key=value]
+            let base = PathBuf::from(&args[1]);
+            let mut depth = 3usize;
+            let mut op_name = "detect".to_string();
+            let mut out_base: Option<PathBuf> = None;
+            let mut csv: Option<PathBuf> = None;
+            let mut pairs: Vec<String> = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--depth" => {
+                        i += 1;
+                        depth = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(3);
+                    }
+                    "--op" => {
+                        i += 1;
+                        op_name = args.get(i).cloned().unwrap_or_else(|| "detect".into());
+                    }
+                    "--csv" => {
+                        i += 1;
+                        csv = args.get(i).map(PathBuf::from);
+                    }
+                    "-o" => {
+                        i += 1;
+                        out_base = args.get(i).map(PathBuf::from);
+                    }
+                    s if s.starts_with("--opt:") => pairs.push(s.trim_start_matches("--opt:").to_string()),
+                    other => eprintln!("未知参数: {other}"),
+                }
+                i += 1;
+            }
+            let roots = crate::features::batch::discover(&base, depth);
+            if roots.is_empty() {
+                println!("✘ 在 {} 下未发现候选游戏目录（深度 {depth}）", base.display());
+                return 1;
+            }
+            println!("发现 {} 个候选游戏目录（根: {}）", roots.len(), base.display());
+            let prog = |idx: usize, n: usize, p: &Path| eprintln!("[{}/{n}] {}", idx + 1, p.display());
+            let items = if op_name == "detect" {
+                crate::features::batch::detect_batch(&roots, &prog)
+            } else {
+                let op = match op_name.as_str() {
+                    "extract" => Op::Extract,
+                    "decompile" => Op::Decompile,
+                    "text-extract" => Op::TextExtract,
+                    "save" => Op::Save,
+                    "unlock" => Op::Unlock,
+                    other => {
+                        eprintln!("✘ 不支持的 --op: {other}（可选 detect/extract/decompile/text-extract/save/unlock）");
+                        return 2;
+                    }
+                };
+                let out_base = out_base.unwrap_or_else(|| base.join("stool_batch_out"));
+                crate::features::batch::run_batch(&roots, op, &out_base, &opts_from(&pairs), &prog)
+            };
+            for it in &items {
+                let mark = if it.ok { "✔" } else { "✘" };
+                let eng = if it.engine_id.is_empty() { "未识别" } else { &it.engine_id };
+                println!("{mark} {} [{eng}] {} — {}", it.root.display(), it.confidence, it.message);
+            }
+            println!("{}", crate::features::batch::summary(&items));
+            if let Some(c) = csv {
+                match std::fs::write(&c, crate::features::batch::to_csv(&items)) {
+                    Ok(_) => println!("报告已写出: {}", c.display()),
+                    Err(e) => eprintln!("✘ 写 CSV 失败: {e}"),
                 }
             }
             0
+        }
+        "inject-support" => {
+            let t = crate::features::inject::SUPPORT_TABLE;
+            println!("运行时 JSON 注入支持范围（共 {} 个引擎）：", t.len());
+            for s in t {
+                println!("  · {} [{}]", s.engine, s.plugin_id);
+                println!("      适配: {}", s.mechanism);
+                println!("      边界: {}", s.limits);
+            }
+            println!("未列出的引擎（KiriKiri / Siglus / BGI / RPG Maker 2000 等）：文本封在私有封包或编译脚本里，");
+            println!("请走「解包 → 文本提取 → 翻译 → 翻译回填 / 封包回写」这套离线流程；");
+            println!("KiriKiri 系还可以走「运行时补丁包」（xp3-patch），见下：");
+            let pt = crate::features::xp3patch::PATCH_TARGETS;
+            println!("\n运行时补丁包支持范围（共 {} 个引擎）：", pt.len());
+            for s in pt {
+                println!("  · {} [{}]", s.engine, s.plugin_id);
+                println!("      机制: {}", s.mechanism);
+                println!("      边界: {}", s.limits);
+                println!("      注意: {}", s.caveat);
+            }
+            0
+        }
+        "engines" => {
+            let reg = Registry::new();
+            let matrix = reg.capability_matrix();
+            println!("引擎能力矩阵（{} 个插件；能力 = 插件声明 ∪ 解锁策略表推导）", matrix.len());
+            for (id, name, caps) in matrix {
+                let cap_str = caps.iter().map(|c| c.label()).collect::<Vec<_>>().join(" / ");
+                println!("  · {name} [{id}]");
+                println!("      能力: {cap_str}");
+                let spec = crate::features::unlock::spec_or_generic(&id);
+                let routes = spec
+                    .routes
+                    .iter()
+                    .map(|r| format!("{}({})", r.label(), r.key()))
+                    .collect::<Vec<_>>()
+                    .join(" > ");
+                println!("      识别依据: {}", spec.basis);
+                println!("      解锁动作: {}", spec.action);
+                println!("      解锁手段（优先序）: {routes}");
+            }
+            0
+        }
+        "unlock-support" => {
+            let table = crate::features::unlock::UNLOCK_CATALOG;
+            println!("全 CG 解锁策略表（{} 个引擎；未列出的走兜底策略）", table.len());
+            for s in table {
+                let routes = s
+                    .routes
+                    .iter()
+                    .map(|r| format!("{}({})", r.label(), r.key()))
+                    .collect::<Vec<_>>()
+                    .join(" > ");
+                println!("  · {} [{}]", s.engine_id, s.basis);
+                println!("      手段: {routes}");
+                println!("      动作: {}", s.action);
+                if !s.note.is_empty() {
+                    println!("      提示: {}", s.note);
+                }
+            }
+            println!(
+                "\n用法: stool unlock <游戏目录> [--opt:apply=1] [--opt:route=<{}>] [--opt:save_dir=<目录>]",
+                crate::features::unlock::route_keys()
+            );
+            println!("缺省为只读预览；覆盖写盘前自动备份为 .stool.bak，可用 stool restore 还原。");
+            0
+        }
+        "precheck" => {
+            // 用法: stool precheck <游戏目录> [-o 输出目录] [--out-only|--root-only|--read-only]
+            use crate::features::precheck::{self, Scope};
+            let root = PathBuf::from(&args[1]);
+            let mut out: Option<PathBuf> = None;
+            let mut scope = Scope::both();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-o" => {
+                        i += 1;
+                        out = args.get(i).map(PathBuf::from);
+                    }
+                    "--out-only" => scope = Scope::out_only(),
+                    "--root-only" => scope = Scope::root_only(),
+                    "--read-only" => scope = Scope::read_only(),
+                    other => eprintln!("未知参数: {other}"),
+                }
+                i += 1;
+            }
+            let rep = precheck::run(&root, out.as_deref(), scope);
+            println!("环境预检: {}", root.display());
+            for line in rep.lines() {
+                println!("{line}");
+            }
+            if rep.ok() {
+                println!("✔ 预检通过，可以开始操作。");
+                0
+            } else {
+                println!("✘ {}（退出码 2）", rep.fail_summary());
+                2
+            }
+        }
+        "doctor" => {
+            // 用法: stool doctor <游戏目录>
+            // D1 游戏体检（P2-8）：区域设置 / 日文字体 / 运行库 DLL / 路径 / 写权限。
+            let root = PathBuf::from(&args[1]);
+            let reg = Registry::new();
+            let engine = reg.best(&root).map(|d| d.plugin_id).unwrap_or_default();
+            let rep = crate::features::health::check(&root, &engine);
+            println!(
+                "游戏体检: {}（引擎: {}）",
+                root.display(),
+                if engine.is_empty() { "未识别" } else { engine.as_str() }
+            );
+            for line in rep.lines() {
+                println!("{line}");
+            }
+            let hints = rep
+                .items
+                .iter()
+                .filter(|i| i.level != crate::features::precheck::Level::Ok)
+                .count();
+            if rep.ok() {
+                println!("✔ 体检完成：{hints} 项提示，未发现阻断性问题。");
+                0
+            } else {
+                println!("✘ 体检发现问题（见上）。");
+                2
+            }
+        }
+        "selfcheck" => {
+            // 用法: stool selfcheck <游戏目录|封包文件> [-o 工作目录]
+            // P2-6 封包自检：解包 → 重打包 → 逐条目比对，确认对该封包的读写无损。
+            let target = PathBuf::from(&args[1]);
+            let mut work: Option<PathBuf> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-o" => {
+                        i += 1;
+                        work = args.get(i).map(PathBuf::from);
+                    }
+                    other => eprintln!("未知参数: {other}"),
+                }
+                i += 1;
+            }
+            let work_root = work.unwrap_or_else(crate::features::selfcheck::default_work_root);
+            if target.is_file() {
+                println!("封包自检: {}", target.display());
+                match crate::features::selfcheck::check_archive(&target, &work_root) {
+                    Ok(o) => {
+                        for line in o.report().lines() {
+                            println!("{line}");
+                        }
+                        if o.ok() {
+                            println!("✔ 无损：解包→重打包→回读逐条目一致。");
+                            0
+                        } else {
+                            println!("✘ 发现 {} 处往返不一致（见上）。", o.mismatches.len());
+                            1
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("✘ {e}");
+                        1
+                    }
+                }
+            } else {
+                println!("封包自检: {}", target.display());
+                let rep = crate::features::selfcheck::check_dir(&target, &work_root);
+                for line in rep.lines() {
+                    println!("{line}");
+                }
+                if rep.ok() {
+                    println!("✔ 自检通过（无不一致）。");
+                    0
+                } else {
+                    println!("✘ 自检发现阻断性问题（见上）。");
+                    2
+                }
+            }
+        }
+        "diag-export" => {
+            // 用法: stool diag-export [游戏目录] [-o 输出.zip]
+            let mut game: Option<PathBuf> = None;
+            let mut out: Option<PathBuf> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-o" => {
+                        i += 1;
+                        out = args.get(i).map(PathBuf::from);
+                    }
+                    other if !other.starts_with('-') => game = Some(PathBuf::from(other)),
+                    other => eprintln!("未知参数: {other}"),
+                }
+                i += 1;
+            }
+            let out = out.unwrap_or_else(|| {
+                PathBuf::from(format!("stool_diag_{}.zip", crate::diag::stamp_compact()))
+            });
+            match crate::features::diagpack::export(game.as_deref(), &out) {
+                Ok(r) => {
+                    println!(
+                        "✔ 诊断包已导出 → {}（{} 个条目，含 {} 条告警）",
+                        r.zip_path.display(),
+                        r.entries.len(),
+                        r.warnings
+                    );
+                    for e in &r.entries {
+                        println!("    · {e}");
+                    }
+                    if r.warnings > 0 {
+                        println!("提示：warnings.txt 里汇总了 WARN/ERROR/PANIC 行，排障先看它。");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("✘ {e}");
+                    1
+                }
+            }
         }
         "extract" | "decompile" | "save" | "unlock" | "text-extract" | "text-import" | "text-inject" => {
             let root = PathBuf::from(&args[1]);
@@ -410,6 +870,22 @@ pub fn main_args(args: Vec<String>) -> i32 {
                 }
             }
         }
+        "pack-apply" => {
+            // 用法: stool pack-apply <原封包> <新封包>
+            // 回填一键闭环（P2-5）：用重打包产物替换原封包，覆盖前自动留底（绝不再覆盖旧备份）。
+            let target = PathBuf::from(&args[1]);
+            let new_archive = PathBuf::from(&args[2]);
+            match crate::features::restore::apply_repack(&target, &new_archive) {
+                Ok(m) => {
+                    println!("✔ {m}");
+                    0
+                }
+                Err(e) => {
+                    println!("✘ {e}");
+                    1
+                }
+            }
+        }
         "restore" => {
             // 用法: stool restore <文件或 .stool.bak 路径或目录>
             // 文件 → 从同名 .stool.bak 还原；.stool.bak 文件 → 直接还原；目录 → 只列出备份
@@ -460,9 +936,17 @@ pub fn main_args(args: Vec<String>) -> i32 {
             let root = PathBuf::from(&args[1]);
             let patch = PathBuf::from(&args[2]);
             let name = args.iter().position(|a| a == "-n").and_then(|i| args.get(i + 1)).cloned().unwrap_or_default();
-            match crate::features::mods::install_mod(&root, &patch, &name, &print_progress) {
+            let force = args.iter().any(|a| a == "--force" || a == "--allow-conflict");
+            match crate::features::mods::install_mod(&root, &patch, &name, &print_progress, force) {
                 Ok(e) => {
                     println!("✔ 已安装 MOD '{}': {} 文件，覆盖 {} 原文件", e.name, e.files.len(), e.overwritten.len());
+                    let c = crate::features::mods::conflicts(&root);
+                    if !c.is_empty() {
+                        println!("⚠ 当前存在 {} 处 MOD 冲突（mod-conflicts 可单独查看）：", c.len());
+                        for x in c.iter().take(8) {
+                            println!("   · {} ← {}", x.rel, x.mods.join(" / "));
+                        }
+                    }
                     0
                 }
                 Err(e) => {
@@ -472,10 +956,32 @@ pub fn main_args(args: Vec<String>) -> i32 {
             }
         }
         "mod-list" => {
-            for m in crate::features::mods::list_mods(&PathBuf::from(&args[1])) {
+            let root = PathBuf::from(&args[1]);
+            for m in crate::features::mods::list_mods(&root) {
                 println!("{} {} — {} 文件", if m.enabled { "[启用]" } else { "[停用]" }, m.name, m.files.len());
             }
+            let c = crate::features::mods::conflicts(&root);
+            if !c.is_empty() {
+                println!("⚠ 检测到 {} 处冲突（多个已启用 MOD 覆盖同一文件）：", c.len());
+                for x in &c {
+                    println!("   · {} ← {}", x.rel, x.mods.join(" / "));
+                }
+            }
             0
+        }
+        "mod-conflicts" => {
+            let root = PathBuf::from(&args[1]);
+            let c = crate::features::mods::conflicts(&root);
+            if c.is_empty() {
+                println!("✔ 无 MOD 冲突");
+                0
+            } else {
+                for x in &c {
+                    println!("⚠ {} ← {}", x.rel, x.mods.join(" / "));
+                }
+                println!("共 {} 处冲突（退出码 1）", c.len());
+                1
+            }
         }
         "mod-uninstall" | "mod-enable" | "mod-disable" => {
             let root = PathBuf::from(&args[1]);
@@ -497,7 +1003,7 @@ pub fn main_args(args: Vec<String>) -> i32 {
             }
         }
         _ => {
-            eprintln!("未知命令: {}。可用: gui / detect / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / archive-toggle / pack-export / pack-import / mod-*", args[0]);
+            eprintln!("未知命令: {}。可用: gui / detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / mod-enable / mod-disable / diag-export", args[0]);
             2
         }
     }

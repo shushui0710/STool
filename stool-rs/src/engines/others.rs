@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{safe_out_path, Ctx, Detection, Engine, Op, OpOutcome};
+use super::scan::ScanCtx;
+use super::{Ctx, Detection, Engine, Op, OpOutcome};
+use crate::formats::source::{self, Source};
 use crate::formats::{asar, marshal, nscript, pck, rgss, rpgmmv, xp3};
 
 pub fn list_files_by_ext(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
@@ -35,12 +37,9 @@ pub struct RpgMakerMvPlugin;
 
 impl RpgMakerMvPlugin {
     pub fn data_dir(root: &Path) -> Option<PathBuf> {
-        for c in [root.join("www").join("data"), root.join("data")] {
-            if c.join("Actors.json").exists() {
-                return Some(c);
-            }
-        }
-        None
+        [root.join("www").join("data"), root.join("data")]
+            .into_iter()
+            .find(|c| c.join("Actors.json").exists())
     }
 }
 
@@ -54,28 +53,24 @@ impl Engine for RpgMakerMvPlugin {
     fn priority(&self) -> i32 {
         85
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        if Self::data_dir(root).is_some() {
-            score += 60;
-            ev.push("data/Actors.json 游戏数据".into());
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        // Actors.json 是 MV/MZ 独有的核心数据（在 data/ 或 www/data/ 里，故走白名单名前查）
+        if scan.has_file_named("actors.json") {
+            d.hit(65, "data/Actors.json 游戏数据");
         }
-        let enc = list_files_by_ext(root, &["rpgmvp", "rpgmvo", "rpgmvm"]).len();
-        let enc_mz = list_files_by_ext(root, &["png_", "ogg_", "m4a_"]).len();
+        let enc = scan.ext_sum(&["rpgmvp", "rpgmvo", "rpgmvm"]);
+        let enc_mz = scan.ext_sum(&["png_", "ogg_", "m4a_"]);
         if enc + enc_mz > 0 {
-            score += 25;
-            ev.push(format!("{} 个加密素材", enc + enc_mz));
+            d.hit(25, format!("{} 个 MV/MZ 加密素材", enc + enc_mz));
         }
-        if root.join("Game.rpgproject").exists() {
-            score += 15;
-            ev.push("Game.rpgproject".into());
+        if scan.has_file_named("game.rpgproject") {
+            d.hit(15, "Game.rpgproject 工程文件");
         }
-        if root.join("www").join("js").is_dir() || root.join("js").is_dir() {
-            score += 10;
-            ev.push("js/ 脚本目录".into());
+        if scan.has_dir("js") {
+            d.hit(10, "js/ 脚本目录");
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::Repack, Op::TextExtract, Op::TextImport, Op::TextInject, Op::Save]
@@ -257,6 +252,7 @@ impl Engine for RpgMakerMvPlugin {
             }
         }
         let mut done = 0usize;
+        let mut write_failed = 0usize;
         for (fname, pairs) in &edits {
             let fp = data_dir.join(fname);
             if !fp.exists() {
@@ -349,9 +345,15 @@ impl Engine for RpgMakerMvPlugin {
                     }
                 }
             }
-            let _ = fs::write(out_dir.join(fname), serde_json::to_string_pretty(&v).unwrap_or_default());
+            let json = serde_json::to_string_pretty(&v).unwrap_or_default();
+            let dst = out_dir.join(fname);
+            if let Err(e) = fs::write(&dst, json) {
+                write_failed += 1;
+                crate::diag::log("WARN", &format!("回写失败 {}: {e}", dst.display()));
+            }
         }
-        OpOutcome::okn(format!("回填 {done} 条 → {}（重命名为 data 前请备份原目录）", out_dir.display()), done)
+        let msg = crate::engines::with_fail_note(format!("回填 {done} 条 → {}（重命名为 data 前请备份原目录）", out_dir.display()), write_failed);
+        OpOutcome::okn(msg, done)
     }
     fn save(&self, ctx: &Ctx) -> OpOutcome {
         let sdirs: Vec<PathBuf> = [ctx.root.join("www").join("save"), ctx.root.join("save")]
@@ -440,28 +442,26 @@ impl Engine for RpgMakerRgssPlugin {
     fn priority(&self) -> i32 {
         80
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        let mut kind = String::new();
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
         for (ext, k) in [("rgssad", "RGSS1"), ("rgss2a", "RGSS1"), ("rgss3a", "RGSS3")] {
-            if !list_files_by_ext(root, &[ext]).is_empty() {
-                score += 70;
-                kind = k.into();
-                ev.push(format!("*.{ext} 封包"));
+            if scan.has_ext(ext) {
+                d.hit(70, format!("{}（.{ext} 封包）", scan.first_ext_name(ext)));
+                d.notes = k.into();
             }
         }
-        for d in ["Data", "Graphics", "Audio"] {
-            if root.join(d).is_dir() {
-                score += 10;
-                ev.push(format!("{d}/ 目录"));
+        for name in ["Data", "Graphics", "Audio"] {
+            if scan.has_root_dir(name) {
+                d.hit(10, format!("{name}/ 目录"));
             }
         }
-        if !list_files_by_ext(&root.join("Data"), &["rxdata", "rvdata", "rvdata2"]).is_empty() {
-            score += 15;
-            ev.push("Data/Scripts 数据脚本".into());
+        // 已解包（无 .rgss3a）时：Data/*.rxdata|rvdata|rvdata2 是 RMXP/VX/Ace 的独有数据，
+        // 单独就该过线，不能再像旧版只给 15 分导致"解包后反而识别不出"。
+        let scripts = scan.ext_sum(&["rxdata", "rvdata", "rvdata2"]);
+        if scripts > 0 {
+            d.hit(50, format!("{scripts} 个 .rxdata/.rvdata2 游戏数据（已解包）"));
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: kind }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::Repack, Op::Decompile, Op::TextExtract, Op::Save]
@@ -478,38 +478,81 @@ impl Engine for RpgMakerRgssPlugin {
             return OpOutcome::fail("未找到 RGSS 封包");
         }
         let mut done = 0usize;
+        let mut failed = 0usize;
+        let mut resume = crate::engines::Resume::open(ctx.out_dir, "extract", ctx.root).configured(ctx);
         for (i, arc) in archives.iter().enumerate() {
             if ctx.cancelled() {
+                resume.flush();
                 return OpOutcome::fail("已取消");
             }
-            let data = fs::read(arc).unwrap_or_default();
+            let mut src = match Source::open(arc, source::MAX_ARCHIVE) {
+                Ok(s) => s,
+                Err(e) => {
+                    resume.flush();
+                    return OpOutcome::fail(e);
+                }
+            };
             let is_v3 = arc.extension().map(|e| e == "rgss3a").unwrap_or(false);
+            let workers = crate::engines::worker_count(ctx);
             if is_v3 {
-                let entries = match rgss::parse_v3(arc) {
+                let entries = match rgss::parse_index_v3(&mut src) {
                     Ok(e) => e,
-                    Err(er) => return OpOutcome::fail(er),
+                    Err(er) => {
+                        resume.flush();
+                        return OpOutcome::fail(er);
+                    }
                 };
-                for (j, e) in entries.iter().enumerate() {
-                    let blob = rgss::extract_v3_file(&data, e.offset, e.size, e.filekey);
-                    let _ = fs::write(safe_out_path(ctx.out_dir, &e.name), blob);
-                    done += 1;
-                    ctx.report(j as f32 / entries.len().max(1) as f32, &e.name);
+                let mut jobs: Vec<crate::engines::Job<&rgss::V3Entry>> = Vec::new();
+                for e in &entries {
+                    if !resume.already_done(ctx.out_dir, &e.name) {
+                        jobs.push(crate::engines::Job { rel: e.name.clone(), item: e });
+                    }
                 }
+                let skipped_here = entries.len() - jobs.len();
+                let (w, f) = crate::engines::parallel_extract(
+                    &jobs,
+                    ctx.out_dir,
+                    workers,
+                    ctx,
+                    || Source::open(arc, source::MAX_ARCHIVE),
+                    |s, e| rgss::read_entry_v3(s, e.offset, e.size, e.filekey),
+                    &mut resume,
+                );
+                done += w + skipped_here;
+                failed += f;
             } else {
-                let entries = match rgss::parse_v1(arc) {
+                let entries = match rgss::parse_index_v1(&mut src) {
                     Ok(e) => e,
-                    Err(er) => return OpOutcome::fail(er),
+                    Err(er) => {
+                        resume.flush();
+                        return OpOutcome::fail(er);
+                    }
                 };
-                for (j, (name, (off, size, key))) in entries.iter().enumerate() {
-                    let blob = rgss::extract_v1_file(&data, *off, *size, *key);
-                    let _ = fs::write(safe_out_path(ctx.out_dir, name), blob);
-                    done += 1;
-                    ctx.report(j as f32 / entries.len().max(1) as f32, name);
+                let mut jobs: Vec<crate::engines::Job<(u64, u32, u32)>> = Vec::new();
+                for (name, (off, size, key)) in &entries {
+                    if !resume.already_done(ctx.out_dir, name) {
+                        jobs.push(crate::engines::Job { rel: name.clone(), item: (*off, *size, *key) });
+                    }
                 }
+                let skipped_here = entries.len() - jobs.len();
+                let (w, f) = crate::engines::parallel_extract(
+                    &jobs,
+                    ctx.out_dir,
+                    workers,
+                    ctx,
+                    || Source::open(arc, source::MAX_ARCHIVE),
+                    |s, (off, size, key)| rgss::read_entry_v1(s, *off, *size, *key),
+                    &mut resume,
+                );
+                done += w + skipped_here;
+                failed += f;
             }
             ctx.report(i as f32 / archives.len() as f32, &arc.display().to_string());
         }
-        OpOutcome::okn(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), done)
+        let skipped = resume.finish(failed == 0);
+        let msg = crate::engines::with_fail_note(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), failed);
+        let msg = crate::engines::with_resume_note(msg, skipped);
+        OpOutcome::okn(msg, done)
     }
     fn repack(&self, ctx: &Ctx, src_dir: &Path) -> OpOutcome {
         // 找到游戏根目录下的封包（rgss3a=v3，rgssad/rgss2a=v1）
@@ -546,9 +589,11 @@ impl Engine for RpgMakerRgssPlugin {
         if files.is_empty() {
             return OpOutcome::fail(format!("{} 为空，没有可封包的文件", src_dir.display()));
         }
-        // 备份原封包
-        let bak = arc.with_extension(format!("{ext}.stool.bak"));
-        let _ = fs::copy(&arc, &bak);
+        // 备份原封包：已存在则保留（绝不覆盖），失败则中止——宁可不动，也不能无备份改写
+        let bak = match crate::settings::backup_or_abort(&arc) {
+            Ok(b) => b,
+            Err(e) => return OpOutcome::fail(e),
+        };
         let r = if v3 {
             rgss::write_v3_paths(&arc, &files)
         } else {
@@ -577,11 +622,17 @@ impl Engine for RpgMakerRgssPlugin {
             Ok(codes) => {
                 let out = ctx.out_dir.join("scripts");
                 let _ = fs::create_dir_all(&out);
+                let mut failed = 0usize;
                 for (i, raw) in codes.iter().enumerate() {
-                    let _ = fs::write(out.join(format!("{i:03}.rb")), raw);
+                    let p = out.join(format!("{i:03}.rb"));
+                    if let Err(e) = fs::write(&p, raw) {
+                        failed += 1;
+                        crate::diag::log("WARN", &format!("写出失败 {}: {e}", p.display()));
+                    }
                 }
                 let n = codes.len();
-                OpOutcome::okn(format!("提取 {n} 个 Ruby 脚本 → {}", out.display()), n)
+                let msg = crate::engines::with_fail_note(format!("提取 {n} 个 Ruby 脚本 → {}", out.display()), failed);
+                OpOutcome::okn(msg, n)
             }
             Err(e) => OpOutcome::fail(format!("Ruby Marshal 解析失败: {e}")),
         }
@@ -775,23 +826,34 @@ impl Engine for KirikiriPlugin {
     fn priority(&self) -> i32 {
         75
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        let xp3s = list_files_by_ext(root, &["xp3"]);
-        if !xp3s.is_empty() {
-            score += 70;
-            ev.push(format!("{} 个 .xp3 封包", xp3s.len()));
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        if scan.has_ext("xp3") {
+            d.hit(70, format!("{} 个 .xp3 封包", scan.ext_count("xp3")));
         }
-        if fs::read_dir(root).map(|rd| rd.flatten().any(|d| d.file_name().to_string_lossy().to_lowercase().starts_with("krkr") && d.path().extension().map(|e| e == "exe").unwrap_or(false))).unwrap_or(false) {
-            score += 20;
-            ev.push("krkr*.exe".into());
+        if scan.any_exe_contains("krkr") {
+            d.hit(20, "krkr*.exe 运行时");
         }
-        if !list_files_by_ext(root, &["tjs", "ks"]).is_empty() {
-            score += 15;
-            ev.push("明文 .tjs/.ks 脚本".into());
+        // .ks 与 TyranoScript 同名，用 tyrano/ 目录把两者区分开，避免互相误判。
+        let is_tyrano = scan.has_root_dir("tyrano");
+        let tjs = scan.ext_count("tjs");
+        let ks = scan.ext_count("ks");
+        if is_tyrano {
+            if tjs + ks > 0 {
+                d.note("目录里有 tyrano/，更像是 TyranoScript 而非 KiriKiri（见 TyranoBuilder 识别结果）");
+            }
+        } else {
+            // 未打包 / 已解包：明文 .tjs（引擎脚本）+ .ks（KAG 剧情）可见。
+            // 旧版只给 15 分，导致"解包后 / 未打包的 KiriKiri"识别不出来，这里补强。
+            if tjs + ks > 0 {
+                let pts = if tjs + ks >= 5 { 45 } else { 20 };
+                d.hit(pts, format!("{tjs} 个 .tjs + {ks} 个 .ks 明文脚本（未打包）"));
+            }
+            if scan.has_file_named("config.tjs") || scan.has_file_named("startup.tjs") {
+                d.hit(25, "Config.tjs / Startup.tjs 引擎配置");
+            }
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::Repack, Op::TextExtract]
@@ -820,9 +882,14 @@ impl Engine for KirikiriPlugin {
             if files.is_empty() {
                 continue;
             }
-            let bak = arc.with_extension("xp3.stool.bak");
-            let _ = fs::copy(arc, &bak);
-            match xp3::write_paths(arc, &files) {
+            // 备份已存在则保留（绝不覆盖）；备份失败就跳过这个封包，而不是无备份改写
+            if let Err(e) = crate::settings::backup_or_abort(arc) {
+                return OpOutcome::fail(format!("{}: {e}", file_name(arc)));
+            }
+            // 写出时沿用原封包的头部变体（V1 老游戏套 V2 头可能load不了），
+            // 并且绝不能沿用「加密标志」——我们写的是明文内容。
+            let ver = xp3::version_of(arc).unwrap_or(xp3::Xp3Version::V2);
+            match xp3::write_paths_v(arc, &files, ver) {
                 Ok(_) => {
                     rebuilt += 1;
                     msgs.push(format!("{}（{} 文件）", file_name(arc), files.len()));
@@ -845,34 +912,84 @@ impl Engine for KirikiriPlugin {
             return OpOutcome::fail("未找到 .xp3");
         }
         let mut done = 0usize;
+        let mut write_failed = 0usize;
         let mut failed = Vec::new();
+        let mut encrypted: Vec<String> = Vec::new();
+        let mut resume = crate::engines::Resume::open(ctx.out_dir, "extract", ctx.root).configured(ctx);
         for (i, arc) in xp3s.iter().enumerate() {
             if ctx.cancelled() {
+                resume.flush();
                 return OpOutcome::fail("已取消");
             }
-            let data = fs::read(arc).unwrap_or_default();
-            let files = match xp3::parse_bytes(&data) {
+            let mut src = match Source::open(arc, source::MAX_ARCHIVE) {
+                Ok(s) => s,
+                Err(e) => {
+                    failed.push(format!("{}: {e}", file_name(arc)));
+                    continue;
+                }
+            };
+            let files = match xp3::parse_index(&mut src) {
                 Ok(f) => f,
                 Err(e) => {
                     failed.push(format!("{}: {e}", file_name(arc)));
                     continue;
                 }
             };
-            let sub = ctx.out_dir.join(arc.file_stem().unwrap_or_default().to_string_lossy().as_ref());
-            let total = files.len().max(1);
-            for (j, (name, entry)) in files.iter().enumerate() {
-                if let Ok(blob) = xp3::read_file(&data, entry) {
-                    let _ = fs::write(safe_out_path(&sub, name), blob);
-                    done += 1;
-                }
-                ctx.report(j as f32 / total as f32, name);
+            // 引擎加密的内容我们解不出来（各家 Cx/Hx 方案按游戏定制）。
+            // 与其把乱码当成果写盘，不如明确报错并给替代路线。
+            let enc = xp3::encrypted_count(&files);
+            if enc > 0 {
+                encrypted.push(format!(
+                    "{}（{enc}/{} 个条目加密）",
+                    file_name(arc),
+                    files.len()
+                ));
+                continue;
             }
+            let sub = ctx.out_dir.join(arc.file_stem().unwrap_or_default().to_string_lossy().as_ref());
+            let mut jobs: Vec<crate::engines::Job<&xp3::Xp3Entry>> = Vec::new();
+            for (name, entry) in &files {
+                if !resume.already_done(&sub, name) {
+                    jobs.push(crate::engines::Job { rel: name.clone(), item: entry });
+                }
+            }
+            let skipped_here = files.len() - jobs.len();
+            let (w, f) = crate::engines::parallel_extract(
+                &jobs,
+                &sub,
+                crate::engines::worker_count(ctx),
+                ctx,
+                || Source::open(arc, source::MAX_ARCHIVE),
+                |s, e| xp3::read_entry(s, e),
+                &mut resume,
+            );
+            done += w + skipped_here;
+            write_failed += f;
             ctx.report(i as f32 / xp3s.len() as f32, &arc.display().to_string());
+        }
+        let skipped = resume.finish(write_failed == 0 && failed.is_empty() && encrypted.is_empty());
+        // 全部封包都被加密 → 直接失败：这不是“解包失败”，而是本工具不解这类保护，
+        // 必须让用户知道原因和替代路线，而不是拿到一堆乱码。
+        if done == 0 && !encrypted.is_empty() {
+            return OpOutcome::fail(format!(
+                "该游戏的 .xp3 内容被 KiriKiri 加密方案保护（{}），STool 不内置解密。\
+                 替代做法：用 GARbro / KrrkExtract 等工具按游戏的加密方案解密并导出，\
+                 或改用已发布的汉化补丁中的明文脚本；导出成明文目录后，本工具的解包/文本/回写流程都能继续用。",
+                encrypted.join("、")
+            ));
         }
         let mut msg = format!("解包 {done} 个文件 → {}", ctx.out_dir.display());
         if !failed.is_empty() {
             msg.push_str(&format!("；失败封包（可能自定义加密）: {}", failed.join("; ")));
         }
+        if !encrypted.is_empty() {
+            msg.push_str(&format!(
+                "；跳过加密封包（STool 不解密，请用 GARbro 等导出明文）: {}",
+                encrypted.join("; ")
+            ));
+        }
+        let msg = crate::engines::with_fail_note(msg, write_failed);
+        let msg = crate::engines::with_resume_note(msg, skipped);
         OpOutcome { success: done > 0, message: msg, files_done: done, logs: vec![] }
     }
     fn text_extract(&self, ctx: &Ctx, out_csv: &Path) -> OpOutcome {
@@ -880,28 +997,36 @@ impl Engine for KirikiriPlugin {
         if ks_files.is_empty() {
             return OpOutcome::fail("未找到 .ks 脚本（请先解包 .xp3）");
         }
-        let mut rows: Vec<[String; 4]> = Vec::new();
-        let total = ks_files.len();
-        for (i, p) in ks_files.iter().enumerate() {
-            let bytes = fs::read(p).unwrap_or_default();
-            let text = decode_sjis_or_utf8(&bytes);
-            for (ln, line) in text.lines().enumerate() {
-                let s = line.trim();
-                if s.is_empty() || s.starts_with(';') || s.starts_with('@') || s.starts_with('*') {
-                    continue;
-                }
-                let stripped = strip_tags(s);
-                if !stripped.is_empty() {
-                    rows.push([format!("{}:{}", file_name(p), ln + 1), "kag".into(), stripped, String::new()]);
-                }
+        extract_kag_ks(&ks_files, out_csv, ctx, "kag")
+    }
+}
+
+/// KAG 剧本（KiriKiri 与 TyranoScript 共用 `.ks` 格式）对白提取。
+///
+/// 规则：`;` 注释、`*` label、`@` 指令行跳过；其余行去掉 `[tag]` 内联标签后
+/// 若仍有内容即视为对白。行首/行尾控制符在回填时另处理。
+fn extract_kag_ks(files: &[PathBuf], out_csv: &Path, ctx: &Ctx, tag: &str) -> OpOutcome {
+    let mut rows: Vec<[String; 4]> = Vec::new();
+    let total = files.len().max(1);
+    for (i, p) in files.iter().enumerate() {
+        let bytes = fs::read(p).unwrap_or_default();
+        let text = decode_sjis_or_utf8(&bytes);
+        for (ln, line) in text.lines().enumerate() {
+            let s = line.trim();
+            if s.is_empty() || s.starts_with(';') || s.starts_with('@') || s.starts_with('*') {
+                continue;
             }
-            ctx.report((i + 1) as f32 / total as f32, &p.display().to_string());
+            let stripped = strip_tags(s);
+            if !stripped.is_empty() {
+                rows.push([format!("{}:{}", file_name(p), ln + 1), tag.into(), stripped, String::new()]);
+            }
         }
-        let n = rows.len();
-        match crate::features::text::write_csv(out_csv, &rows) {
-            Ok(()) => OpOutcome::okn(format!("提取 {n} 行对话 → {}", out_csv.display()), n),
-            Err(e) => OpOutcome::fail(e),
-        }
+        ctx.report((i + 1) as f32 / total as f32, &p.display().to_string());
+    }
+    let n = rows.len();
+    match crate::features::text::write_csv(out_csv, &rows) {
+        Ok(()) => OpOutcome::okn(format!("提取 {n} 行对话 → {}", out_csv.display()), n),
+        Err(e) => OpOutcome::fail(e),
     }
 }
 
@@ -963,19 +1088,20 @@ impl Engine for GodotPlugin {
     fn priority(&self) -> i32 {
         70
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        let pcks = list_files_by_ext(root, &["pck"]);
-        if !pcks.is_empty() {
-            score += 70;
-            ev.push(format!("{} 个 .pck", pcks.len()));
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        let pck = scan.has_ext("pck");
+        if pck {
+            d.hit(70, format!("{} 个 .pck 封包（如 {}）", scan.ext_count("pck"), scan.first_ext_name("pck")));
         }
-        if root.join("project.godot").exists() || root.join(".godot").is_dir() {
-            score += 30;
-            ev.push("project.godot".into());
+        // 明文工程（未被 pck 打包）时 project.godot 是 Godot 独有特征，单独过线；
+        // 已有 .pck 时只作补充证据，避免重复计分虚高。
+        if scan.has_file_named("project.godot") {
+            d.hit(if pck { 15 } else { 65 }, "project.godot 工程文件");
+        } else if scan.has_dir(".godot") {
+            d.hit(25, ".godot/ 导入缓存");
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::Repack, Op::Decompile]
@@ -989,22 +1115,53 @@ impl Engine for GodotPlugin {
             return OpOutcome::fail("未找到 .pck");
         }
         let mut done = 0usize;
+        let mut failed = 0usize;
+        let mut resume = crate::engines::Resume::open(ctx.out_dir, "extract", ctx.root).configured(ctx);
         for (i, pckf) in pcks.iter().enumerate() {
-            let data = fs::read(pckf).unwrap_or_default();
-            let entries = match pck::parse_bytes(&data) {
+            if ctx.cancelled() {
+                resume.flush();
+                return OpOutcome::fail("已取消");
+            }
+            let mut src = match Source::open(pckf, source::MAX_ARCHIVE) {
+                Ok(s) => s,
+                Err(e) => {
+                    resume.flush();
+                    return OpOutcome::fail(e);
+                }
+            };
+            let entries = match pck::parse_index(&mut src) {
                 Ok(e) => e,
-                Err(e) => return OpOutcome::fail(format!("{} 解析失败: {e}", file_name(pckf))),
+                Err(e) => {
+                    resume.flush();
+                    return OpOutcome::fail(format!("{} 解析失败: {e}", file_name(pckf)));
+                }
             };
             let sub = ctx.out_dir.join(pckf.file_stem().unwrap_or_default().to_string_lossy().as_ref());
-            for (j, e) in entries.iter().enumerate() {
+            let mut jobs: Vec<crate::engines::Job<&pck::PckEntry>> = Vec::new();
+            for e in &entries {
                 let rel = e.path.trim_start_matches("res://");
-                let _ = fs::write(safe_out_path(&sub, rel), pck::read_file(&data, e));
-                done += 1;
-                ctx.report(j as f32 / entries.len().max(1) as f32, &e.path);
+                if !resume.already_done(&sub, rel) {
+                    jobs.push(crate::engines::Job { rel: rel.to_string(), item: e });
+                }
             }
+            let skipped_here = entries.len() - jobs.len();
+            let (w, f) = crate::engines::parallel_extract(
+                &jobs,
+                &sub,
+                crate::engines::worker_count(ctx),
+                ctx,
+                || Source::open(pckf, source::MAX_ARCHIVE),
+                |s, e| pck::read_entry(s, e),
+                &mut resume,
+            );
+            done += w + skipped_here;
+            failed += f;
             ctx.report(i as f32 / pcks.len() as f32, &pckf.display().to_string());
         }
-        OpOutcome::okn(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), done)
+        let skipped = resume.finish(failed == 0);
+        let msg = crate::engines::with_fail_note(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), failed);
+        let msg = crate::engines::with_resume_note(msg, skipped);
+        OpOutcome::okn(msg, done)
     }
     fn repack(&self, ctx: &Ctx, src_dir: &Path) -> OpOutcome {
         let pckf = match list_files_by_ext(ctx.root, &["pck"]).into_iter().next() {
@@ -1031,8 +1188,10 @@ impl Engine for GodotPlugin {
             .into_iter()
             .map(|(k, v)| (format!("res://{k}"), v))
             .collect();
-        let bak = pckf.with_extension("pck.stool.bak");
-        let _ = fs::copy(&pckf, &bak);
+        let bak = match crate::settings::backup_or_abort(&pckf) {
+            Ok(b) => b,
+            Err(e) => return OpOutcome::fail(e),
+        };
         match pck::write_v1_paths(&pckf, &res_files) {
             Ok(n) => OpOutcome::okn(format!(
                 "已重新封包 {n} 个文件 → {}（原封包备份为 {}；注意：回写为 v1 格式，Godot 3.x/未加密 4.x 可用）",
@@ -1108,22 +1267,22 @@ impl Engine for NscripterPlugin {
     fn priority(&self) -> i32 {
         65
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        if root.join("nscript.dat").exists() {
-            score += 70;
-            ev.push("nscript.dat 加密脚本".into());
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        if scan.has_file_named("nscript.dat") {
+            d.hit(70, "nscript.dat 加密脚本");
         }
-        if !list_files_by_ext(root, &["nsa"]).is_empty() {
-            score += 20;
-            ev.push("*.nsa 资源包".into());
+        if scan.has_ext("nsa") {
+            d.hit(20, format!("{} 个 .nsa 资源包", scan.ext_count("nsa")));
         }
-        if fs::read_dir(root).map(|rd| rd.flatten().any(|d| d.file_name().to_string_lossy().to_lowercase().contains("ons") && d.path().extension().map(|e| e == "exe").unwrap_or(false))).unwrap_or(false) {
-            score += 15;
-            ev.push("ONScripter 运行时".into());
+        // .sar 是 NScripter/ONScripter 的归档变体，旧版漏判，这里补上
+        if scan.has_ext("sar") {
+            d.hit(20, format!("{} 个 .sar 资源包", scan.ext_count("sar")));
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        if scan.any_exe_contains("ons") {
+            d.hit(15, "ONScripter 运行时");
+        }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::TextExtract, Op::TextImport]
@@ -1138,7 +1297,9 @@ impl Engine for NscripterPlugin {
         }
         let data = fs::read(&src).unwrap_or_default();
         let out = ctx.out_dir.join("nscript.txt");
-        let _ = fs::write(&out, nscript::decode(&data));
+        if let Err(e) = fs::write(&out, nscript::decode(&data)) {
+            return OpOutcome::fail(format!("写出 {} 失败: {e}", out.display()));
+        }
         OpOutcome::ok(format!("脚本已解密 → {}（若乱码说明是特殊加密变体）", out.display()))
     }
     /// NScripter 脚本的对白行：行首为 Shift-JIS 双字节字符（>=0x80）即视为文本行，
@@ -1223,7 +1384,9 @@ impl Engine for NscripterPlugin {
             out.push(b ^ ((key as u32 + i as u32) & 0xFF) as u8);
         }
         let src = ctx.root.join("nscript.dat");
-        let _ = fs::copy(&src, ctx.root.join("nscript.dat.stool.bak"));
+        if let Err(e) = crate::settings::backup_or_abort(&src) {
+            return OpOutcome::fail(e);
+        }
         if let Err(e) = fs::write(&src, out) {
             return OpOutcome::fail(format!("写回 nscript.dat 失败: {e}"));
         }
@@ -1249,19 +1412,28 @@ impl Engine for HtmlGamePlugin {
     fn priority(&self) -> i32 {
         55
     }
-    fn detect(&self, root: &Path) -> Detection {
-        let mut score = 0;
-        let mut ev = Vec::new();
-        let asars = list_files_by_ext(root, &["asar"]);
-        if !asars.is_empty() {
-            score += 70;
-            ev.push(format!("{} 个 app.asar", asars.len()));
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        if scan.has_ext("asar") {
+            d.hit(70, format!("{} 个 app.asar（Electron 封包）", scan.ext_count("asar")));
         }
-        if root.join("index.html").exists() {
-            score += 50;
-            ev.push("index.html".into());
+        // TyranoBuilder 与 RPG Maker MV 根目录都带 index.html，但它们各有更专门的插件；
+        // 这里排除掉，避免同一个目录同时被"确认"成三种 HTML 系引擎。
+        let owned_by_tyrano = scan.has_root_dir("tyrano");
+        let owned_by_mv = scan.has_file_named("actors.json");
+        if scan.has_root_file("index.html") && !owned_by_tyrano && !owned_by_mv {
+            d.hit(60, "index.html Web 入口");
+            if scan.has_dir("assets") {
+                d.hit(15, "assets/ 资源目录");
+            }
+            if scan.has_dir("js") {
+                d.hit(10, "js/ 脚本目录");
+            }
         }
-        Detection { plugin_id: self.id().into(), name: self.name().into(), score, evidence: ev, notes: String::new() }
+        if owned_by_tyrano {
+            d.note("检测到 tyrano/ 目录，判定交由 TyranoBuilder 插件");
+        }
+        d
     }
     fn capabilities(&self) -> Vec<Op> {
         vec![Op::Extract, Op::Repack, Op::TextInject]
@@ -1290,23 +1462,58 @@ impl Engine for HtmlGamePlugin {
             return OpOutcome::fail("未找到 asar（明文 HTML 游戏无需解包，直接编辑）");
         }
         let mut done = 0usize;
+        let mut write_failed = 0usize;
+        let mut resume = crate::engines::Resume::open(ctx.out_dir, "extract", ctx.root).configured(ctx);
         for (i, arc) in asars.iter().enumerate() {
-            let data = fs::read(arc).unwrap_or_default();
-            let (files, data_start) = match asar::parse_bytes(&data) {
+            if ctx.cancelled() {
+                resume.flush();
+                return OpOutcome::fail("已取消");
+            }
+            let mut src = match Source::open(arc, source::MAX_ARCHIVE) {
+                Ok(s) => s,
+                Err(e) => {
+                    resume.flush();
+                    return OpOutcome::fail(e);
+                }
+            };
+            let (files, data_start) = match asar::parse_index(&mut src) {
                 Ok(f) => f,
-                Err(e) => return OpOutcome::fail(format!("{} 解析失败: {e}", file_name(arc))),
+                Err(e) => {
+                    resume.flush();
+                    return OpOutcome::fail(format!("{} 解析失败: {e}", file_name(arc)));
+                }
             };
             let sub = ctx.out_dir.join(arc.file_stem().unwrap_or_default().to_string_lossy().as_ref());
-            for (j, (name, entry)) in files.iter().enumerate() {
-                if let Ok(blob) = asar::read_file(&data, data_start, entry) {
-                    let _ = fs::write(safe_out_path(&sub, name), blob);
-                    done += 1;
+            let mut jobs: Vec<crate::engines::Job<&asar::AsarNode>> = Vec::new();
+            let mut skipped_here = 0usize;
+            for (name, entry) in &files {
+                // unpacked 外置条目：不写出、不计数（与旧串行逻辑一致）
+                if entry.unpacked {
+                    continue;
                 }
-                ctx.report(j as f32 / files.len().max(1) as f32, name);
+                if resume.already_done(&sub, name) {
+                    skipped_here += 1;
+                    continue;
+                }
+                jobs.push(crate::engines::Job { rel: name.clone(), item: entry });
             }
+            let (w, f) = crate::engines::parallel_extract(
+                &jobs,
+                &sub,
+                crate::engines::worker_count(ctx),
+                ctx,
+                || Source::open(arc, source::MAX_ARCHIVE),
+                |s, e| asar::read_entry(s, data_start, e),
+                &mut resume,
+            );
+            done += w + skipped_here;
+            write_failed += f;
             ctx.report(i as f32 / asars.len() as f32, &arc.display().to_string());
         }
-        OpOutcome::okn(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), done)
+        let skipped = resume.finish(write_failed == 0);
+        let msg = crate::engines::with_fail_note(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), write_failed);
+        let msg = crate::engines::with_resume_note(msg, skipped);
+        OpOutcome::okn(msg, done)
     }
     fn repack(&self, ctx: &Ctx, src_dir: &Path) -> OpOutcome {
         let target = ctx
@@ -1314,11 +1521,210 @@ impl Engine for HtmlGamePlugin {
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.root.join("resources").join("app.asar"));
         if target.exists() {
-            let _ = fs::copy(&target, target.with_extension("asar.stool.bak"));
+            // 备份已存在则保留（绝不覆盖）；备份失败即中止，不能无备份改写
+            if let Err(e) = crate::settings::backup_or_abort(&target) {
+                return OpOutcome::fail(e);
+            }
         }
         match asar::pack(src_dir, &target) {
             Ok(n) => OpOutcome::okn(format!("已打包 {} 个文件 → {}", n, target.display()), n),
             Err(e) => OpOutcome::fail(e),
         }
+    }
+}
+
+// ---------------- TyranoBuilder / TyranoScript ----------------
+
+/// TyranoBuilder（TyranoScript）游戏。
+///
+/// 与 KiriKiri 同源（都用 `.tjs`/`.ks`），但目录结构不同：根目录有 `tyrano/` 运行时
+/// 目录 + `index.html` 入口，剧本在 `data/scenario/*.ks`，配置在 `data/system/Config.tjs`。
+/// 因为它是纯 HTML/JS 前端，文本既可从 `.ks` 提取，也可走 DOM 运行时注入。
+pub struct TyranoPlugin;
+
+impl Engine for TyranoPlugin {
+    fn id(&self) -> &'static str {
+        "tyrano"
+    }
+    fn name(&self) -> &'static str {
+        "TyranoBuilder / TyranoScript"
+    }
+    fn priority(&self) -> i32 {
+        60
+    }
+    fn detect_scan(&self, scan: &ScanCtx) -> Detection {
+        let mut d = Detection::new(self.id(), self.name());
+        if scan.has_root_dir("tyrano") {
+            d.hit(60, "tyrano/ 引擎运行时目录");
+        }
+        if scan.has_root_file("index.html") {
+            d.hit(25, "index.html 入口页");
+        }
+        let ks = scan.ext_count("ks");
+        if ks > 0 {
+            d.hit(15, format!("{ks} 个 .ks 剧本"));
+        }
+        if scan.has_dir("scenario") {
+            d.hit(10, "data/scenario/ 剧本目录");
+        }
+        if scan.has_file_named("config.tjs") {
+            d.hit(10, "data/system/Config.tjs");
+        }
+        if !scan.has_root_dir("tyrano") {
+            d.note("未发现 tyrano/ 目录，可能是 KiriKiri 或其他 .ks/.tjs 引擎，请人工核对");
+        }
+        d
+    }
+    fn capabilities(&self) -> Vec<Op> {
+        vec![Op::Extract, Op::TextExtract, Op::TextInject]
+    }
+
+    /// 剧本提取：`data/scenario/**/*.ks`（KAG 语法，与 KiriKiri 共用解析器）。
+    fn text_extract(&self, ctx: &Ctx, out_csv: &Path) -> OpOutcome {
+        let base = [ctx.root.join("data").join("scenario"), ctx.root.join("scenario"), ctx.root.join("data")]
+            .into_iter()
+            .find(|p| p.is_dir())
+            .unwrap_or_else(|| ctx.root.join("data"));
+        let files = list_files_by_ext(&base, &["ks"]);
+        if files.is_empty() {
+            return OpOutcome::fail("未找到 data/scenario/*.ks 剧本（请确认游戏目录是否指到了根目录）");
+        }
+        extract_kag_ks(&files, out_csv, ctx, "tyrano")
+    }
+
+    /// 运行时 JSON 注入（HTML 变体）：挂 DOM 文本替换脚本，不改 `.ks`。
+    fn text_inject(&self, ctx: &Ctx, json_path: &Path) -> OpOutcome {
+        let json = match json_path.exists() {
+            true => json_path.to_path_buf(),
+            false => ctx.root.join("translation.json"),
+        };
+        if !json.exists() {
+            return OpOutcome::fail(format!(
+                "未找到翻译 JSON（{} 不存在）。格式：{{\"原文\":\"译文\"}}，可从“文本提取”的 CSV 生成",
+                json.display()
+            ));
+        }
+        match crate::features::inject::install(ctx.root, &json, self.id()) {
+            Ok(m) => OpOutcome::ok(m),
+            Err(e) => OpOutcome::fail(e),
+        }
+    }
+
+    fn describe(&self, root: &Path) -> String {
+        let scen = root.join("data").join("scenario");
+        let n = list_files_by_ext(&scen, &["ks"]).len();
+        format!("剧本: data/scenario/（{n} 个 .ks）；入口: index.html")
+    }
+
+    fn extract(&self, ctx: &Ctx) -> OpOutcome {
+        // TyranoBuilder 通常不封包，资源直接躺在 data/ 下
+        OpOutcome::fail(format!(
+            "TyranoBuilder 游戏一般无需解包（{} 下的 data/ 已是明文）；若确有封包请配置 GARbro 后重试",
+            ctx.root.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+    use crate::engines::scan::ScanCtx;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("stool_others_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn det(e: &dyn Engine, d: &Path) -> Detection {
+        e.detect_scan(&ScanCtx::build(d))
+    }
+
+    #[test]
+    fn test_rgss_unpacked_is_recognized() {
+        // 旧版：解包后只剩 Data/*.rvdata2，最多 45 分 → 漏判。现在应过线。
+        let d = tmp("rgss_unpacked");
+        fs::create_dir_all(d.join("Data")).unwrap();
+        fs::create_dir_all(d.join("Graphics")).unwrap();
+        fs::create_dir_all(d.join("Audio")).unwrap();
+        fs::write(d.join("Data").join("Map001.rvdata2"), b"x").unwrap();
+        let r = det(&RpgMakerRgssPlugin, &d);
+        assert!(r.ok(), "解包后的 RGSS 应被识别，实得 {} 分：{:?}", r.score, r.evidence);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_kirikiri_unpacked_is_recognized() {
+        // 旧版：未打包（无 .xp3）时最多 35 分 → 漏判。现在应过线。
+        let d = tmp("krkr_unpacked");
+        fs::create_dir_all(d.join("scenario")).unwrap();
+        fs::create_dir_all(d.join("system")).unwrap();
+        for i in 0..6 {
+            fs::write(d.join("scenario").join(format!("s{i}.ks")), b"x").unwrap();
+        }
+        fs::write(d.join("system").join("Config.tjs"), b"x").unwrap();
+        let r = det(&KirikiriPlugin, &d);
+        assert!(r.ok(), "未打包的 KiriKiri 应被识别，实得 {} 分：{:?}", r.score, r.evidence);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_tyrano_detected_and_not_stolen_by_kirikiri() {
+        let d = tmp("tyrano");
+        fs::create_dir_all(d.join("tyrano")).unwrap();
+        fs::create_dir_all(d.join("data").join("scenario")).unwrap();
+        fs::write(d.join("index.html"), b"<html></html>").unwrap();
+        for i in 0..3 {
+            fs::write(d.join("data").join("scenario").join(format!("s{i}.ks")), b"x").unwrap();
+        }
+        let tyrano = det(&TyranoPlugin, &d);
+        assert!(tyrano.ok(), "TyranoBuilder 应被识别，实得 {} 分", tyrano.score);
+        // KiriKiri 不应把 tyrano/ 目录的游戏抢走
+        let kiri = det(&KirikiriPlugin, &d);
+        assert!(!kiri.ok(), "有 tyrano/ 时不该同时确认成 KiriKiri，实得 {} 分", kiri.score);
+        // HTML 插件也应让位
+        let html = det(&HtmlGamePlugin, &d);
+        assert!(!html.ok(), "有 tyrano/ 时 HTML 插件不该抢，实得 {} 分", html.score);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_godot_unpacked_project_file() {
+        let d = tmp("godot_proj");
+        fs::write(d.join("project.godot"), b"config_version=5").unwrap();
+        let r = det(&GodotPlugin, &d);
+        assert!(r.ok(), "仅 project.godot 也应识别为 Godot，实得 {} 分", r.score);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_html_index_alone_and_mv_not_stolen() {
+        let d = tmp("html_plain");
+        fs::write(d.join("index.html"), b"<html></html>").unwrap();
+        let r = det(&HtmlGamePlugin, &d);
+        assert!(r.ok(), "纯 index.html Web 游戏应被识别，实得 {} 分", r.score);
+        let _ = fs::remove_dir_all(&d);
+
+        // MV 游戏同样有 index.html，但不该被 HTML 插件抢走
+        let m = tmp("mv_html");
+        fs::create_dir_all(m.join("www").join("data").join("js")).unwrap();
+        fs::write(m.join("www").join("index.html"), b"<html></html>").unwrap();
+        fs::write(m.join("www").join("data").join("Actors.json"), b"[]").unwrap();
+        let mv = det(&RpgMakerMvPlugin, &m);
+        let html = det(&HtmlGamePlugin, &m);
+        assert!(mv.ok(), "MV 应被识别，实得 {} 分", mv.score);
+        assert!(!html.ok(), "MV 目录不该被 HTML 插件抢走，实得 {} 分", html.score);
+        let _ = fs::remove_dir_all(&m);
+    }
+
+    #[test]
+    fn test_nscripter_and_sar() {
+        let d = tmp("nscripter");
+        fs::write(d.join("nscript.dat"), b"\x00\x01xxxx").unwrap();
+        fs::write(d.join("arc.sar"), b"x").unwrap();
+        let r = det(&NscripterPlugin, &d);
+        assert!(r.ok(), "nscript.dat 应识别为 NScripter，实得 {} 分", r.score);
+        let _ = fs::remove_dir_all(&d);
     }
 }

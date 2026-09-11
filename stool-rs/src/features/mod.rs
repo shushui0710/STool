@@ -2,6 +2,7 @@
 
 pub mod memscan;
 pub mod mods;
+pub mod gallery;
 pub mod inject;
 pub mod preview;
 pub mod restore;
@@ -11,3 +12,10 @@ pub mod text;
 pub mod tools_dl;
 pub mod tpack;
 pub mod translate;
+pub mod unlock;
+pub mod diagpack;
+pub mod precheck;
+pub mod batch;
+pub mod health;
+pub mod selfcheck;
+pub mod xp3patch;

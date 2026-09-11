@@ -53,14 +53,54 @@ fn walk(node: &AsarNode, prefix: &str, out: &mut BTreeMap<String, AsarNode>) {
     }
 }
 
+// ---------- 流式 API（P2-1）：只读索引 + 按需读条目 ----------
+
+/// 只读索引（不整包读入）：头部 16 字节 + JSON 头，数据区不动。
+pub fn parse_index(src: &mut super::source::Source) -> Result<(BTreeMap<String, AsarNode>, u64), String> {
+    let len = src.len();
+    if len < 16 {
+        return Err("不是 asar 文件".into());
+    }
+    let head = src.read_exact_at(0, 16)?;
+    if u32::from_le_bytes(head[0..4].try_into().unwrap()) != 4 {
+        return Err("不是 asar 文件".into());
+    }
+    // [u32=4][u32=headerBuf总长][u32=headerBuf总长][u32=JSON长度][JSON][补齐]
+    let header_total = u32::from_le_bytes(head[4..8].try_into().unwrap()) as u64;
+    let json_size = u32::from_le_bytes(head[12..16].try_into().unwrap()) as u64;
+    if 8 + header_total > len || 16 + json_size > len {
+        return Err("asar 头部越界".into());
+    }
+    let json = src.read_exact_at(16, json_size as usize)?;
+    let header: AsarNode = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+    let data_start = 8 + header_total;
+    let mut files = BTreeMap::new();
+    walk(&header, "", &mut files);
+    Ok((files, data_start))
+}
+
+/// 按需读取一个条目。
+pub fn read_entry(src: &mut super::source::Source, data_start: u64, entry: &AsarNode) -> Result<Vec<u8>, String> {
+    if entry.unpacked {
+        return Err("该文件存储于 app.asar.unpacked 目录".into());
+    }
+    let off = data_start
+        .checked_add(entry.offset.parse::<u64>().map_err(|e| e.to_string())?)
+        .ok_or("asar 数据偏移溢出")?;
+    src.read_at(off, entry.size as usize)
+}
+
 pub fn read_file(data: &[u8], data_start: u64, entry: &AsarNode) -> Result<Vec<u8>, String> {
     if entry.unpacked {
         return Err("该文件存储于 app.asar.unpacked 目录".into());
     }
-    let off = data_start + entry.offset.parse::<u64>().map_err(|e| e.to_string())?;
-    let start = off as usize;
-    let end = (start + entry.size as usize).min(data.len());
-    Ok(data[start.min(data.len())..end].to_vec())
+    let off = data_start
+        .checked_add(entry.offset.parse::<u64>().map_err(|e| e.to_string())?)
+        .ok_or("asar 数据偏移溢出")?;
+    // 饱和夹取，避免伪造 size 触发整数溢出 panic
+    let start = (off as usize).min(data.len());
+    let end = start.saturating_add(entry.size as usize).min(data.len());
+    Ok(data[start..end].to_vec())
 }
 
 /// 打包目录为 asar。返回文件数。
@@ -88,13 +128,17 @@ pub fn pack(src_dir: &Path, out: &Path) -> Result<usize, String> {
     }
     let mut header = serde_json::json!({"files": {}});
     let mut off = 0u64;
-    build_header(header.get_mut("files").unwrap(), &sizes, "", &mut off)?;
+    // 数据区必须**按头表分配 offset 的同一顺序**写入：头表先排当前层叶子、再递归子目录，
+    // 与 `files.values()` 的全局字典序并不一致——两者不一致会让解包端按 offset 取到错位内容。
+    let mut order: Vec<String> = Vec::new();
+    build_header(header.get_mut("files").unwrap(), &sizes, "", &mut off, &mut order)?;
 
     fn build_header(
         node: &mut serde_json::Value,
         sizes: &BTreeMap<String, u64>,
         prefix: &str,
         off: &mut u64,
+        order: &mut Vec<String>,
     ) -> Result<(), String> {
         // 收集当前层应包含的子项（目录 + 文件）
         let mut dirs: Vec<String> = Vec::new();
@@ -123,11 +167,12 @@ pub fn pack(src_dir: &Path, out: &Path) -> Result<usize, String> {
             let size = *sizes.get(&rel).ok_or("size 缺失")?;
             obj.insert(leaf, serde_json::json!({"size": size, "offset": off.to_string()}));
             *off += size;
+            order.push(rel);
         }
         for dir in dirs {
             let mut child = serde_json::json!({"files": {}});
             // 注意：传入的是 child["files"]（build_header 的 node 参数是文件表本身）
-            build_header(child.get_mut("files").unwrap(), sizes, &format!("{prefix_slash}{dir}"), off)?;
+            build_header(child.get_mut("files").unwrap(), sizes, &format!("{prefix_slash}{dir}"), off, order)?;
             obj.insert(dir, child);
         }
         Ok(())
@@ -144,7 +189,8 @@ pub fn pack(src_dir: &Path, out: &Path) -> Result<usize, String> {
     f.write_all(&(json_len as u32).to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(header_str.as_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&[0u8; 8][..pad]).map_err(|e| e.to_string())?;
-    for (_, p) in &files {
+    for rel in &order {
+        let p = files.get(rel).ok_or("路径缺失")?;
         let content = fs::read(p).map_err(|e| e.to_string())?;
         f.write_all(&content).map_err(|e| e.to_string())?;
     }

@@ -71,15 +71,16 @@ pub fn parse_v1(path: &Path) -> Result<BTreeMap<String, (u64, u32, u32)>, String
             String::from_utf8_lossy(&name).into_owned(),
             (pos as u64, size, data_key),
         );
-        pos += size as usize;
+        pos = pos.saturating_add(size as usize);
     }
     Ok(out)
 }
 
 /// v1 数据解密。
 pub fn extract_v1_file(data: &[u8], offset: u64, size: u32, data_key: u32) -> Vec<u8> {
-    let end = (offset as usize + size as usize).min(data.len());
+    // 饱和加法 + min 夹取，避免伪造 offset/size 触发整数溢出 panic
     let start = (offset as usize).min(data.len());
+    let end = start.saturating_add(size as usize).min(data.len());
     xor_block_stream(&data[..end], start, data_key)
 }
 
@@ -136,8 +137,9 @@ pub fn parse_v3(path: &Path) -> Result<Vec<V3Entry>, String> {
 
 /// v3 数据解密。
 pub fn extract_v3_file(data: &[u8], offset: u64, size: u64, filekey: u32) -> Vec<u8> {
-    let end = (offset as usize + size as usize).min(data.len());
+    // 饱和加法 + min 夹取，避免伪造 offset/size 触发整数溢出 panic
     let start = (offset as usize).min(data.len());
+    let end = start.saturating_add(size as usize).min(data.len());
     xor_block_stream(&data[..end], start, filekey)
 }
 
@@ -207,6 +209,122 @@ pub fn write_v3(archive: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<(),
 
 // ---------- 流式写出（路径版）：避免大封包整体载入内存 ----------
 
+// ---------- 流式 API（P2-1）：只读索引 + 按需读条目 ----------
+
+/// 只读 v1 索引（不整包读入）。v1 的条目头与数据**交错**存放，因此按
+/// 「读元数据 → 跳过数据区」的方式顺序推进。
+pub fn parse_index_v1(src: &mut super::source::Source) -> Result<BTreeMap<String, (u64, u32, u32)>, String> {
+    let len = src.len();
+    if len < 8 {
+        return Err("不是 RGSSAD 封包".into());
+    }
+    if !src.read_exact_at(0, 8)?.starts_with(b"RGSSAD\x00") {
+        return Err("不是 RGSSAD 封包".into());
+    }
+    let mut pos = 8u64;
+    let mut ks = KeyStream::new();
+    let mut out = BTreeMap::new();
+    while pos + 4 <= len {
+        let name_len = match src.read_at(pos, 4) {
+            Ok(v) if v.len() == 4 => u32::from_le_bytes(v.try_into().unwrap()) ^ ks.next(),
+            _ => break,
+        };
+        pos += 4;
+        if name_len == 0 || name_len > 512 || pos + name_len as u64 + 4 > len {
+            break;
+        }
+        let nb = match src.read_at(pos, name_len as usize) {
+            Ok(v) if v.len() == name_len as usize => v,
+            _ => break,
+        };
+        let mut name = Vec::with_capacity(name_len as usize);
+        for b in nb {
+            name.push(b ^ (ks.next() & 0xFF) as u8);
+        }
+        pos += name_len as u64;
+        let size = match src.read_at(pos, 4) {
+            Ok(v) if v.len() == 4 => u32::from_le_bytes(v.try_into().unwrap()) ^ ks.next(),
+            _ => break,
+        };
+        pos += 4;
+        let data_key = ks.current(); // 数据区起始密钥（元数据流不穿过数据区）
+        out.insert(String::from_utf8_lossy(&name).into_owned(), (pos, size, data_key));
+        pos = pos.saturating_add(size as u64);
+    }
+    Ok(out)
+}
+
+/// 只读 v3 索引（不整包读入）：头表连续存放，按需逐条读。
+pub fn parse_index_v3(src: &mut super::source::Source) -> Result<Vec<V3Entry>, String> {
+    let len = src.len();
+    if len < 12 {
+        return Err("不是 RGSS3A 封包".into());
+    }
+    let head = src.read_exact_at(0, 12)?;
+    if !head.starts_with(b"RGSSAD\x00\x03") {
+        return Err("不是 RGSS3A 封包".into());
+    }
+    let seed = u32::from_le_bytes(head[8..12].try_into().unwrap());
+    let key = seed.wrapping_mul(9).wrapping_add(3);
+    let mut pos = 12u64;
+    let mut out = Vec::new();
+    while pos + 16 <= len {
+        let rec = match src.read_at(pos, 16) {
+            Ok(v) if v.len() == 16 => v,
+            _ => break,
+        };
+        let offset = (u32::from_le_bytes(rec[0..4].try_into().unwrap()) ^ key) as u64;
+        if offset == 0 {
+            break;
+        }
+        let size = (u32::from_le_bytes(rec[4..8].try_into().unwrap()) ^ key) as u64;
+        let filekey = u32::from_le_bytes(rec[8..12].try_into().unwrap()) ^ key;
+        let name_len = u32::from_le_bytes(rec[12..16].try_into().unwrap()) ^ key;
+        pos += 16;
+        if name_len == 0 || name_len > 512 || pos + name_len as u64 > len {
+            break;
+        }
+        let nb = match src.read_at(pos, name_len as usize) {
+            Ok(v) if v.len() == name_len as usize => v,
+            _ => break,
+        };
+        let mut name = Vec::with_capacity(name_len as usize);
+        for (i, b) in nb.iter().enumerate() {
+            name.push(b ^ ((key >> ((i % 4) * 8)) & 0xFF) as u8);
+        }
+        pos += name_len as u64;
+        out.push(V3Entry {
+            name: String::from_utf8_lossy(&name).into_owned(),
+            offset,
+            size,
+            filekey,
+        });
+    }
+    Ok(out)
+}
+
+/// 按需读取 v1 条目数据（读多少解密多少）。
+pub fn read_entry_v1(
+    src: &mut super::source::Source,
+    offset: u64,
+    size: u32,
+    data_key: u32,
+) -> Result<Vec<u8>, String> {
+    let buf = src.read_at(offset, size as usize)?;
+    Ok(xor_block_stream(&buf, 0, data_key))
+}
+
+/// 按需读取 v3 条目数据。
+pub fn read_entry_v3(
+    src: &mut super::source::Source,
+    offset: u64,
+    size: u64,
+    filekey: u32,
+) -> Result<Vec<u8>, String> {
+    let buf = src.read_at(offset, size as usize)?;
+    Ok(xor_block_stream(&buf, 0, filekey))
+}
+
 /// 数据块 XOR 加密写入器：密钥推进规则与 xor_block_stream 一致（块首推进）。
 struct XorBlockWriter<W: std::io::Write> {
     inner: W,
@@ -224,7 +342,7 @@ impl<W: std::io::Write> std::io::Write for XorBlockWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut enc = Vec::with_capacity(buf.len());
         for &b in buf {
-            if self.i > 0 && self.i % 4 == 0 {
+            if self.i > 0 && self.i.is_multiple_of(4) {
                 self.key = self.key.wrapping_mul(7).wrapping_add(3);
             }
             enc.push(b ^ ((self.key >> ((self.i % 4) * 8)) & 0xFF) as u8);

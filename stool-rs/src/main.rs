@@ -6,6 +6,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 fn main() {
+    stool::diag::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = if args.is_empty() {
         stool::gui::run()
