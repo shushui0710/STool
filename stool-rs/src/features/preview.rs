@@ -39,13 +39,20 @@ pub fn kind_of(path: &Path) -> MediaKind {
     }
 }
 
-/// 列出目录下的媒体文件（递归），按 类型→文件名 排序。
+/// 媒体列表条目上限：素材目录可能有几万个文件，全量列出会让列表构建与渲染卡顿。
+/// 达到上限即提前停止遍历，调用方据「数量 == MAX_MEDIA」判断是否被截断。
+pub const MAX_MEDIA: usize = 20_000;
+
+/// 列出目录下的媒体文件（递归，最多 [`MAX_MEDIA`] 条），按 类型→文件名 排序。
 pub fn list_media(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for e in walkdir::WalkDir::new(dir).max_depth(6).into_iter().filter_map(|e| e.ok()) {
         let p = e.path();
         if p.is_file() && kind_of(p) != MediaKind::Other {
             out.push(p.to_path_buf());
+            if out.len() >= MAX_MEDIA {
+                break;
+            }
         }
     }
     out.sort_by_key(|p| (kind_of(p) == MediaKind::Audio, p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));

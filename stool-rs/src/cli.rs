@@ -65,6 +65,7 @@ fn xp3_patch(args: &[String]) -> i32 {
     let mut list = false;
     let mut remove: Option<String> = None;
     let mut src: Option<PathBuf> = None;
+    let mut from_extract: Option<PathBuf> = None;
     let mut name: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -77,6 +78,10 @@ fn xp3_patch(args: &[String]) -> i32 {
             "--src" => {
                 i += 1;
                 src = args.get(i).map(PathBuf::from);
+            }
+            "--from-extract" => {
+                i += 1;
+                from_extract = args.get(i).map(PathBuf::from);
             }
             "--name" => {
                 i += 1;
@@ -102,6 +107,20 @@ fn xp3_patch(args: &[String]) -> i32 {
 
     if let Some(src) = src {
         return match crate::features::xp3patch::build(&root, &src, name.as_deref()) {
+            Ok(m) => {
+                println!("✔ {m}");
+                0
+            }
+            Err(e) => {
+                eprintln!("✘ {e}");
+                1
+            }
+        };
+    }
+
+    // 闭环用法：给出解包目录，自动只打包与现有封包不同的文件
+    if let Some(dir) = from_extract {
+        return match crate::features::xp3patch::build_changed(&root, &dir, name.as_deref()) {
             Ok(m) => {
                 println!("✔ {m}");
                 0
@@ -380,7 +399,7 @@ fn missing_arg_usage(args: &[String]) -> Option<&'static str> {
             (n < 3).then_some("stool mod-<动作> <游戏目录> <MOD名称>")
         }
         "xp3-patch" => (n < 2).then_some(
-            "stool xp3-patch <游戏目录> --list | --src <改动目录> [--name patchN.xp3] | --remove <patchN.xp3>",
+            "stool xp3-patch <游戏目录> --list | --src <改动目录> [--name patchN.xp3] | --from-extract <解包目录> [--name patchN.xp3] | --remove <patchN.xp3>",
         ),
         _ => None,
     }

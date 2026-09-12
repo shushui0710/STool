@@ -64,6 +64,13 @@ pub(crate) struct MsStatus {
     msg: String,
 }
 
+/// 首次写内存前待确认的动作（写内存属修改器行为，必须先让用户明确知道风险）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MsPending {
+    WriteAll,
+    Freeze,
+}
+
 /// 外部工具下载结果：`(工具名, 结果)`。
 type DlResult = Arc<Mutex<Option<(String, Result<PathBuf, String>)>>>;
 /// 后台引擎检测结果：`(检测列表, 可能的存档目录, MOD 列表, 扫描的根目录, 引擎详情)`。
@@ -152,6 +159,10 @@ pub(crate) struct StoolApp {
     ms_scanner: Arc<Mutex<Option<memscan::Scanner>>>,
     ms_frozen: bool,
     ms_freeze_stop: Arc<AtomicBool>,
+    /// 用户是否已确认「写内存」风险（未确认时首次写入会先弹确认框）。
+    ms_ack: bool,
+    /// 待确认的写内存动作。
+    ms_pending: Option<MsPending>,
     save_scope: saves::SearchScope,
 
     // ---- 资源预览 ----
@@ -188,6 +199,9 @@ pub(crate) struct StoolApp {
     // ---- 后台检测 / 后台加载（拖放与检测不阻塞界面） ----
     det_busy: Arc<AtomicBool>,
     det_result: DetResult,
+    /// 本次操作是否可能改变游戏目录的内容（决定操作完成后要不要整树重扫引擎）。
+    /// 解包/反编译/文本提取只写输出目录，不需要重扫 —— 大目录下这一步很贵。
+    det_dirty: bool,
     save_load_result: Arc<Mutex<Option<Result<saves::SaveDoc, String>>>>,
     pv_list_result: PvListResult,
     /// 启动时是否已尝试自动检测（STOOL_GAME 环境变量指定目录）
@@ -286,6 +300,8 @@ impl Default for StoolApp {
             ms_scanner: Arc::new(Mutex::new(None)),
             ms_frozen: false,
             ms_freeze_stop: Arc::new(AtomicBool::new(false)),
+            ms_ack: false,
+            ms_pending: None,
             save_scope: saves::SearchScope::All,
 
             pv_dir_str: String::new(),
@@ -316,6 +332,7 @@ impl Default for StoolApp {
 
             det_busy: Arc::new(AtomicBool::new(false)),
             det_result: Arc::new(Mutex::new(None)),
+            det_dirty: true,
             save_load_result: Arc::new(Mutex::new(None)),
             pv_list_result: Arc::new(Mutex::new(None)),
             boot_detect_done: false,
@@ -328,10 +345,15 @@ impl Default for StoolApp {
 }
 
 impl StoolApp {
-    /// 引擎检测改为后台执行：立即返回并提示，避免大目录拖放/检测时界面假死。
-    fn refresh_detections(&mut self) {
+    /// 把输入框里的路径同步到内部字段（不触发检测）。
+    fn sync_paths(&mut self) {
         self.game_root = PathBuf::from(self.game_root_str.trim());
         self.csv_path = PathBuf::from(self.csv_path_str.trim());
+    }
+
+    /// 引擎检测改为后台执行：立即返回并提示，避免大目录拖放/检测时界面假死。
+    fn refresh_detections(&mut self) {
+        self.sync_paths();
         if self.game_root.as_os_str().is_empty() {
             return;
         }
@@ -411,6 +433,9 @@ impl StoolApp {
         scope: crate::features::precheck::Scope,
         f: impl FnOnce(Arc<Shared>, PathBuf, PathBuf) -> OpOutcome + Send + 'static,
     ) {
+        // 默认按「可能改动游戏目录」处理，操作完成后会重扫引擎；
+        // 只写输出目录的操作（解包/反编译/文本提取）会在 run_plugin_op 里改成 false，省掉一次整树扫描。
+        self.det_dirty = true;
         // 执行前环境预检（P1-2）：目录有效 / 可写 + 磁盘空间 + 文件占用，
         // 失败直接给出「原因 + 修法」，避免任务跑到一半才失败（几 GB 解包尤其致命）。
         let rep = crate::features::precheck::run(&self.game_root, Some(&self.out_dir), scope);
@@ -463,9 +488,13 @@ impl StoolApp {
         let plugin_id = d.plugin_id.clone();
         let name = format!("{plugin_id}:{op:?}");
         let scope = crate::features::precheck::scope_for_op(op, &extra_opts);
+        // 解包 / 反编译 / 文本提取只往输出目录写，游戏目录一个字节都不会变
+        // → 完成后没必要再整树重扫引擎（大目录下这一步很贵）。
+        let writes_root = !matches!(op, Op::Extract | Op::Decompile | Op::TextExtract);
         self.spawn(&name, scope, move |shared, root, out| {
             exec_op(op, &plugin_id, shared, &root, &out, &extra_opts, None)
         });
+        self.det_dirty = writes_root;
     }
 
     /// D1 游戏体检（P2-8）：区域设置 / 日文字体 / 运行库 DLL / 路径 / 写权限。
@@ -572,7 +601,13 @@ impl StoolApp {
                     ));
                 }
             }
-            self.refresh_detections();
+            // 只有可能改动游戏目录的操作才重扫引擎；解包/反编译/文本提取跳过（省一次整树扫描）
+            if self.det_dirty {
+                self.refresh_detections();
+            } else {
+                self.sync_paths();
+            }
+            self.det_dirty = true;
         }
     }
 }
@@ -722,7 +757,14 @@ impl eframe::App for StoolApp {
         if let Ok(mut r) = self.pv_list_result.lock() {
             if let Some((dir, files)) = r.take() {
                 if *self.pv_dir_str.trim() == dir {
+                    let n = files.len();
                     self.pv_files = files;
+                    if n >= preview::MAX_MEDIA {
+                        self.toast = Some((
+                            format!("媒体文件很多，仅列出前 {n} 个（可缩小目录或用筛选）"),
+                            std::time::Instant::now(),
+                        ));
+                    }
                 }
             }
         }

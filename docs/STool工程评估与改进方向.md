@@ -102,31 +102,36 @@
 
 ### 3.2 仍然存在的问题
 
-| 问题 | 影响 | 位置 |
-|---|---|---|
-| 每次操作完成后都 `refresh_detections()`，整目录**重新扫一遍** | 操作 → 卡一下；小目录无感，大目录明显 | `gui.rs:397` |
-| 解析封包**整包读入内存**且无大小上限（7 处 `read_to_end`） | 4GB 级 `.xp3/.pck` → 内存峰值等同文件大小，可能 OOM | `formats/{pck,rpa,asar,xp3}.rs` |
-| 解包**逐文件同步写盘**，且每个文件都调 `create_dir_all` | 万级文件解包慢；目录 syscall 重复 | `engines/others.rs` 各 `extract` |
-| 文本提取/机翻**完全串行**，机翻无重试与退避 | 几万条文本耗时长；遇 429 直接失败（只能靠断点重跑） | `features/translate.rs`、各 `text_extract` |
-| `tools_dl` 下载全量进内存 | AssetRipper 包 ~100MB，峰值内存翻倍 | `features/tools_dl.rs:167` |
-| 预览 `list_media` 递归遍历无上限 | 超大素材目录下列表构建卡顿 | `features/preview.rs` |
+> 下表是**施工前**的评估结论，保留原始判断以便对照；**实际处置见 §7.2**（P2-1 ~ P2-12）。
+> 最新状态：🟢 已解决 / 🟡 部分解决 / 🔴 仍存在。
 
-> 说明：没有做基准测试（缺大目录样本），以上为**代码路径分析**结论，不冒充实测数字。
+| 问题 | 影响 | 位置 | 现状 |
+|---|---|---|---|
+| 每次操作完成后都 `refresh_detections()`，整目录**重新扫一遍** | 操作 → 卡一下；小目录无感，大目录明显 | `gui/mod.rs` | 🟡 已加 `det_dirty`：解包/反编译/文本提取（只写输出目录）不再重扫；其余写操作仍需重扫（正确性优先） |
+| 解析封包**整包读入内存**且无大小上限（7 处 `read_to_end`） | 4GB 级 `.xp3/.pck` → 内存峰值等同文件大小，可能 OOM | `formats/{pck,rpa,asar,xp3}.rs` | 🟢 P2-1：`formats::source::Source` 流式化 + 4GB 上限 |
+| 解包**逐文件同步写盘**，且每个文件都调 `create_dir_all` | 万级文件解包慢；目录 syscall 重复 | `engines/others.rs` 各 `extract` | 🟢 P2-2：`parallel_extract` 多线程 + `safe_out_path` 线程本地目录缓存 |
+| 文本提取/机翻**完全串行**，机翻无重试与退避 | 几万条文本耗时长；遇 429 直接失败（只能靠断点重跑） | `features/translate.rs`、各 `text_extract` | 🟢 P2-3：`jobs` 批并发 + 429/5xx 指数退避重试 |
+| `tools_dl` 下载全量进内存 | AssetRipper 包 ~100MB，峰值内存翻倍 | `features/tools_dl.rs` | 🟢 改为流式写盘（边下边算 SHA-256） |
+| 预览 `list_media` 递归遍历无上限 | 超大素材目录下列表构建卡顿 | `features/preview.rs` | 🟢 新增 `MAX_MEDIA` 上限，达到即停止并如实告知被截断 |
+
+> 说明：本表早期版本为**代码路径分析**结论（当时未做基准测试）。标 🟢 的项在 §7.2 有具体验证记录。
 
 ---
 
 ## 4. 可维护性
 
-| 问题 | 具体表现 |
-|---|---|
-| **UI 单体** | `gui.rs` 2906 行 / 55 个函数；`page_text` 342 行、`page_runtime` 297 行、`update` 283 行、`page_save` 174 行。改一个按钮要在几百行闭包里找上下文。 |
-| **引擎接口过重** | `Engine` trait 11 个方法，多数默认实现返回 `"未实现"`。新增一个只支持解包的引擎，仍要面对一整套方法（还要顺手实现一个用不上的 `describe`）。 |
-| **死接口占用实现** | `describe` 13 个实现全是白维护（见 2.2）。 |
-| **本机路径硬编码** | `settings.rs:87` `D:/STool/tools/unrpyc/unrpyc.py`、`settings.rs:114` python `3.13.12`；截图/验证脚本写死 `D:/STool/verify/...`。换机器即失效，且失败是"静默回退到 `python`"。 |
-| **构建不可移植** | `.cargo/config.toml` 写死 MSVC `14.37.32822`；已被 `.gitignore` 排除（正确），但 README 没有替代的"如何在新机器构建"说明。 |
-| **无质量门禁** | CI 只 `cargo test --release`；无 `cargo clippy -D warnings`、无 `cargo fmt --check`、无覆盖率。 |
-| **文档不均** | README 18.6KB 很完整；但缺 `ARCHITECTURE.md`（模块职责与数据流），新人/新会话理解成本高。 |
-| **配置无版本** | `Config` 靠 `#[serde(default)]` 兼容新增字段；字段重命名/语义变化时无迁移路径，且 `load()` 出错时**静默回退默认值** —— 配置损坏会表现为"设置全丢"，且下一次 `save` 会把损坏内容彻底覆盖。 |
+> 同 §3.2：下表为**施工前**评估，保留原始判断；🟢 = 已在 §7 处置完毕。
+
+| 问题 | 具体表现 | 现状 |
+|---|---|---|
+| **UI 单体** | `gui.rs` 2906 行 / 55 个函数；`page_text` 342 行、`page_runtime` 297 行、`update` 283 行、`page_save` 174 行。改一个按钮要在几百行闭包里找上下文。 | 🟢 P2-11：拆为 `gui/mod.rs` + `pages/*.rs`（纯机械搬移，测试数不变） |
+| **引擎接口过重** | `Engine` trait 11 个方法，多数默认实现返回 `"未实现"`。新增一个只支持解包的引擎，仍要面对一整套方法。 | 🟡 未改（trait 形态保持不变；新增引擎仍有默认实现兜底，成本可接受） |
+| **死接口占用实现** | `describe` 13 个实现全是白维护（见 2.2）。 | 🟢 P1-6 / P2-7：`describe` 接进 GUI「引擎详情」面板，不再是无用实现 |
+| **本机路径硬编码** | `settings.rs` 写死 `D:/STool/tools/unrpyc/unrpyc.py` 与 python `3.13.12`；截图/验证脚本写死 `D:/STool/verify/...`。换机器即失效，且失败是"静默回退到 `python`"。 | 🟢 已改为跨机器探测（配置 → 环境变量 → `~/.stool/tools` → skill 副本；Python 扫 `versions/*` 取最新）。`verify/` 脚本属本机验证工具、不入库，可接受 |
+| **构建不可移植** | `.cargo/config.toml` 写死 MSVC；已被 `.gitignore` 排除（正确），但 README 没有替代的"如何在新机器构建"说明。 | 🟢 README 新增「从源码构建」章节（含 VC 运行库 PATH / `RUSTC` / `CARGO_INCREMENTAL`），`ARCHITECTURE.md` §6 同步 |
+| **无质量门禁** | CI 只 `cargo test --release`；无 `cargo clippy -D warnings`。 | 🟢 P1-3：CI 增加 `clippy -D warnings`；测试改 `cargo test --tests`。fmt 门禁**有意不设**（见 rustfmt.toml 说明） |
+| **文档不均** | README 很完整；但缺 `ARCHITECTURE.md`（模块职责与数据流）。 | 🟢 P1-4：新增 `ARCHITECTURE.md` + `引擎识别依据与解锁策略.md` |
+| **配置无版本** | `Config` 靠 `#[serde(default)]` 兼容新增字段；字段语义变化时无迁移路径，且 `load()` 出错时**静默回退默认值**。 | 🟢 P1-5：`CONFIG_VERSION` + `migrate()`；解析失败**备份损坏文件 + 明确报错**，不再静默丢设置 |
 
 ---
 
@@ -142,14 +147,14 @@
 
 ### 5.2 风险与建议
 
-| 风险 | 说明 | 建议 |
-|---|---|---|
-| API Key 明文落盘 | `Config.mtl_key` 明文写入 `~/.stool/config.json`。本机自用风险低，但会被任何同步盘/备份/误分享带走 | Windows 用 DPAPI（`CryptProtectData`）加密该字段；或至少写入时改权限 + UI 提示"该文件含密钥" |
-| 下载无完整性校验 | `tools_dl` 只依赖 GitHub 的 HTTPS，未校验 SHA256/签名，下载后可执行文件直接被写进 `~/.stool/tools` 并在后续被 `Command::new` 执行 | 内置已知版本的 SHA256（`fixed_url` 那几个尤其容易做）；或在 UI 显示实际哈希供人工核对 |
-| `Cargo.lock` 未入库 | 二进制项目的依赖版本应锁定。当前"每次全新构建可能拉到不同的传递依赖" → 供应链不可复现，也无法审计 | 从 `.gitignore` 移除 `Cargo.lock` 并提交 |
-| panic 信息丢弃 | GUI 无控制台，`std::panic` 输出到 stderr 无处可见；工作线程 panic 只留 `poll_worker` 里一句"任务线程异常退出" | 安装 panic hook 写入共享状态 + 日志文件；工作线程 `catch_unwind` 兜底 |
-| 内存写入无显式警告 | `memscan` 会**写**目标进程内存（修改器本质），文档/UI 未强调"可能让游戏存档或状态异常" | 首次写内存前弹二次确认 |
-| 日志无脱敏 | 日志若落盘，可能含绝对路径与翻译内容 | 落盘时过滤 `mtl_key`；日志目录权限限制为当前用户 |
+| 风险 | 说明 | 建议 | 现状 |
+|---|---|---|---|
+| API Key 明文落盘 | `Config.mtl_key` 明文写入 `~/.stool/config.json`。本机自用风险低，但会被任何同步盘/备份/误分享带走 | Windows 用 DPAPI（`CryptProtectData`）加密该字段 | 🟢 **已做**：DPAPI 加密，落盘形如 `enc:v1:<hex>`；旧明文自动兼容并在下次保存时升级；跨机器解不开时告警 + 清空该字段 |
+| 下载无完整性校验 | `tools_dl` 只依赖 GitHub 的 HTTPS，未校验 SHA256，下载后可执行文件直接被写进 `~/.stool/tools` 并在后续被 `Command::new` 执行 | 内置已知版本的 SHA256；或在 UI 显示实际哈希供人工核对 | 🟢 **已做**：流式下载 + 自实现 SHA-256（`src/hash.rs`，零依赖），对照 GitHub Release 资产 `digest` 校验，不一致即中止并删临时文件；无摘要时把校验和记到 `<工具目录>/.sha256` |
+| `Cargo.lock` 未入库 | 二进制项目的依赖版本应锁定，否则供应链不可复现 | 从 `.gitignore` 移除并提交 | 🟢 **已做**（P0-8） |
+| panic 信息丢弃 | GUI 无控制台，`std::panic` 输出无处可见 | panic hook + 工作线程 `catch_unwind` | 🟢 **已做**（P0-4，`diag.rs`） |
+| 内存写入无显式警告 | `memscan` 会**写**目标进程内存，文档/UI 未强调风险 | 首次写内存前弹二次确认 | 🟢 **已做**：首次写入/锁定前弹确认窗（`MsPending`），确认后可勾选免打扰 |
+| 日志无脱敏 | 日志若落盘，可能含绝对路径与翻译内容 | 落盘时过滤 `mtl_key` | 🟢 **已做**（P1-1，诊断包导出时 `mask()` 脱敏） |
 
 ---
 

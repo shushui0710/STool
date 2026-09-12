@@ -50,10 +50,14 @@ src/
 │   ├── mods.rs         MOD 安装/启停/卸载
 │   ├── runtime.rs      运行时修改（内存/脚本层）
 │   ├── xp3patch.rs     [新增] KiriKiri 运行时补丁包（P2-12）：`list` / `next_name` /
-│   │                   `build`（打 patchN.xp3，原封包不动）/ `remove`（只删自己建的）
-│   ├── memscan.rs      进程内存扫描（RAII 句柄，MAX_REGION 限制）
-│   ├── preview.rs      资源预览（图片/音频列表）
-│   ├── tools_dl.rs     外部工具下载
+│   │                   `build`（打 patchN.xp3，原封包不动）/ `remove`（只删自己建的）/
+│   │                   `build_changed`（与现有封包逐字节比对，**只打包改动文件** →
+│   │                   支撑「解包 → 汉化 → 打补丁」闭环）
+│   ├── memscan.rs      进程内存扫描（RAII 句柄，MAX_REGION 限制）；
+│   │                   **首次写入前必须二次确认**（GUI 弹窗 / `ms_ack` 勾选）
+│   ├── preview.rs      资源预览（图片/音频列表；`MAX_MEDIA` 上限防超大目录卡顿）
+│   ├── tools_dl.rs     外部工具下载：**流式**写盘 + 对照 GitHub `digest` 做 SHA-256 校验，
+│   │                   无摘要时把校验和记到 `<工具目录>/.sha256`
 │   ├── restore.rs      `.stool.bak` 备份还原 + 双档案切换
 │   ├── diagpack.rs     一键诊断包导出（P1-1）
 │   ├── precheck.rs     环境预检（P1-2）：目录可写 / 文件占用 / 磁盘空间，
@@ -73,7 +77,11 @@ src/
 │                       runtime / mods / settings / help / log
 │                       （子模块 `use crate::gui::*;`，可访问父模块私有字段）
 ├── cli.rs             命令行入口（子命令分发）
-├── settings.rs        配置（~/.stool/config.json，含版本化与损坏自愈）
+├── hash.rs            [新增] 无依赖 SHA-256（流式；校验外部工具下载内容）
+├── settings.rs        配置（~/.stool/config.json，含版本化与损坏自愈）；
+│                      机翻 API Key 用 **Windows DPAPI** 加密落盘（`enc:v1:<hex>`，
+│                      旧明文值仍可读，下次保存自动升级）；外部工具/Python 路径
+│                      **按跨机器成立的位置探测**（不写死本机绝对路径）
 └── diag.rs            诊断：panic 钩子 / 日志落盘 / guard / 时间格式化
 ```
 
@@ -230,6 +238,12 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **配置损坏自愈** | `settings::load` | 解析失败要备份 + 告警，不静默丢设置 |
 | **写操作先预检** | `features::precheck` | 目录不可写 / 磁盘不足等**可预知**的失败要在开跑前拦下并给修法，别跑到一半才炸（几 GB 解包尤其致命） |
 | **CI 门禁：clippy + 测试** | `.github/workflows/ci.yml` | `clippy -D warnings` 与 `cargo test --tests` 必须过 |
+| **密钥不明文落盘** | `settings::{encrypt_key, decrypt_key}` | `mtl_key` 用 **Windows DPAPI** 加密后写入配置（`enc:v1:<hex>`）。旧明文值仍能读，下次保存自动升级；密文绑定当前 Windows 用户，跨机器解不开时告警 + 清空该字段（不能把解不开的垃圾当密钥用） |
+| **外部工具下载必须校验** | `features::tools_dl` + `hash::Sha256` | 下载的是**随后会被执行**的可执行文件，只靠 HTTPS 不够。流式落盘 + 边算 SHA-256，与 GitHub Release `digest` 比对，不一致即中止并删除临时文件；上游无摘要时把校验和记到 `<工具目录>/.sha256` |
+| **不写死本机绝对路径** | `settings::{unrpyc_path, python_path}` | 硬编码 `D:/STool/...` 换机器即失效，且会静默回退到系统 `python`。改为**按跨机器成立的位置顺序探测**（配置 → 环境变量 → `~/.stool/tools` → skill 副本；Python 扫描 `versions/*` 取最新） |
+| **写内存要二次确认** | `features::memscan` + `gui/pages/runtime.rs` | 内存扫描会直接改写目标进程内存（修改器本质）。首次写入/锁定前必须确认（GUI 弹窗，`ms_ack` 勾选后不再问），失败/拒绝路径不得静默通过 |
+| **重扫按需** | `gui::StoolApp::det_dirty` | 操作完成后是否重扫引擎由 `det_dirty` 决定：解包/反编译/文本提取只写输出目录 → 不重扫（大目录下这一步很贵）；`spawn` 默认置 `true`，只有明确不改游戏目录的操作才置 `false` |
+| **列表要设上限** | `features::preview::MAX_MEDIA` | 素材目录可能有几万个文件，全量列表会拖垮 UI；达到上限提前停止并如实告知被截断 |
 | **代码风格：宽行（120 列）** | `stool-rs/rustfmt.toml` | 历史代码为手工维护的宽行风格；**不设 fmt 门禁**（全量格式化会改动约 2000 行/37 文件），改代码时对齐相邻代码即可 |
 
 ---
@@ -257,13 +271,16 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 ## 6. 构建与验证
 
 ```bash
-# 本机 Git Bash（MSVC 工具链由 stool-rs/.cargo/config.toml 固定）
+# 本机 Git Bash。注意：stool-rs/.cargo/config.toml 被 .gitignore 排除（写死了本机 MSVC 路径），
+# 新克隆的仓库没有它 → 必须自己把 VC 运行库加进 PATH，否则链接阶段会找不到库。
+export PATH="/c/Program Files/Microsoft Visual Studio/<版本>/VC/Redist/MSVC/<版本号>/x64/Microsoft.VC143.CRT:$PATH"
 export PATH="/c/Users/<user>/.cargo/bin:$PATH"
 export RUSTC="C:/Users/<user>/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe"
+export CARGO_INCREMENTAL=0   # 避免 target/ 增量目录偶发「拒绝访问(os error 5)」
 cd stool-rs
 
 cargo clippy --all-targets -- -D warnings   # lint 门禁（CI 强制）
-cargo test --tests                  # 单元 + 集成（fuzz_parsers / roundtrip）
+cargo test --tests                  # 单元 + 集成（fuzz_parsers / roundtrip / streaming / parallel）
 cargo build --release
 # cargo fmt 不设门禁（宽行风格，见 rustfmt.toml）；如要局部对齐可手动跑
 # cargo fmt --all -- --check
@@ -283,11 +300,14 @@ cargo build --release
 - **不入库**：`verify/`（真实游戏数据）、`tools/`（下载的外部工具）、
   `stool-rs/target/`、`.workbuddy/`、`.cargo/config.toml`（本机 MSVC 路径）。
   （`Cargo.lock` **入库**：本项目含 `[[bin]]`，属二进制应用，按官方建议锁定依赖版本。）
-- **本机数据**：`~/.stool/config.json`（含机翻 API Key，明文，仅本机自用）、
-  `~/.stool/logs/stool-YYYY-MM-DD.log`（日志，导出诊断包时 Key 会脱敏）。
+- **本机数据**：`~/.stool/config.json`（机翻 API Key 用 DPAPI 加密后落盘，见 §4）、
+  `~/.stool/logs/stool-YYYY-MM-DD.log`（日志，导出诊断包时 Key 会脱敏）、
+  `~/.stool/tools/<工具名>/`（下载的外部工具 + `.sha256` 校验记录）。
 - **不注入、不提权**：所有外部工具都是独立进程 + 只写文件，不进目标进程。
   因此「运行时改动」一律做成**文件级**：KiriKiri 系 = `patchN.xp3`（`features/xp3patch.rs`），
   JS/DOM 系 = 新增脚本文件（`features/inject.rs`），MV/MZ 另有 CDP 远程调试改内存。
   **明确不做**：进程内 DLL/API 注入、Wolf RPG 注入（无验证样本，其数据本就在 `Data/` 目录里，
   直接改文件即可）、以及需要破解他人加密方案的解密。
+- **写内存的例外要打招呼**：通用内存扫描（`features/memscan.rs`）会直接改写目标进程内存，
+  是唯一"进内存"的能力，因此首次写入前强制二次确认（见 §4）。
 - **不做非法解密**：保护类加密只给明确报错与替代路线（KiriKiri 加密封包会明确报错并指向 GARbro / KrkrExtract）。

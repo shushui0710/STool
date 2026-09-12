@@ -94,6 +94,127 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".stool").join("config.json"))
 }
 
+/// 密钥字段的密文前缀：`enc:v1:<hex(DPAPI blob)>`。没有该前缀 = 旧配置里的明文。
+pub const KEY_PREFIX: &str = "enc:v1:";
+
+/// Windows DPAPI 加解密（`CryptProtectData` / `CryptUnprotectData`，无第三方依赖）。
+///
+/// 选它的理由：密钥由 Windows 按**当前登录用户**派生，本工具不需要自己管理主密钥，
+/// 也不会有"主密钥和密文放在一起"的伪加密问题。
+///
+/// 代价：密文**绑定当前 Windows 用户**，把 `config.json` 拷到别的机器/账户会解不开 ——
+/// 这种情况按"密钥失效"处理（告警 + 清空该字段），不影响其它设置加载。
+#[cfg(windows)]
+mod dpapi {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+    };
+
+    fn blob_of(data: &[u8]) -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 }
+    }
+
+    fn empty() -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB { cbData: 0, pbData: ptr::null_mut() }
+    }
+
+    /// 把内存块拷出来并释放 API 分配的内存（避免句柄泄漏）。
+    unsafe fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        LocalFree(out.pbData as *mut core::ffi::c_void);
+        v
+    }
+
+    pub fn protect(plain: &[u8]) -> Result<Vec<u8>, String> {
+        unsafe {
+            let input = blob_of(plain);
+            let mut out = empty();
+            let ok = CryptProtectData(
+                &input,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            );
+            if ok == 0 {
+                return Err(format!("CryptProtectData 失败: {}", std::io::Error::last_os_error()));
+            }
+            Ok(take(out))
+        }
+    }
+
+    pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
+        unsafe {
+            let input = blob_of(blob);
+            let mut out = empty();
+            let mut descr: *mut u16 = ptr::null_mut();
+            let ok = CryptUnprotectData(
+                &input,
+                &mut descr,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            );
+            if !descr.is_null() {
+                LocalFree(descr as *mut core::ffi::c_void);
+            }
+            if ok == 0 {
+                return Err(format!("CryptUnprotectData 失败: {}", std::io::Error::last_os_error()));
+            }
+            Ok(take(out))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod dpapi {
+    pub fn protect(_plain: &[u8]) -> Result<Vec<u8>, String> {
+        Err("DPAPI 仅在 Windows 上可用".into())
+    }
+    pub fn unprotect(_blob: &[u8]) -> Result<Vec<u8>, String> {
+        Err("DPAPI 仅在 Windows 上可用".into())
+    }
+}
+
+/// 明文密钥 → 落盘字符串（空串保持空串，不产生无意义的密文）。
+pub fn encrypt_key(plain: &str) -> Result<String, String> {
+    if plain.is_empty() {
+        return Ok(String::new());
+    }
+    let blob = dpapi::protect(plain.as_bytes())?;
+    Ok(format!("{KEY_PREFIX}{}", crate::hash::hex(&blob)))
+}
+
+/// 落盘字符串 → 明文密钥。无前缀的（旧配置）按明文原样返回。
+pub fn decrypt_key(stored: &str) -> Result<String, String> {
+    let Some(hexpart) = stored.strip_prefix(KEY_PREFIX) else {
+        return Ok(stored.to_string());
+    };
+    let raw = hex_decode(hexpart).ok_or("密钥字段不是合法的十六进制")?;
+    let bytes = dpapi::unprotect(&raw)?;
+    String::from_utf8(bytes).map_err(|e| format!("解密结果不是 UTF-8: {e}"))
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
 /// 版本迁移：把任意版本的配置提升到 [`CONFIG_VERSION`]。
 ///
 /// - `0`（无版本字段的旧配置）→ 目前结构兼容，只补版本号；
@@ -127,6 +248,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
 /// - 解析失败 → **备份损坏文件**（`.stool.bak`，不覆盖既有备份）→ 落日志 + stderr 告警 →
 ///   返回默认值。相比旧的"静默回退默认值"，损坏不再无声无息（旧行为会让下一次
 ///   `save` 把损坏内容彻底覆盖掉）。
+/// - 密钥字段：带 [`KEY_PREFIX`] 的用 DPAPI 解回明文；解不开（换机器/账户）→ 告警 + 清空该字段。
 pub fn load() -> Config {
     let p = config_path();
     let text = match fs::read_to_string(&p) {
@@ -134,7 +256,21 @@ pub fn load() -> Config {
         Err(_) => return Config::default(),
     };
     match parse(&text) {
-        Ok(cfg) => cfg,
+        Ok(mut cfg) => {
+            match decrypt_key(&cfg.mtl_key) {
+                Ok(k) => cfg.mtl_key = k,
+                Err(e) => {
+                    let msg = format!(
+                        "机翻 API Key 解密失败（{e}）。DPAPI 密文绑定当前 Windows 用户，\
+                         把配置拷到别的机器/账户会解不开；该字段已清空，请重新填写（其它设置不受影响）。"
+                    );
+                    crate::diag::log("WARN", &msg);
+                    eprintln!("⚠ {msg}");
+                    cfg.mtl_key = String::new();
+                }
+            }
+            cfg
+        }
         Err(e) => {
             let where_ = match backup_once(&p) {
                 Ok(b) => b.display().to_string(),
@@ -150,15 +286,31 @@ pub fn load() -> Config {
     }
 }
 
+/// 保存配置。**密钥不明文落盘**：先加密再写；加密失败也不阻断保存（退回明文并落日志）。
 pub fn save(cfg: &Config) -> Result<(), String> {
     let p = config_path();
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&p, serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    let mut out = cfg.clone();
+    match encrypt_key(&cfg.mtl_key) {
+        Ok(enc) => out.mtl_key = enc,
+        Err(e) => {
+            crate::diag::log("WARN", &format!("API Key 加密失败（{e}），本次以明文写入配置"));
+        }
+    }
+    fs::write(&p, serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
-/// unrpyc.py 路径：配置优先，其次 skill 捆绑副本。
+/// 外部工具安装根目录（与 `features::tools_dl` 一致：`~/.stool/tools/`）。
+pub fn tools_root() -> PathBuf {
+    userprofile().join(".stool").join("tools")
+}
+
+/// unrpyc.py 路径：配置优先 → 环境变量 → 本工具下载目录 → skill 捆绑副本 → 兜底。
+///
+/// 注意：**不能写死本机绝对路径**（换机器即失效，且失败会静默回退到系统 `python`）。
+/// 这里只按「跨机器成立」的位置顺序探测。
 pub fn unrpyc_path() -> PathBuf {
     let cfg = load();
     if !cfg.unrpyc.is_empty() {
@@ -168,7 +320,9 @@ pub fn unrpyc_path() -> PathBuf {
         }
     }
     let candidates = [
-        PathBuf::from("D:/STool/tools/unrpyc/unrpyc.py"),
+        // ① 设置页「一键下载」的落地位置
+        tools_root().join("unrpyc").join("unrpyc.py"),
+        // ② skill 捆绑副本
         userprofile()
             .join(".workbuddy")
             .join("skills")
@@ -177,11 +331,20 @@ pub fn unrpyc_path() -> PathBuf {
             .join("unrpyc")
             .join("unrpyc.py"),
     ];
+    if let Ok(v) = std::env::var("STOOL_UNRPYC") {
+        let p = PathBuf::from(v);
+        if p.exists() {
+            return p;
+        }
+    }
     let found = candidates.iter().find(|p| p.exists()).cloned();
-    found.unwrap_or(candidates[0].clone())
+    found.unwrap_or_else(|| candidates[0].clone())
 }
 
-/// Python 解释器：配置优先，其次受管运行时，最后 PATH。
+/// Python 解释器：配置优先 → 环境变量 → 受管运行时（扫 `versions/*`，取最新）→ PATH。
+///
+/// 受管目录里可能同时存在 3.12/3.13 等多个版本，硬编码某个版本号换机器就会失效；
+/// 这里改成**扫描目录取版本号最大者**。
 pub fn python_path() -> String {
     let cfg = load();
     if !cfg.python.is_empty() {
@@ -190,17 +353,42 @@ pub fn python_path() -> String {
     if let Ok(v) = std::env::var("STOOL_PYTHON") {
         return v;
     }
-    let managed = userprofile()
+    if let Some(p) = managed_python() {
+        return p.to_string_lossy().into_owned();
+    }
+    "python".to_string()
+}
+
+/// 在受管运行目录里找最新版的 `python.exe`（`~/.workbuddy/binaries/python/versions/<ver>/python.exe`）。
+fn managed_python() -> Option<PathBuf> {
+    let versions = userprofile()
         .join(".workbuddy")
         .join("binaries")
         .join("python")
-        .join("versions")
-        .join("3.13.12")
-        .join("python.exe");
-    if managed.exists() {
-        return managed.to_string_lossy().into_owned();
+        .join("versions");
+    let rd = fs::read_dir(&versions).ok()?;
+    let mut best: Option<(Vec<u32>, PathBuf)> = None;
+    for e in rd.flatten() {
+        let dir = e.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let exe = dir.join("python.exe");
+        if !exe.exists() {
+            continue;
+        }
+        let ver = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .split('.')
+            .map(|x| x.parse::<u32>().unwrap_or(0))
+            .collect::<Vec<u32>>();
+        if best.as_ref().map(|(b, _)| ver > *b).unwrap_or(true) {
+            best = Some((ver, exe));
+        }
     }
-    "python".to_string()
+    best.map(|(_, p)| p)
 }
 
 pub fn userprofile() -> PathBuf {
@@ -364,5 +552,42 @@ mod tests {
         // 损坏内容必须返回 Err（调用方据此备份 + 告警），而不是静默吞掉
         assert!(parse("{ not json").is_err());
         assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn legacy_plaintext_key_passes_through() {
+        // 旧配置里的明文 Key 没有前缀：必须原样返回（保证老配置能用）
+        assert_eq!(decrypt_key("sk-plain-123").unwrap(), "sk-plain-123");
+        assert_eq!(decrypt_key("").unwrap(), "");
+    }
+
+    #[test]
+    fn hex_decode_roundtrip() {
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(hex_decode(&crate::hash::hex(&bytes)).unwrap(), bytes);
+        assert!(hex_decode("abc").is_none(), "奇数长度必须拒绝");
+        assert!(hex_decode("zz").is_none(), "非十六进制必须拒绝");
+    }
+
+    #[test]
+    fn empty_key_stays_empty() {
+        // 没填 Key 时不应写入无意义的密文
+        assert_eq!(encrypt_key("").unwrap(), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_roundtrip_and_no_plaintext_leak() {
+        let secret = "sk-test-中文-key-0123456789";
+        let enc = encrypt_key(secret).unwrap();
+        assert!(enc.starts_with(KEY_PREFIX), "应带 enc:v1: 前缀");
+        assert!(!enc.contains(secret), "密文里不能出现明文");
+        assert_eq!(decrypt_key(&enc).unwrap(), secret, "加解密必须回环");
+        // 篡改密文（保持十六进制合法）→ 必须报错（而不是解出垃圾）
+        let idx = KEY_PREFIX.len() + 4;
+        let mut bad = enc.clone();
+        let ch = if bad.as_bytes()[idx] == b'0' { "1" } else { "0" };
+        bad.replace_range(idx..idx + 1, ch);
+        assert!(decrypt_key(&bad).is_err(), "被篡改的密文应解密失败");
     }
 }

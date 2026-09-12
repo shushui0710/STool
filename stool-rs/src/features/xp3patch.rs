@@ -197,6 +197,153 @@ pub fn build(root: &Path, src_dir: &Path, name: Option<&str>) -> Result<String, 
         ));
     }
 
+    write_patch(root, files, name, &src_dir.display().to_string())
+}
+
+/// 只把**与游戏现有封包内容不同**的文件打进补丁包 —— 这是「解包 → 汉化 → 打补丁」的闭环：
+/// 直接把解包产物目录整个交给它，未改动的文件会被自动跳过，补丁包里只有真正改过的东西。
+///
+/// 对比基准是游戏**当前实际生效**的内容：按引擎搜索顺序（`data.xp3 → patch.xp3 → patch2.xp3 → …`，
+/// 后者覆盖前者）依次读出封包里的条目，所以即使游戏自带补丁包，比对结果也是正确的。
+///
+/// 典型用法：
+/// ```text
+/// stool-cli extract <游戏目录> -o <解包目录>        # 1. 解包
+/// stool-cli text-extract <解包目录> -o text.csv      # 2. 提台词
+/// stool-cli text-mtl text.csv …                      # 3. 机翻
+/// stool-cli text-import <解包目录> text.csv          # 4. 回写译文到解包目录
+/// stool-cli xp3-patch <游戏目录> --from-extract <解包目录>   # 5. 只把改动打成 patchN.xp3
+/// ```
+pub fn build_changed(root: &Path, src_dir: &Path, name: Option<&str>) -> Result<String, String> {
+    if !src_dir.is_dir() {
+        return Err(format!("解包目录不存在: {}", src_dir.display()));
+    }
+    let files = collect(src_dir)?;
+    if files.is_empty() {
+        return Err(format!("解包目录里没有文件: {}", src_dir.display()));
+    }
+    let originals = original_entries(root)?;
+    let stems = archive_stems(root);
+
+    let mut changed: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut skipped = 0usize;
+    // 按封包分组，每个封包只打开一次（大封包重复打开很贵）
+    let mut by_arc: BTreeMap<PathBuf, Vec<(String, crate::formats::xp3::Xp3Entry, PathBuf)>> = BTreeMap::new();
+    for (rel, p) in &files {
+        // 解包产物按「<解包目录>/<封包名>/<封包内路径>」落盘（见 engines 的 extract），
+        // 这里要把 `<封包名>/` 这层剥掉，换回**封包内路径**——补丁包里的名字必须是后者。
+        let key = to_entry_name(rel, &stems);
+        match originals.get(&key) {
+            Some((arc, e)) => by_arc.entry(arc.clone()).or_default().push((key, e.clone(), p.clone())),
+            None => {
+                // 封包里没有 → 新增文件，一律打包
+                changed.insert(key, p.clone());
+            }
+        }
+    }
+    for (arc, items) in by_arc {
+        let mut src = crate::formats::source::Source::open(&arc, crate::formats::source::MAX_ARCHIVE)
+            .map_err(|e| format!("打开 {} 失败: {e}", arc.display()))?;
+        for (rel, entry, path) in items {
+            // 先比大小（省掉绝大多数读取），大小一致再逐字节比
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+            if size != entry_size(&entry) {
+                changed.insert(rel, path);
+                continue;
+            }
+            let orig = crate::formats::xp3::read_entry(&mut src, &entry).unwrap_or_default();
+            let now = std::fs::read(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+            if orig == now {
+                skipped += 1;
+            } else {
+                changed.insert(rel, path);
+            }
+        }
+    }
+
+    if changed.is_empty() {
+        return Err(format!(
+            "对比后没有发现任何改动（检查了 {} 个文件，全部与游戏现有内容一致）。\n\
+             请确认：① 译文确实回写进了这个解包目录；② 目录结构与封包内路径一致（如 scenario/first.ks）。",
+            files.len()
+        ));
+    }
+    let n_changed = changed.len();
+    let msg = write_patch(root, changed, name, &src_dir.display().to_string())?;
+    Ok(format!("{msg}\n已跳过 {skipped} 个未改动文件，仅打包改动的 {n_changed} 个。"))
+}
+
+/// 读出游戏现有封包里的条目表：相对路径 → (所在封包, 条目)。
+/// 顺序遵循引擎搜索规则，**后加载的覆盖先加载的**，因此拿到的是"当前实际生效"的内容。
+fn original_entries(root: &Path) -> Result<BTreeMap<String, (PathBuf, crate::formats::xp3::Xp3Entry)>, String> {
+    let mut out: BTreeMap<String, (PathBuf, crate::formats::xp3::Xp3Entry)> = BTreeMap::new();
+    let Ok(rd) = std::fs::read_dir(root) else { return Ok(out) };
+    let mut arcs: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let lower = name.to_ascii_lowercase();
+        if (lower.starts_with("data") || lower.starts_with("patch")) && lower.ends_with(".xp3") {
+            arcs.push(p);
+        }
+    }
+    // data 在前、patch 系列按号在后（后者覆盖前者）
+    arcs.sort_by_key(|p| {
+        let n = p.file_name().map(|x| x.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        (n.starts_with("patch"), patch_index(&n))
+    });
+    for arc in arcs {
+        // 打不开 / 解析失败的封包跳过（可能加密或损坏），不影响其余封包的比对
+        let Ok(mut src) = crate::formats::source::Source::open(&arc, crate::formats::source::MAX_ARCHIVE) else {
+            continue;
+        };
+        let Ok(idx) = crate::formats::xp3::parse_index(&mut src) else { continue };
+        for (rel, entry) in idx {
+            out.insert(rel.replace('\\', "/"), (arc.clone(), entry));
+        }
+    }
+    Ok(out)
+}
+
+/// 条目在封包里的原始大小（各段原始大小之和）。
+fn entry_size(e: &crate::formats::xp3::Xp3Entry) -> u64 {
+    e.segments.iter().map(|s| s.orig_size).sum()
+}
+
+/// 游戏目录下所有封包的「名字主干」小写集合（`data.xp3` → `data`，`patch2.xp3` → `patch2`）。
+/// 解包时每个封包会单独落到一个以主干命名的子目录里，据此把解包路径还原成封包内路径。
+fn archive_stems(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        if (lower.starts_with("data") || lower.starts_with("patch")) && lower.ends_with(".xp3") {
+            out.insert(lower.trim_end_matches(".xp3").to_string());
+        }
+    }
+    out
+}
+
+/// 解包目录里的相对路径 → 封包内路径。
+/// 若首段正好是某个封包主干（`data` / `patch` / `patch2` …）则剥掉这一层；
+/// 否则原样返回（用户也可能直接把 `<解包目录>/data` 这一层当输入）。
+fn to_entry_name(rel: &str, stems: &std::collections::BTreeSet<String>) -> String {
+    if let Some((first, rest)) = rel.split_once('/') {
+        if stems.contains(&first.to_ascii_lowercase()) {
+            return rest.to_string();
+        }
+    }
+    rel.to_string()
+}
+
+/// 落盘：解析包名（含归属保护）→ 备份 → 写 XP3 → 写 sidecar。
+fn write_patch(
+    root: &Path,
+    files: BTreeMap<String, PathBuf>,
+    name: Option<&str>,
+    origin: &str,
+) -> Result<String, String> {
     let name = match name {
         Some(n) => {
             let lower = n.to_ascii_lowercase();
@@ -231,7 +378,7 @@ pub fn build(root: &Path, src_dir: &Path, name: Option<&str>) -> Result<String, 
         "tool": "STool",
         "kind": "kirikiri-patch",
         "entries": n,
-        "source": src_dir.display().to_string(),
+        "source": origin,
         "created_unix": created,
     });
     std::fs::write(sidecar(root, &name), serde_json::to_string_pretty(&meta).unwrap_or_default())
@@ -409,5 +556,96 @@ mod tests {
         assert!(supports("kirikiri"));
         assert!(!supports("renpy"));
         assert!(target_of("kirikiri").unwrap().mechanism.contains("patch"));
+    }
+
+    /// 造一个真封包（内容取自临时文件），供 build_changed 当「原封包」比对基准。
+    fn make_xp3(archive: &Path, files: &[(&str, &str)]) {
+        let dir = archive.parent().unwrap();
+        let mut map = BTreeMap::new();
+        for (i, (name, content)) in files.iter().enumerate() {
+            let p = dir.join(format!("seed_{i}.bin"));
+            std::fs::write(&p, content).unwrap();
+            map.insert(name.to_string(), p);
+        }
+        crate::formats::xp3::write_paths_v(archive, &map, crate::formats::xp3::Xp3Version::V2).unwrap();
+    }
+
+    #[test]
+    fn build_changed_packs_only_modified_files() {
+        let d = tmp("changed");
+        make_xp3(
+            &d.join("data.xp3"),
+            &[("scenario/first.ks", "*start\nこんにちは\n"), ("system/config.tjs", "; cfg\n")],
+        );
+
+        // 解包目录与封包内容一致 → 必须报「没有发现改动」，且不产生补丁包
+        let ext = d.join("extract");
+        std::fs::create_dir_all(ext.join("scenario")).unwrap();
+        std::fs::create_dir_all(ext.join("system")).unwrap();
+        std::fs::write(ext.join("scenario").join("first.ks"), "*start\nこんにちは\n").unwrap();
+        std::fs::write(ext.join("system").join("config.tjs"), "; cfg\n").unwrap();
+        let err = build_changed(&d, &ext, None).unwrap_err();
+        assert!(err.contains("没有发现任何改动"), "实得: {err}");
+        assert!(!d.join("patch.xp3").exists(), "无改动不该产出补丁包");
+
+        // 改一个文件 + 新增一个文件 → 补丁包里应恰好这两条，未改动的被跳过
+        std::fs::write(ext.join("scenario").join("first.ks"), "*start\n你好\n").unwrap();
+        std::fs::write(ext.join("scenario").join("extra.ks"), "*extra\n").unwrap();
+        let msg = build_changed(&d, &ext, None).unwrap();
+        assert!(msg.contains("已跳过 1 个未改动文件"), "实得: {msg}");
+
+        let idx = crate::formats::xp3::parse(&d.join("patch.xp3")).unwrap();
+        assert_eq!(idx.len(), 2, "只应打包改动/新增的 2 个文件");
+        assert!(idx.contains_key("scenario/first.ks"));
+        assert!(idx.contains_key("scenario/extra.ks"));
+        assert!(!idx.contains_key("system/config.tjs"), "未改动文件不该进补丁包");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn build_changed_handles_extract_layout() {
+        // 真实解包产物是 `<解包目录>/<封包名>/<封包内路径>`（如 extract/data/scenario/first.ks），
+        // 比对与打包都必须换算回「封包内路径」，否则会把全部文件误判成新增。
+        let d = tmp("changed_layout");
+        make_xp3(&d.join("data.xp3"), &[("scenario/first.ks", "A\n")]);
+        let ext = d.join("extract");
+        let inner = ext.join("data").join("scenario");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("first.ks"), "A\n").unwrap();
+        // 未改动 → 必须报「没有发现改动」
+        assert!(
+            build_changed(&d, &ext, None).unwrap_err().contains("没有发现任何改动"),
+            "解包目录布局下也应正确识别「未改动」"
+        );
+
+        // 改动 → 补丁包条目名必须是封包内路径（不带 data/ 这一层）
+        std::fs::write(inner.join("first.ks"), "B\n").unwrap();
+        build_changed(&d, &ext, None).unwrap();
+        let idx = crate::formats::xp3::parse(&d.join("patch.xp3")).unwrap();
+        assert_eq!(idx.len(), 1);
+        assert!(
+            idx.contains_key("scenario/first.ks"),
+            "键应为封包内路径，实得 {:?}",
+            idx.keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn build_changed_respects_existing_patch_override() {
+        // 游戏自带 patch.xp3 覆盖了 data.xp3 里的同名文件：比对基准必须是「后者」（当前生效的那个）
+        let d = tmp("changed_override");
+        make_xp3(&d.join("data.xp3"), &[("scenario/first.ks", "OLD\n")]);
+        make_xp3(&d.join("patch.xp3"), &[("scenario/first.ks", "NEW\n")]);
+
+        let ext = d.join("extract");
+        std::fs::create_dir_all(ext.join("scenario")).unwrap();
+        // 与 data.xp3 相同、但与被覆盖后的生效内容不同 → 应判定为「有改动」
+        std::fs::write(ext.join("scenario").join("first.ks"), "OLD\n").unwrap();
+        build_changed(&d, &ext, Some("patch2.xp3")).unwrap();
+        let idx = crate::formats::xp3::parse(&d.join("patch2.xp3")).unwrap();
+        assert_eq!(idx.len(), 1);
+        assert!(idx.contains_key("scenario/first.ks"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

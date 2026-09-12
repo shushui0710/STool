@@ -144,7 +144,14 @@ impl StoolApp {
     pub(crate) fn refresh_pv_files(&mut self) {
         let dir = PathBuf::from(self.pv_dir_str.trim());
         self.pv_files = preview::list_media(&dir);
-        self.pv_msg = format!("共 {} 个媒体文件", self.pv_files.len());
+        self.pv_msg = if self.pv_files.len() >= preview::MAX_MEDIA {
+            format!(
+                "媒体文件很多，已达上限 {} 个（其余未列出；可改用上面的名称筛选或缩小目录范围）",
+                preview::MAX_MEDIA
+            )
+        } else {
+            format!("共 {} 个媒体文件", self.pv_files.len())
+        };
     }
 
     pub(crate) fn load_pv_texture(&mut self, path: &PathBuf, ctx: &egui::Context) {

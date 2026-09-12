@@ -139,6 +139,20 @@ stool-cli xp3-patch <游戏目录> --remove patch.xp3         # 移除（只删�
 安全约束：**绝不覆盖游戏自带的补丁包**（检测到非本工具创建的包会拒绝并自动改取下一个空号）；
 补丁包名强制为 `patch*.xp3`（挡掉把 `data.xp3` 误当补丁写的操作）；移除只认本工具生成的包。
 
+**「解包 → 汉化 → 打补丁」闭环**：如果封包已经整个解开过，可以直接把**解包目录**交给它，
+它会和游戏现有封包逐字节比对（按引擎搜索顺序，游戏自带补丁包也算在内），
+**只把真正改过的文件**打进补丁包——未改动的文件不会白占体积：
+
+```bash
+stool-cli extract <游戏目录> -o <解包目录>                  # 1. 解包
+stool-cli text-extract <解包目录> -o text.csv               # 2. 提台词
+stool-cli text-mtl text.csv --preset deepseek --key sk-xxx  # 3. 机翻
+stool-cli text-import <解包目录> text.csv                   # 4. 回写译文
+stool-cli xp3-patch <游戏目录> --from-extract <解包目录>     # 5. 只把改动打成 patchN.xp3
+```
+
+第 5 步若一个文件都没改，会明确报「没有发现任何改动」而不是产出一个空补丁包。
+
 ## 怎么用？
 
 直接双击 `stool.exe` 就会打开图形界面（支持中文显示，**不会弹出黑色控制台窗口**），按页面提示操作即可。
@@ -218,6 +232,38 @@ stool-cli diag-export <游戏目录> -o 诊断包.zip
 
 **完整汉化工作流**：`text-extract` 提取 → `text-mtl` 机翻（或人工翻译 CSV）
 → `text-import` 回填；或写好 JSON 后 `text-mtl` 机翻 → `text-inject` 运行时注入。
+吉里吉里这类封包引擎还可以走「解包 → 汉化 → 打补丁」闭环（见上文"运行时修改"页方式三）。
+
+## 从源码构建
+
+需要 **Rust 稳定版工具链** + **MSVC 生成工具**（Windows 目标 `x86_64-pc-windows-msvc`）。
+开发环境是 Git Bash + MSVC，关键在于**让 `rustc` 与链接器找得到 VC 运行库**：
+
+```bash
+# 1) 安装工具链（已装可跳过）
+rustup toolchain install stable-x86_64-pc-windows-msvc
+
+# 2) 把 VC 运行库与本机工具链加进 PATH
+#    版本号按本机 Visual Studio 的实际路径调整（Community/BuildTools、14.xx.xxxxx 都可能不同）
+export PATH="/c/Program Files/Microsoft Visual Studio/2022/Community/VC/Redist/MSVC/14.36.32532/x64/Microsoft.VC143.CRT:$PATH"
+export RUSTC="$HOME/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe"
+# 关闭增量编译，避免偶发的 target/ 目录占用报错（os error 5）
+export CARGO_INCREMENTAL=0
+
+# 3) 构建与验证
+cd stool-rs
+cargo build --release                       # 产物：target/release/stool.exe、stool-cli.exe
+cargo test --tests                          # 跑全部测试
+cargo clippy --all-targets -- -D warnings    # 质量门禁：必须零警告
+```
+
+两点说明：
+
+- **测试请用 `cargo test --tests`**，不要用裸 `cargo test`：本项目没有 doctest
+  （文档里的代码块都标了 ` ```text `），显式限定可避免 Windows 上 doctest 执行器的环境差异造成假失败。
+- **本项目不设 `cargo fmt --check` 门禁**：仓库是手工维护的「宽行」风格
+  （`stool-rs/rustfmt.toml` 仅作编辑器指引）。全量 `cargo fmt` 会产生约 2000 行、跨 37 个文件的改动，
+  与「保持既有风格一致」冲突。
 
 ## 程序结构（给想参与开发的你）
 
@@ -233,7 +279,8 @@ src/
 │              #   unlock 解锁归纳 / xp3patch 吉里吉里运行时补丁包
 ├── cli.rs     # 命令行入口
 ├── gui/       # 图形界面（mod.rs + pages/ 各页 + util / save_tree；自动加载中文字体，界面不乱码）
-└── settings.rs# 配置文件（~/.stool/config.json，存放外部工具的路径）
+├── hash.rs    # 无依赖 SHA-256（校验一键下载的外部工具是否被篡改）
+└── settings.rs# 配置（~/.stool/config.json；机翻 API Key 用 Windows DPAPI 加密后落盘）
 ```
 
 **想加一个新引擎？** 只需实现一个 `Engine` 接口（其中"如何识别该引擎"必须实现，
@@ -248,6 +295,10 @@ src/
 程序会自动从官方 GitHub Release 下载、解压到 `~/.stool/tools/` 并填好路径
 （下载不动时可在设置页配置代理）。手动安装的话，把可执行文件完整路径填进去保存即可。
 
+下载是**流式**的（不会把上百 MB 的压缩包整个读进内存），并且**边下边算 SHA-256**，
+与 GitHub 给出的官方摘要比对——不一致直接中止并删除临时文件（防代理劫持或上游换包）；
+上游没提供摘要时，会把算出的校验和记到 `~/.stool/tools/<工具名>/.sha256` 供人工核对。
+
 - **unrpyc** — 把 Ren'Py 的加密脚本还原成可读源码（需要电脑装有 Python；本程序会自动寻找捆绑的副本）
 - **WolfDec** — 解包 Wolf 引擎游戏
 - **AssetRipper** — 导出 Unity 游戏的资源（传统的 Mono 版 Unity 游戏也可以用 dnSpy 查看）
@@ -258,11 +309,11 @@ src/
 
 本项目的质量门禁：`cargo clippy --all-targets -- -D warnings`（零警告）+ `cargo test --tests`。
 
-当前 `cargo test --tests` 共 **189 项测试全部通过**（另有 1 项需联网的用例默认忽略）：
+当前 `cargo test --tests` 共 **199 项测试全部通过**（另有 1 项需联网的用例默认忽略）：
 
-- **156 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
-  MTool 式 JSON 注入、MOD 管理、解锁策略、预检/自检/体检/批量、吉里吉里运行时补丁包、
-  断点续传、并行解包、机翻重试退避……
+- **166 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
+  MTool 式 JSON 注入、MOD 管理、解锁策略、预检/自检/体检/批量、吉里吉里运行时补丁包
+  （含「只打包改动」比对）、断点续传、并行解包、机翻重试退避、SHA-256 官方向量、API Key 加解密……
 - **15 项回环测试**（`tests/roundtrip.rs`）：每种封包"生成样本 → 解析 → 写回 → 再解析"，
   与原文件逐字节比对
 - **9 项模糊测试**（`tests/fuzz_parsers.rs`）：对解析器投喂畸形/截断/随机输入，
@@ -314,3 +365,8 @@ pieroxy/lz-string 官方源码）逐一核对过，确保对真实游戏文件�
   Unity 的 IL2CPP 打包），这些需要借助对应的外部工具或暂不支持
 - 所有会修改游戏文件的操作（封包、存档、进度解锁、MOD 安装）都会先把原文件
   自动备份为 `*.stool.bak`，改坏了随时可以还原
+- **机翻 API Key 不会明文落盘**：保存设置时用 Windows DPAPI（按当前用户派生密钥）加密后
+  写入 `~/.stool/config.json`。该密文**绑定当前 Windows 用户**，把配置拷到别的机器/账户会解不开——
+  此时程序会告警并清空该字段，重新填一次即可，其它设置不受影响
+- **内存扫描类操作（修改游戏进程内存）会在首次写入前弹确认**，说明可能的风险；
+  确认过一次后不再重复询问（可随时在界面上取消勾选）

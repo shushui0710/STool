@@ -281,6 +281,10 @@ impl StoolApp {
                     ui.label(RichText::new("● 已锁定").color(Color32::from_rgb(220, 120, 120)).small());
                 }
             });
+            ui.checkbox(
+                &mut self.ms_ack,
+                "我已了解写入内存的风险（可能让游戏状态或存档异常）；勾选后不再每次弹窗确认",
+            );
             if let Ok(st) = self.ms_sh.lock() {
                 if !st.msg.is_empty() {
                     ui.label(RichText::new(&st.msg).small());
@@ -342,6 +346,26 @@ impl StoolApp {
                     }
                     self.xp_refresh();
                 }
+                if ui
+                    .button("🔍 只打包改动（对比原封包）")
+                    .on_hover_text(
+                        "上面填「解包产物目录」：会自动和游戏现有封包逐字节比对，只把真正改过的文件打进补丁包。\n\
+                         适合「解包 → 汉化 → 打补丁」流程，未改动的文件不会白占体积。",
+                    )
+                    .clicked()
+                {
+                    let src = PathBuf::from(self.xp_src_str.trim());
+                    let name = self.xp_name_str.trim();
+                    let name = if name.is_empty() { None } else { Some(name.to_string()) };
+                    match xp3patch::build_changed(&self.game_root, &src, name.as_deref()) {
+                        Ok(m) => {
+                            self.toast = Some(("已生成补丁包（仅含改动文件）".into(), std::time::Instant::now()));
+                            self.xp_msg = m;
+                        }
+                        Err(e) => self.toast = Some((format!("✘ {e}"), std::time::Instant::now())),
+                    }
+                    self.xp_refresh();
+                }
                 if ui.button("🗑 移除本工具建的补丁包").clicked() {
                     let name = self.xp_name_str.trim();
                     if name.is_empty() {
@@ -388,6 +412,46 @@ impl StoolApp {
                 ui.label(RichText::new(format!("提示: {}", t.caveat)).weak().small());
             }
         });
+
+        // ---- 写内存二次确认（Cheat Engine 类工具会直接改目标进程内存，首次写入必须让用户明确知晓）----
+        if let Some(pending) = self.ms_pending {
+            let mut go = false;
+            let mut cancel = false;
+            egui::Window::new("⚠ 写入游戏内存前确认")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new("内存扫描会直接改写目标进程的内存，属于修改器行为。").strong());
+                    ui.label("可能导致：游戏状态异常、存档损坏、游戏崩溃，或被反作弊判定为异常。");
+                    ui.label("建议：动手前先在游戏里手动存一次档；不确定的地址不要写。");
+                    ui.add_space(6.0);
+                    let act = match pending {
+                        MsPending::WriteAll => "写入所有命中地址",
+                        MsPending::Freeze => "锁定数值（每 150ms 反复写入）",
+                    };
+                    ui.label(RichText::new(format!("即将执行：{act}　新值：{}", self.ms_value.trim())).monospace());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("我明白，继续").clicked() {
+                            go = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if go {
+                self.ms_ack = true;
+                self.ms_pending = None;
+                match pending {
+                    MsPending::WriteAll => self.ms_write_all_now(),
+                    MsPending::Freeze => self.ms_toggle_freeze_now(),
+                }
+            } else if cancel {
+                self.ms_pending = None;
+            }
+        }
     }
 
     /// 刷新补丁包列表（进入页面 / 生成 / 移除后调用）。
@@ -507,8 +571,17 @@ impl StoolApp {
         }
     }
 
-    /// 数值锁定：后台线程每 150ms 反复写入当前输入框的值（Cheat Engine 的 Freeze）。
+    /// 数值锁定入口：未确认过写内存风险则先弹确认框。
     pub(crate) fn ms_toggle_freeze(&mut self) {
+        if !self.ms_frozen && !self.ms_ack {
+            self.ms_pending = Some(MsPending::Freeze);
+            return;
+        }
+        self.ms_toggle_freeze_now();
+    }
+
+    /// 数值锁定：后台线程每 150ms 反复写入当前输入框的值（Cheat Engine 的 Freeze）。
+    pub(crate) fn ms_toggle_freeze_now(&mut self) {
         if self.ms_frozen {
             self.ms_freeze_stop.store(true, Ordering::Relaxed);
             self.ms_frozen = false;
@@ -537,8 +610,17 @@ impl StoolApp {
         self.toast = Some(("已锁定该数值（游戏里改不掉；要改锁定值请先解锁再锁定）".into(), std::time::Instant::now()));
     }
 
-    /// 把新值写入所有命中地址（用当前输入框的值）。
+    /// 写入所有命中入口：未确认过写内存风险则先弹确认框。
     pub(crate) fn ms_write_all(&mut self) {
+        if !self.ms_ack {
+            self.ms_pending = Some(MsPending::WriteAll);
+            return;
+        }
+        self.ms_write_all_now();
+    }
+
+    /// 真正把新值写入所有命中地址（用当前输入框的值）。
+    pub(crate) fn ms_write_all_now(&mut self) {
         let value = self.ms_value.trim().to_string();
         let result = {
             let mut opt = match self.ms_scanner.lock() {
