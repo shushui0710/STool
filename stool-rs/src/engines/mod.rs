@@ -1,5 +1,6 @@
 //! 引擎插件层：Engine trait + 注册表 + 检测评分。
 
+pub mod artemis;
 pub mod external;
 pub mod generic;
 pub mod others;
@@ -7,6 +8,7 @@ pub mod recognize;
 pub mod renpy;
 pub mod scan;
 
+pub use artemis::ArtemisPlugin;
 pub use others::{GodotPlugin, HtmlGamePlugin, KirikiriPlugin, NscripterPlugin, RpgMakerMvPlugin, RpgMakerRgssPlugin, TyranoPlugin};
 pub use scan::ScanCtx;
 
@@ -278,6 +280,7 @@ impl Registry {
             Box::new(others::NscripterPlugin),
             Box::new(others::TyranoPlugin),
             Box::new(others::HtmlGamePlugin),
+            Box::new(artemis::ArtemisPlugin),
             Box::new(external::WolfPlugin),
             Box::new(external::UnityPlugin),
         ];

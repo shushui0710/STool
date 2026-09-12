@@ -12,7 +12,8 @@ use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
-use stool::formats::{asar, marshal, nscript, pck, pickle, rgss, rpgmmv, xp3};
+use stool::formats::source::{Source, MAX_ARCHIVE};
+use stool::formats::{asar, dotnet, il2cpp, marshal, nscript, pck, pfs, pickle, rgss, rpgmmv, xp3};
 
 // ---------- 工具 ----------
 
@@ -222,6 +223,34 @@ fn fuzz_file_based_parsers() {
         for len in [0usize, 8, 24, 64, 200] {
             v.push(("random", rng.bytes(len)));
         }
+        // Artemis PFS 头（pf6 / pf8）截断
+        for extra in 0..48usize {
+            let mut a = b"pf8".to_vec();
+            a.extend(rng.bytes(extra));
+            v.push(("pfs", a));
+            let mut b = b"pf6".to_vec();
+            b.extend(rng.bytes(extra));
+            v.push(("pfs", b));
+        }
+        // .NET 程序集头（MZ）截断
+        for extra in 0..64usize {
+            let mut a = b"MZ".to_vec();
+            a.extend(rng.bytes(extra));
+            v.push(("dotnet", a));
+        }
+        // IL2CPP 元数据头（magic + 版本）截断
+        for extra in 0..64usize {
+            let mut a = 0xFAB1_1BAFu32.to_le_bytes().to_vec();
+            a.extend_from_slice(&29i32.to_le_bytes());
+            a.extend(rng.bytes(extra));
+            v.push(("il2cpp", a));
+            // 版本合法但区指针全随机
+            let mut b = 0xFAB1_1BAFu32.to_le_bytes().to_vec();
+            b.extend_from_slice(&24i32.to_le_bytes());
+            b.extend(rng.bytes(16)); // 6 个 i32 区指针
+            b.extend(rng.bytes(32));
+            v.push(("il2cpp", b));
+        }
         v
     };
 
@@ -246,6 +275,20 @@ fn fuzz_file_based_parsers() {
         });
         no_panic(&format!("rgss::parse_v3 #{idx} ({kind})"), || {
             let _ = rgss::parse_v3(&path);
+        });
+        let p = path.clone();
+        no_panic(&format!("pfs::parse_index #{idx} ({kind})"), || {
+            if let Ok(mut s) = Source::open(&p, MAX_ARCHIVE) {
+                let _ = pfs::parse_index(&mut s);
+            }
+        });
+        let p = path.clone();
+        no_panic(&format!("dotnet::read_strings #{idx} ({kind})"), || {
+            let _ = dotnet::read_strings(&p);
+        });
+        let p = path.clone();
+        no_panic(&format!("il2cpp::read_strings #{idx} ({kind})"), || {
+            let _ = il2cpp::read_strings(&p);
         });
     }
 }
@@ -309,12 +352,17 @@ fn fuzz_mutated_valid_packets() {
     rgss::write_v1(&rgss1, &kv).unwrap();
     let rgss3 = dir.join("sample.rgss3a");
     rgss::write_v3(&rgss3, &kv).unwrap();
+    let pfs_path = dir.join("sample.pfs");
+    let pfs_files: Vec<(String, Vec<u8>)> =
+        vec![("a.txt".to_string(), b"hello world 12345".to_vec()), ("d\\b.bin".to_string(), (0..200u8).collect())];
+    pfs::write_archive(&pfs_path, &pfs_files, b'8').unwrap();
 
     let bases: Vec<(&str, Vec<u8>)> = vec![
         ("pck", fs::read(&pck_path).unwrap()),
         ("xp3", fs::read(&xp3_path).unwrap()),
         ("rgss_v1", fs::read(&rgss1).unwrap()),
         ("rgss_v3", fs::read(&rgss3).unwrap()),
+        ("pfs", fs::read(&pfs_path).unwrap()),
     ];
 
     for (kind, base) in bases {
@@ -374,6 +422,19 @@ fn dispatch(kind: &str, bytes: &[u8]) {
             let p = path.clone();
             no_panic("mutate rgss v3", || {
                 let _ = rgss::parse_v3(&p);
+            });
+        }
+        "pfs" => {
+            let p = path.clone();
+            no_panic("mutate pfs", || {
+                if let Ok(mut s) = Source::open(&p, MAX_ARCHIVE) {
+                    if let Ok(ix) = pfs::parse_index(&mut s) {
+                        // 索引能解析时，条目读取也必须安全（越界 offset/size 不 panic）
+                        for e in &ix.entries {
+                            let _ = pfs::read_entry(&mut s, &ix, e);
+                        }
+                    }
+                }
             });
         }
         _ => {}

@@ -62,7 +62,7 @@
 ### 1.3 本报告新发现的功能缺口（原方案未覆盖）
 
 1. **无诊断包导出能力** → ✅ 已补（P1-1 `features/diagpack.rs` + CLI `diag-export`）。
-2. **无解包断点续传**：几 GB 的封包解到一半取消/崩溃，只能从头再来（`Ctx::cancelled()` 只支持中止，不支持恢复）。→ ⏳ 待办（P2-4）
+2. **无解包断点续传**：几 GB 的封包解到一半取消/崩溃，只能从头再来（`Ctx::cancelled()` 只支持中止，不支持恢复）。→ ✅ 已补（P2-4 `engines::Resume` + `write_out_resume`，台账 `<out>/.stool_resume_extract.json`）
 3. **无"回填一键闭环"** → ✅ 已补（P2-5 `restore::apply_repack` + CLI `pack-apply`）。
 4. **无封包完整性校验** → ✅ 已补（P2-6 `features/selfcheck.rs` + CLI `selfcheck` + GUI「🧩 封包自检」）：解包 → 重打包 → 逐条目比对，把 `verify/*_diff.txt` 的人工流程产品化。
 5. **无批量/队列** → ✅ 已补（P2-9 `features/batch.rs` + CLI `batch` + GUI 批量检测）。
@@ -316,6 +316,40 @@
 
 **验证**：`"Orc Kabe"` 哈希与 skill 实测样本一致（`3173159926`）；合成 Unity 目录 + 隔离注册表键（`HKCU\Software\StoolTest\...`，验证后已删除）跑通「扫描 → 写入 3 项 / 校验 3 项 → 回滚」全链路；新增 8 个单元测试 + 1 个 `#[ignore]` 的真实注册表回归测试（自建自删）。测试总数 **81 通过 / 0 失败**，`clippy --all-targets` 零警告。
 
-**已知局限**：候选键名靠「场景字符串 + 启发式」提取，可能混入无关整数设置项。缓解手段是「用现存键族前缀自动收敛候选」+ `--opt:filter=` + 默认只读扫描；**最稳的仍是优先找游戏自带的「全开开关」**（已在报告里提示用户）。若后续要更精确，可接 ilspycmd 反编译 `*GalleryManager*` 直接取 `_wholeNameList`（P1）。
+**已知局限**：候选键名曾靠「场景字符串 + 启发式」提取，可能混入无关整数设置项。缓解手段是「用现存键族前缀自动收敛候选」+ `--opt:filter=` + 默认只读扫描；**最稳的仍是优先找游戏自带的「全开开关」**（已在报告里提示用户）。
+
+**已解决（后续落地）**：原计划的「接 ilspycmd 反编译 `*GalleryManager*` 取 `_wholeNameList`」经实测**不需要**——
+`_wholeNameList` 这类字面量本身就存在元数据字符串堆里，直接读即可，还省掉了外部工具与 .NET 运行时依赖：
+
+- Mono 版：`*_Data/Managed/Assembly-CSharp*.dll` 的 `#US` 堆（`formats/dotnet.rs`，PE → CLI 头 → `BSJB` 元数据根 → 流头）；
+- IL2CPP 版（**无 C# 程序集**）：`il2cpp_data/Metadata/global-metadata.dat` 的字面量池（`formats/il2cpp.rs`，v24..31，带布局自检）。
+
+真机效果：Inari（Mono）读出 10085 条字面量 / 164 个画廊类型；Yakuzarogue（IL2CPP v31）直接列出真实键
+`cg_button_name1`…`cg_button_name7`。噪声用字符集白名单 + base64 常量块剔除 + 相关性排序（先排序再截断）压制，
+新增只读入口 `stool cg-candidates`（完全不碰注册表）。**不做 ilspycmd**：它拿到的信息不超出元数据字符串，
+却引入一个需要 .NET 运行时的可选依赖（详见 `docs/引擎识别依据与解锁策略.md` §2.4）。
 
 
+
+---
+
+## 9. 本轮增量：Artemis 原生支持 + Unity 精确键名 + CI 升级
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| **CI** | `actions/checkout@v4` → `@v5`（v4 指向 Node 20，GitHub 已弃用告警） | CI run 全绿 |
+| **新引擎：Artemis Engine** | `formats/pfs.rs`（pf6/pf8 索引 + 写侧）+ `engines/artemis.rs`（识别 70 分、解包并行 + 断点续传、按原索引顺序回封、分卷明确报错）+ `selfcheck` 纳入 PFS | 真机：`root.pfs` 1.5GB/2703 条目、`Amakano3.pfs` 1.7GB/3361 条目，索引 100% 解析零越界，产物 PNG/OTF/OGV/`.ast` 全部有效；`selfcheck` 重打包逐条目无损 |
+| **Unity 全 CG：键名精确化** | `formats/dotnet.rs`（.NET/PE 元数据 `#US`/`#Strings`）+ `formats/il2cpp.rs`（`global-metadata.dat`）+ `gallery::scan_precise` 两级来源 | Mono 版 Inari：10085 条字面量 / 164 个画廊类型，与**独立 Python 解析器**计数完全一致；IL2CPP 版 6 款游戏 6/6 正确解析，字面量 UTF-8 可解率 99.99% |
+| **只读入口 `cg-candidates`** | 完全不碰注册表的候选查看命令（写入前确认 / 排查"一个键都没扫到"） | 真机 Yakuzarogue 扫出真实键 `cg_button_name1`…`cg_button_name7` |
+| **封包自检扩容** | `selfcheck::Kind` 增加 `Pfs8` / `Pfs6` | 12 项 selfcheck 单测全过 |
+| **对抗性测试** | dotnet / il2cpp 加入逐字节翻转 + 随机改写（各 500 轮）+ 逐长度截断；`tests/fuzz_parsers.rs` 加头级样本 | 无 panic |
+
+**过程中发现并修掉的 3 个真 bug**（真机样本 + 交叉验证才暴露的）：
+
+1. `.NET` 元数据根里 `Flags(u16)` 在 `Streams(u16)` **之前**，解析器把 `Flags`（恒 0）当成了流数量 → 误报"流数量异常（0）"。
+2. 流头里的 `Offset` 是**相对元数据根**的，解析器当成了绝对文件偏移 → 所有堆读取越界。
+3. IL2CPP 的 `len` 是**精确字节长度**（池内无 NUL 终止符），按"含结尾 NUL"切 `len-1` 会让**每条字面量都被截掉末字符**（`" - Linux"` → `" - Linu"`）。两种解读都能 97% 解出合法 UTF-8，只有真机样本能判定；现已加**布局自检**（字面量 UTF-8 可解率 ≥90%）把错误解读挡在门外。
+   另修一个**偶发测试竞态**：`pfs.rs` 的 `sample()` 被两个用例共用同一临时目录，`tmp()` 的先删后建在并行测试下互相踩踏。
+
+**门禁**：`cargo clippy --all-targets -- -D warnings` 零警告；`cargo test --tests` **228 项全过**
+（193 单元 + 9 模糊 + 4 并行 + 16 回环 + 6 流式，1 项需真实注册表的用例默认 `#[ignore]`）。

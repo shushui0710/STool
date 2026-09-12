@@ -113,6 +113,13 @@ impl<'a> Cursor<'a> {
     }
 
     #[inline]
+    pub fn i32_le(&mut self) -> Option<i32> {
+        let v = i32_le(self.data, self.pos)?;
+        self.pos += 4;
+        Some(v)
+    }
+
+    #[inline]
     pub fn u64_le(&mut self) -> Option<u64> {
         let v = u64_le(self.data, self.pos)?;
         self.pos += 8;

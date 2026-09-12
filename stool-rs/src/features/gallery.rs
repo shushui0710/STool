@@ -9,8 +9,13 @@
 //! - **哈希**：djb2 变体，按 UTF-8 字节，32 位无符号溢出（见 [`prefs_hash`]）。
 //! - **自检**：用注册表里**已存在**的真实键反推哈希，对得上才动手写——
 //!   这是避免"写一堆无效键"的关键。
-//! - **键名来源**：不靠猜。画廊的键名列表（`_wholeNameList`）已序列化进
-//!   `<游戏>_Data/level*` 场景文件，直接按字符串取出即可。
+//! - **键名来源（两级）**：
+//!   1. **精确**：Mono 版的 `<游戏>_Data/Managed/Assembly-CSharp.dll` 是标准 .NET
+//!      程序集，`PlayerPrefs.SetInt("cg_flag_01", 1)` 的**字面量**就躺在 `#US` 堆里，
+//!      直接读出来即可（见 [`scan_assemblies`] → `formats::dotnet`）。零依赖、不需要
+//!      反编译器、不执行任何代码。
+//!   2. **兜底**：场景 / 资源二进制里的 ASCII 串（IL2CPP 版没有 C# 程序集，
+//!      `assembly-csharp.dll` 不存在，此时仍用启发式扫描）。
 //! - **优先策略**：很多作品自带隐藏的"全开开关"，比逐个写键更彻底；
 //!   本模块会在报告里提示这一点。
 //!
@@ -22,6 +27,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::engines::{Ctx, OpOutcome};
+use crate::formats::{dotnet, il2cpp};
 
 // ---------------------------------------------------------------------------
 // 哈希与命名
@@ -125,8 +131,12 @@ const NOISE: &[&str] = &[
 /// 猜测"像画廊键"的字符串。
 ///
 /// 规则（刻意保守，宁可少不可错）：
-/// - 长度 3..=64；至少含一个字母；
-/// - 不含路径分隔符 `/` `\`（键名不会长成路径）；
+/// - 长度 3..=64；至少含一个 ASCII 字母；
+/// - 只允许 `[A-Za-z0-9_ .-]` 与非 ASCII（CJK 等）——**键名不会含** `()` `{}` `:` `/`
+///   `%` `=` 等符号。这条专治 IL2CPP 字面量池里的框架格式串
+///   （`" (offset:"`、`"{0} --> {1}"`）；
+/// - **首、末字符**必须是字母/数字/`_`/非 ASCII，且不含连续空格 —— 键名不会是
+///   `"-   q"`、`"Pass Culling Disabled -"` 这种被空格/标点包住的串；
 /// - 不是纯十六进制串（GUID / hash 噪声）；
 /// - 不含 `NOISE` 里的框架名。
 pub fn looks_like_key(s: &str) -> bool {
@@ -136,17 +146,57 @@ pub fn looks_like_key(s: &str) -> bool {
     if !s.chars().any(|c| c.is_ascii_alphabetic()) {
         return false;
     }
-    if s.contains('/') || s.contains('\\') {
+    if !s.chars().next().map(is_key_edge).unwrap_or(false) {
+        return false;
+    }
+    if !s.chars().next_back().map(is_key_edge).unwrap_or(false) {
+        return false;
+    }
+    if !s.chars().all(is_key_char) {
+        return false;
+    }
+    if s.contains("  ") {
         return false;
     }
     if NOISE.iter().any(|n| s.contains(n)) {
         return false;
+    }
+    // base64 / base64url 常量块（protobuf 描述符等）：长、只含 base64 字符集、
+    // 长度是 4 的倍数、且大小写数字齐全。这类串常以 `Cg1`（protobuf 字段 1 定长）
+    // 开头，会骗过 `cg`+数字的判据。游戏里的 PlayerPrefs 键不会长成这样。
+    if s.len() >= 24
+        && s.len().is_multiple_of(4)
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        let (mut lower, mut upper, mut digit) = (false, false, false);
+        for b in s.bytes() {
+            if b.is_ascii_lowercase() {
+                lower = true;
+            } else if b.is_ascii_uppercase() {
+                upper = true;
+            } else {
+                digit = true;
+            }
+        }
+        if lower && upper && digit {
+            return false;
+        }
     }
     // 纯 hex（>=8 位）视为 GUID/hash 噪声
     if s.len() >= 8 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
     true
+}
+
+/// 键名**中间**允许出现的字符：ASCII 字母/数字、`_`、`.`、`-`、空格，以及非 ASCII（CJK 等）。
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' ') || !c.is_ascii()
+}
+
+/// 键名**首/末**允许出现的字符：字母/数字/`_`/非 ASCII（不含空格、`-`、`.`）。
+fn is_key_edge(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()
 }
 
 /// 从一段二进制里抽出所有可打印 ASCII 串（3..=80 字节）。
@@ -173,13 +223,236 @@ fn extract_ascii_runs(blob: &[u8], out: &mut BTreeSet<String>) {
     }
 }
 
-/// 扫描 `<游戏>_Data/` 下的场景与资源文件，收集候选画廊键名（去重、保持稳定顺序）。
+// ---------------------------------------------------------------------------
+// 精确字符串来源：Mono 程序集（.NET 元数据）/ IL2CPP 元数据
+// ---------------------------------------------------------------------------
+
+/// 精确来源的类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreciseKind {
+    /// Mono 版：`*_Data/Managed/Assembly-CSharp*.dll`（.NET `#US` / `#Strings` 堆）。
+    Dotnet,
+    /// IL2CPP 版：`*_Data/il2cpp_data/Metadata/global-metadata.dat`。
+    Il2Cpp,
+}
+
+impl PreciseKind {
+    /// 给用户看的名字。
+    pub fn label(self) -> &'static str {
+        match self {
+            PreciseKind::Dotnet => "程序集",
+            PreciseKind::Il2Cpp => "IL2CPP 元数据",
+        }
+    }
+}
+
+/// 精确字符串来源的扫描结果。
+#[derive(Debug, Clone, Default)]
+pub struct PreciseScan {
+    /// 成功解析的来源（路径 + 类别）。
+    pub sources: Vec<(PathBuf, PreciseKind)>,
+    /// 找到但解析失败的（路径, 原因）。不致命，退回启发式即可。
+    pub failures: Vec<(PathBuf, String)>,
+    /// 字面量里筛出来的"像键名"的字符串。
+    pub keys: Vec<String>,
+    /// 命中的画廊类型 / 字段名（如 `GalleryManager`、`_wholeNameList`）。
+    pub gallery_types: Vec<String>,
+}
+
+impl PreciseScan {
+    /// 是否有可用的精确来源。
+    pub fn usable(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
+    /// 是否来自 IL2CPP（字面量池里框架串较多，报告里要提示收窄）。
+    pub fn is_il2cpp(&self) -> bool {
+        self.sources.iter().any(|(_, k)| *k == PreciseKind::Il2Cpp)
+    }
+}
+
+/// 在 `<_Data>/Managed/` 下找 `Assembly-CSharp*.dll`（大小写不敏感）。
 ///
-/// 单文件上限 512 MB，避免误读超大文件把内存打满。
-pub fn collect_candidate_keys(root: &Path) -> Vec<String> {
-    let mut set: BTreeSet<String> = BTreeSet::new();
+/// 主程序集 `Assembly-CSharp.dll` 排第一，其余（如 `Assembly-CSharp-firstpass.dll`）
+/// 按名字排序跟在后面。
+pub fn find_assemblies(root: &Path) -> Vec<PathBuf> {
     let Some(data_dir) = find_data_dir(root) else {
         return Vec::new();
+    };
+    let Some(managed) = read_dir_find_dir(&data_dir, "managed") else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&managed) else {
+        return Vec::new();
+    };
+    let mut rest: Vec<PathBuf> = Vec::new();
+    let mut main: Option<PathBuf> = None;
+    for e in entries.flatten() {
+        if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let low = e.file_name().to_string_lossy().to_ascii_lowercase();
+        if !low.ends_with(".dll") || !low.starts_with("assembly-csharp") {
+            continue;
+        }
+        if low == "assembly-csharp.dll" {
+            main = Some(e.path());
+        } else {
+            rest.push(e.path());
+        }
+    }
+    rest.sort();
+    let mut out: Vec<PathBuf> = Vec::with_capacity(rest.len() + 1);
+    if let Some(m) = main {
+        out.push(m);
+    }
+    out.extend(rest);
+    out
+}
+
+/// 定位 IL2CPP 元数据 `*_Data/il2cpp_data/Metadata/global-metadata.dat`。
+pub fn find_il2cpp_metadata(root: &Path) -> Option<PathBuf> {
+    let data_dir = find_data_dir(root)?;
+    let meta = read_dir_find_dir(&data_dir, "il2cpp_data")
+        .and_then(|d| read_dir_find_dir(&d, "metadata"))?;
+    let p = meta.join("global-metadata.dat");
+    p.is_file().then_some(p)
+}
+
+/// 在 `dir` 下按名字（大小写不敏感）找一级子目录。
+fn read_dir_find_dir(dir: &Path, name_lower: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if e.file_name().to_string_lossy().to_ascii_lowercase() == name_lower {
+            return Some(e.path());
+        }
+    }
+    None
+}
+
+/// 读所有精确来源：Mono 程序集（优先）；一个都没读到再试 IL2CPP 元数据。
+///
+/// 只读元数据、不反编译、不加载程序集。任一文件失败都不致命——记入
+/// [`PreciseScan::failures`] 后继续。
+pub fn scan_precise(root: &Path) -> PreciseScan {
+    let mut out = PreciseScan::default();
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    let mut types: BTreeSet<String> = BTreeSet::new();
+
+    // Mono：`Assembly-CSharp*.dll`
+    for p in find_assemblies(root) {
+        match dotnet::read_strings(&p) {
+            Ok(s) => {
+                collect_literals(s.user_strings.iter(), &mut keys);
+                for t in s.gallery_hits() {
+                    types.insert(t);
+                }
+                out.sources.push((p, PreciseKind::Dotnet));
+            }
+            Err(e) => out.failures.push((p, e)),
+        }
+    }
+
+    // IL2CPP：`global-metadata.dat`（仅在没有 Mono 程序集时才读，避免重复扫描）
+    if out.sources.is_empty() {
+        if let Some(p) = find_il2cpp_metadata(root) {
+            match il2cpp::read_strings(&p) {
+                Ok(s) => {
+                    collect_literals(s.literals.iter(), &mut keys);
+                    for t in s.gallery_hits() {
+                        types.insert(t);
+                    }
+                    out.sources.push((p, PreciseKind::Il2Cpp));
+                }
+                Err(e) => out.failures.push((p, e)),
+            }
+        }
+    }
+
+    out.keys = keys.into_iter().collect();
+    out.gallery_types = types.into_iter().collect();
+    out
+}
+
+/// 把一组字面量里"像键名"的收进 `keys`（trim + 过滤 + 去重）。
+fn collect_literals<'a>(literals: impl Iterator<Item = &'a String>, keys: &mut BTreeSet<String>) {
+    for k in literals {
+        let t = k.trim();
+        if looks_like_key(t) {
+            keys.insert(t.to_string());
+        }
+    }
+}
+
+/// 供报告展示：精确来源的一句话摘要。
+fn precise_note(scan: &PreciseScan) -> String {
+    if scan.usable() {
+        let names: Vec<String> = scan
+            .sources
+            .iter()
+            .map(|(p, k)| {
+                format!(
+                    "{}({})",
+                    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    k.label()
+                )
+            })
+            .collect();
+        let mut s = format!(
+            "精确字符串来源: {} 个（{}）→ 候选 {} 条",
+            scan.sources.len(),
+            names.join(", "),
+            scan.keys.len()
+        );
+        if !scan.gallery_types.is_empty() {
+            let preview: Vec<&String> = scan.gallery_types.iter().take(6).collect();
+            s.push_str(&format!(
+                "\n已识别画廊类型/字段 {} 个: {preview:?}",
+                scan.gallery_types.len()
+            ));
+        }
+        for (p, e) in &scan.failures {
+            s.push_str(&format!("\n⚠ 解析失败 {}: {e}", p.display()));
+        }
+        s
+    } else if let Some((p, e)) = scan.failures.first() {
+        format!("⚠ 精确来源解析失败（已退回场景启发式）{}: {e}", p.display())
+    } else {
+        "精确来源: 未找到 Managed/Assembly-CSharp*.dll 或 il2cpp_data/Metadata/global-metadata.dat，已退回场景启发式".into()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 候选键名汇总
+// ---------------------------------------------------------------------------
+
+/// 扫描候选键名（精确来源 + 场景启发式），去重后保持稳定顺序。
+pub fn collect_candidate_keys(root: &Path) -> Vec<String> {
+    collect_candidate_keys_detailed(root).0
+}
+
+/// 同 [`collect_candidate_keys`]，另外返回精确来源扫描详情（供报告展示）。
+pub fn collect_candidate_keys_detailed(root: &Path) -> (Vec<String>, PreciseScan) {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    scan_scene_strings(root, &mut set);
+    let scan = scan_precise(root);
+    for k in &scan.keys {
+        if looks_like_key(k) {
+            set.insert(k.clone());
+        }
+    }
+    (set.into_iter().collect(), scan)
+}
+
+/// 扫描 `<游戏>_Data/` 下的场景与资源文件，收集候选画廊键名。
+///
+/// 单文件上限 512 MB，避免误读超大文件把内存打满。
+fn scan_scene_strings(root: &Path, set: &mut BTreeSet<String>) {
+    let Some(data_dir) = find_data_dir(root) else {
+        return;
     };
     let mut targets: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(&data_dir) {
@@ -197,10 +470,9 @@ pub fn collect_candidate_keys(root: &Path) -> Vec<String> {
             continue;
         }
         if let Ok(blob) = fs::read(&p) {
-            extract_ascii_runs(&blob, &mut set);
+            extract_ascii_runs(&blob, set);
         }
     }
-    set.into_iter().collect()
 }
 
 /// 从候选里挑出"和已知真实键同族"的那些：共享 >= 2 字符的公共前缀。
@@ -243,6 +515,38 @@ fn longest_common_prefix(items: &[String]) -> String {
         end = end.min(first.char_indices().nth(common).map(|(i, _)| i).unwrap_or(first.len()));
     }
     first[..end].to_string()
+}
+
+// ---------------------------------------------------------------------------
+// 候选排序
+// ---------------------------------------------------------------------------
+
+/// 候选相关性评分（越小越可能真的是画廊键）。
+///
+/// IL2CPP 字面量池里绝大多数是引擎/框架字符串，若只按字典序排序再截断，
+/// 真候选会被挤到截断线之外。所以先按相关性分层，再按字典序。
+fn relevance(c: &str) -> u8 {
+    if dotnet::is_gallery_like(c) {
+        return 0; // 形如 cg_flag / CG01 / GalleryXxx
+    }
+    let low = c.to_ascii_lowercase();
+    if low.contains("cg") || low.contains("gallery") || low.contains("album") {
+        return 1; // 含关键词（可能是 cgFlag / myGalleryKey 之类）
+    }
+    if c.contains('_') {
+        return 2; // 有下划线：PlayerPrefs 键的常见形态
+    }
+    3
+}
+
+/// 按相关性 + 字典序排序（确定性）。
+pub fn sort_candidates(candidates: &mut [String]) {
+    candidates.sort_by(|a, b| relevance(a).cmp(&relevance(b)).then_with(|| a.cmp(b)));
+}
+
+/// 相关性为 0/1 的候选个数（报告里提示"高置信候选有几条"）。
+pub fn high_confidence_count(candidates: &[String]) -> usize {
+    candidates.iter().filter(|c| relevance(c) <= 1).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -699,18 +1003,23 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
     }
     ctx.report(0.4, "已完成哈希自检");
 
-    // 候选键名
-    let all_candidates = collect_candidate_keys(ctx.root);
+    // 候选键名（精确来源 + 场景启发式）
+    let (all_candidates, scan) = collect_candidate_keys_detailed(ctx.root);
+    let asm_note = precise_note(&scan);
     let (family_filtered, family_prefix) = prefer_same_family(&all_candidates, &known_raw);
     let mut candidates = family_filtered;
     if let Some(f) = ctx.opt("filter") {
         candidates.retain(|c| c.contains(f));
     }
     let max: usize = ctx.opt("max").and_then(|s| s.parse().ok()).unwrap_or(3000);
-    let truncated = candidates.len() > max;
-    candidates.truncate(max);
+    // 先去重，再按相关性排序，**最后才截断** —— 否则 IL2CPP 池里的框架串
+    // 会把真正的 CG 键挤出截断线。
     candidates.sort();
     candidates.dedup();
+    sort_candidates(&mut candidates);
+    let high_conf = high_confidence_count(&candidates);
+    let truncated = candidates.len() > max;
+    candidates.truncate(max);
     ctx.report(0.7, "已提取候选键名");
 
     if !hash_bad.is_empty() && ctx.opt("apply") == Some("1") {
@@ -755,6 +1064,7 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
             "【只读扫描】Unity 画廊解锁预览\n\
              注册表位置: {location}\n\
              {note}\n\
+             {asm_note}\n\
              候选键名: {} 个 —— 已解锁 {unlocked} / 锁定 {locked} / 注册表中尚无 {new_keys}；\
              将跳过：非 int {non_int} / 与裸值重名 {plain_hit}",
             candidates.len()
@@ -762,8 +1072,17 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
         if let Some(p) = &family_prefix {
             msg.push_str(&format!("\n已按现存键族前缀 `{p}` 收敛候选"));
         }
+        if high_conf > 0 {
+            msg.push_str(&format!("\n其中高置信候选（形如 cg_/CG01/含 gallery 关键词）{high_conf} 条，已排在前面"));
+        }
         if truncated {
             msg.push_str(&format!("\n（候选过多，已截断到 {max}；可用 --opt:max= 或 --opt:filter= 收窄）"));
+        }
+        if scan.is_il2cpp() {
+            msg.push_str(
+                "\n注意：IL2CPP 元数据的字面量池含大量引擎/框架字符串，候选里可能混入与画廊无关的名字；\
+                 建议配合 `--opt:filter=` 收窄（例如 --opt:filter=cg）",
+            );
         }
         if !candidates.is_empty() {
             let sample: Vec<&String> = candidates.iter().take(20).collect();
@@ -859,6 +1178,7 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
         "✔ Unity 画廊解锁完成\n\
          注册表位置: {location}\n\
          {note}\n\
+         {asm_note}\n\
          候选 {} 个 → 写入 {written} 个（其中翻转既有 0→1 的 {flipped} 个；读回校验通过 {verified} 个），失败 {failed} 个；\
          跳过：非 int 键 {skipped_nonint} 个 / 与裸值重名 {skipped_plain} 个\n\
          原值已备份: {}",
@@ -866,10 +1186,14 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
         bak_path.display()
     );
     if family_prefix.is_none() {
-        msg.push_str(
-            "\n⚠ 未能用「现存键族前缀」收敛候选（注册表里没有可参照的 CG 键）。\
-             启发式候选可能混入与画廊无关的整数设置项，若担心误改，请先用 `--opt:filter=` 收窄后重跑。",
-        );
+        msg.push_str(if scan.usable() {
+            "\n提示：候选来自程序集字符串（精确字面量），已按过滤规则剔除明显噪声；\
+             若仍担心混入无关设置项，可用 `--opt:filter=` 收窄后重跑。"
+        } else {
+            "\n⚠ 未能用「现存键族前缀」收敛候选（注册表里没有可参照的 CG 键），\
+             且未读到程序集精确字符串，当前为启发式候选，可能混入与画廊无关的整数设置项。\
+             若担心误改，请先用 `--opt:filter=` 收窄后重跑。"
+        });
     }
     if verified < written {
         msg.push_str("\n⚠ 有写入项读回校验未通过，请用 `--opt:restore=<备份文件>` 回滚后反馈");
@@ -996,6 +1320,10 @@ mod tests {
     fn looks_like_key_filters_noise() {
         assert!(looks_like_key("Orc Kabe"));
         assert!(looks_like_key("CG_01_a"));
+        assert!(looks_like_key("cg.flag-1"));
+        assert!(looks_like_key("CG回想1"));
+        // 纯非 ASCII（无 ASCII 字母）拒绝——否则 IL2CPP 池里成片的 CJK 台词会灌进来
+        assert!(!looks_like_key("回想シーン"));
         // 噪声
         assert!(!looks_like_key("Assets/Textures/a"));
         assert!(!looks_like_key("m_Script"));
@@ -1003,6 +1331,48 @@ mod tests {
         assert!(!looks_like_key("deadbeefcafebabe"));
         assert!(!looks_like_key("12"));
         assert!(!looks_like_key("123456"));
+        // IL2CPP 字面量池里的框架格式串（新增白名单专治这些）
+        assert!(!looks_like_key(" (offset:"));
+        assert!(!looks_like_key("{0} --> {1}"));
+        assert!(!looks_like_key("   -   W:"));
+        assert!(!looks_like_key("Data:"));
+        assert!(!looks_like_key("a=b"));
+        assert!(!looks_like_key(" [1] x"));
+        // 首/末字符规则 + 连续空格规则
+        assert!(!looks_like_key("-   q"));
+        assert!(!looks_like_key("-  A"));
+        assert!(!looks_like_key("Pass Culling Disabled -"));
+        assert!(!looks_like_key("--- End of inner exception stack trace --"));
+        assert!(!looks_like_key("            model"));
+        assert!(!looks_like_key("Modifiers:  ok"));
+        // protobuf 描述符的 base64 常量块（长 + base64 字符集 + 4 的倍数 + 大小写数字齐全）
+        assert!(!looks_like_key("Cg1UWVBFX1NGSVhFRDMyEA8SEQoNVFlQRV9TRklYRUQ2NBAQEg8KC1RZUEVf"));
+        assert!(!looks_like_key("Cg1yZXNlcnZlZF9uYW1lGAUgAygJGi8KEUVudW1SZXNlcnZlZFJhbmdlEg0K"));
+        // 但真键必须保住：只有小写+数字（无大写）→ 不误杀
+        assert!(looks_like_key("cg_button_name1"));
+        assert!(looks_like_key("CG8KK0sidd"));
+    }
+
+    #[test]
+    fn relevance_puts_gallery_like_first() {
+        let mut v: Vec<String> = vec![
+            "zzz_framework_helper".into(),
+            "Screenmanager Resolution Width".into(),
+            "myGalleryKey".into(),
+            "cg_flag_01".into(),
+            "CG01".into(),
+        ];
+        sort_candidates(&mut v);
+        // 形如 cg_/CG01 的排最前
+        assert_eq!(v[0], "CG01");
+        assert_eq!(v[1], "cg_flag_01");
+        assert_eq!(v[2], "myGalleryKey");
+        assert_eq!(high_confidence_count(&v), 3);
+        // 排序必须确定性（同分按字典序）
+        let mut v2 = v.clone();
+        v2.reverse();
+        sort_candidates(&mut v2);
+        assert_eq!(v, v2);
     }
 
     #[test]
@@ -1070,6 +1440,91 @@ mod tests {
         assert!(keys.contains(&"Orc Kabe".to_string()));
         assert!(keys.contains(&"Slime Girl".to_string()));
         assert!(!keys.iter().any(|k| k.contains("Assets/")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 精确来源接入（Mono）：`<_Data>/Managed/Assembly-CSharp.dll` 里的字面量
+    /// 必须进入候选集，且画廊类型要被识别出来。
+    #[test]
+    fn dotnet_scan_feeds_candidates() {
+        let dir = std::env::temp_dir().join(format!("stool_gal_asm_{}", std::process::id()));
+        let data = dir.join("G_Data");
+        let managed = data.join("Managed");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&managed).unwrap();
+
+        // 只放程序集、不放任何场景文件 —— 候选应当**只**来自程序集
+        let dll = crate::formats::dotnet::tests_support::minimal_pe(
+            &["GalleryManager", "_wholeNameList"],
+            &["cg_flag_01", "cg_flag_02"],
+        );
+        fs::write(managed.join("Assembly-CSharp.dll"), &dll).unwrap();
+
+        let found = find_assemblies(&dir);
+        assert_eq!(found.len(), 1, "应找到 1 个程序集: {found:?}");
+        assert!(found[0].ends_with("Assembly-CSharp.dll"));
+
+        let (keys, scan) = collect_candidate_keys_detailed(&dir);
+        assert!(scan.usable(), "程序集应解析成功: {scan:?}");
+        assert_eq!(scan.sources[0].1, PreciseKind::Dotnet);
+        assert!(keys.contains(&"cg_flag_01".to_string()), "{keys:?}");
+        assert!(keys.contains(&"cg_flag_02".to_string()), "{keys:?}");
+        assert!(scan.gallery_types.iter().any(|t| t == "GalleryManager"), "{scan:?}");
+        assert!(scan.gallery_types.iter().any(|t| t == "_wholeNameList"), "{scan:?}");
+
+        // 程序集坏掉时不致命：记 failures，且退回场景启发式（此处无场景 → 空候选）
+        fs::write(managed.join("Assembly-CSharp.dll"), b"MZ\x00\x00 garbage").unwrap();
+        let scan2 = scan_precise(&dir);
+        assert!(!scan2.usable());
+        assert_eq!(scan2.failures.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 精确来源接入（IL2CPP）：没有 Managed 目录时，改读
+    /// `il2cpp_data/Metadata/global-metadata.dat`。
+    #[test]
+    fn il2cpp_scan_feeds_candidates() {
+        let dir = std::env::temp_dir().join(format!("stool_gal_il2_{}", std::process::id()));
+        let meta = dir.join("G_Data").join("il2cpp_data").join("Metadata");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&meta).unwrap();
+
+        let md = crate::formats::il2cpp::tests_support::build_metadata(
+            29,
+            &["cg_flag_01", "{0} --> {1}", "cg_flag_02"],
+            &["mscorlib", "GalleryManager"],
+        );
+        fs::write(meta.join("global-metadata.dat"), &md).unwrap();
+        assert!(find_il2cpp_metadata(&dir).is_some());
+
+        let (keys, scan) = collect_candidate_keys_detailed(&dir);
+        assert!(scan.usable(), "IL2CPP 元数据应解析成功: {scan:?}");
+        assert_eq!(scan.sources[0].1, PreciseKind::Il2Cpp);
+        assert!(scan.is_il2cpp());
+        assert!(keys.contains(&"cg_flag_01".to_string()), "{keys:?}");
+        assert!(keys.contains(&"cg_flag_02".to_string()), "{keys:?}");
+        // 框架格式串必须被挡掉（白名单字符集）
+        assert!(!keys.iter().any(|k| k.contains("-->")), "{keys:?}");
+        assert!(scan.gallery_types.iter().any(|t| t == "GalleryManager"), "{scan:?}");
+        assert!(precise_note(&scan).contains("IL2CPP"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 两种精确来源都缺席 → 不报错，只退回启发式。
+    #[test]
+    fn missing_precise_sources_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("stool_gal_none_{}", std::process::id()));
+        let data = dir.join("G_Data");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("level0"), b"Orc Kabe\0").unwrap();
+        let scan = scan_precise(&dir);
+        assert!(!scan.usable());
+        assert!(scan.failures.is_empty());
+        assert!(precise_note(&scan).contains("已退回场景启发式"));
+        assert!(collect_candidate_keys(&dir).contains(&"Orc Kabe".to_string()));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1,5 +1,6 @@
 //! 命令行入口：detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support /
-//! extract / repack / decompile / text-extract / text-import / text-inject / text-uninject / save / unlock / mod-* / gui。
+//! cg-candidates / extract / repack / decompile / text-extract / text-import / text-inject / text-uninject /
+//! save / unlock / mod-* / gui。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,109 @@ fn run_op(reg: &Registry, det_id: &str, op: Op, root: &Path, out: &Path, opts: H
         Op::Save => engine.save(&ctx),
         Op::Unlock => engine.unlock(&ctx),
     }
+}
+
+/// cg-candidates 子命令：**只读**列出 Unity 全 CG 解锁的候选键名。
+///
+/// 与 `unlock` 的区别：完全不碰注册表（不打开、不创建、不写入），只报告
+/// 「精确来源（Mono 程序集 / IL2CPP 元数据）+ 场景启发式」扫出来的候选。
+/// 用途：写入前先看清候选是什么，或排查"为什么一个键都没扫到"。
+///
+/// 用法:
+///   stool cg-candidates <Unity 游戏目录> [--opt:filter=<子串>] [--opt:max=<n>]
+fn cg_candidates(args: &[String]) -> i32 {
+    use crate::features::gallery;
+
+    let root = PathBuf::from(&args[0]);
+    if !root.is_dir() {
+        eprintln!("✘ 目录不存在: {}", root.display());
+        return 2;
+    }
+    let pairs: Vec<String> = args
+        .iter()
+        .filter(|a| a.starts_with("--opt:"))
+        .map(|a| a.trim_start_matches("--opt:").to_string())
+        .collect();
+    let opts = opts_from(&pairs);
+    let filter = opts.get("filter").map(|s| s.as_str());
+    let max: usize = opts.get("max").and_then(|s| s.parse().ok()).unwrap_or(3000);
+
+    println!("只读扫描: {}", root.display());
+
+    // 精确定位信息
+    let dlls = gallery::find_assemblies(&root);
+    println!(
+        "Mono 程序集: {}",
+        if dlls.is_empty() {
+            "未找到（非 Mono 版）".to_string()
+        } else {
+            dlls.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        }
+    );
+    match gallery::find_il2cpp_metadata(&root) {
+        Some(p) => println!("IL2CPP 元数据: {}", p.display()),
+        None => println!("IL2CPP 元数据: 未找到"),
+    }
+    if let Some(info) = gallery::read_app_info(&root) {
+        println!("PlayerPrefs 位置: HKCU\\Software\\{}\\{}", info.company, info.product);
+    } else {
+        println!("PlayerPrefs 位置: 未知（未读到 app.info）");
+    }
+    let known = gallery::known_keys(&root);
+    if !known.is_empty() {
+        let preview: Vec<&String> = known.iter().take(10).collect();
+        println!("注册表已有键 {} 个: {preview:?}", known.len());
+    }
+
+    // 候选
+    let (mut candidates, scan) = gallery::collect_candidate_keys_detailed(&root);
+    if scan.usable() {
+        for (p, kind) in &scan.sources {
+            println!("精确来源 [{}]: {}", kind.label(), p.display());
+        }
+        println!("  字面量候选 {} 条", scan.keys.len());
+        if !scan.gallery_types.is_empty() {
+            let preview: Vec<&String> = scan.gallery_types.iter().take(12).collect();
+            println!("  画廊类型/字段 {} 个: {preview:?}", scan.gallery_types.len());
+        }
+    }
+    for (p, e) in &scan.failures {
+        println!("  ⚠ 解析失败 {}: {e}", p.display());
+    }
+    let (filtered, prefix) = gallery::prefer_same_family(&candidates, &known);
+    if let Some(p) = &prefix {
+        candidates = filtered;
+        println!("已按现存键族前缀 `{p}` 收敛候选");
+    }
+    if let Some(f) = filter {
+        candidates.retain(|c| c.contains(f));
+        println!("已按子串 `{f}` 过滤");
+    }
+    // 去重 → 按相关性排序 → 最后截断（与 unlock 同一套口径）
+    candidates.sort();
+    candidates.dedup();
+    gallery::sort_candidates(&mut candidates);
+    let high_conf = gallery::high_confidence_count(&candidates);
+    let truncated = candidates.len() > max;
+    candidates.truncate(max);
+
+    println!(
+        "\n候选键名 {} 个（其中高置信 {high_conf} 个，已排在前面）:",
+        candidates.len()
+    );
+    for c in &candidates {
+        println!("  {c}");
+    }
+    if truncated {
+        println!("（候选过多已截断到 {max}，用 --opt:max= 放宽）");
+    }
+    if candidates.is_empty() {
+        println!(
+            "  （无）——该作品可能不在注册表里存画廊状态：\
+             可考虑「替换自带全CG存档」或「游戏内全开开关」，见 stool unlock-support 与 stool unlock。"
+        );
+    }
+    0
 }
 
 /// xp3-patch 子命令：KiriKiri / 吉里吉里 运行时补丁包（不改原封包、删除即还原）。
@@ -401,6 +505,9 @@ fn missing_arg_usage(args: &[String]) -> Option<&'static str> {
         "xp3-patch" => (n < 2).then_some(
             "stool xp3-patch <游戏目录> --list | --src <改动目录> [--name patchN.xp3] | --from-extract <解包目录> [--name patchN.xp3] | --remove <patchN.xp3>",
         ),
+        "cg-candidates" => (n < 2).then_some(
+            "stool cg-candidates <Unity 游戏目录> [--opt:filter=<子串>] [--opt:max=<n>]",
+        ),
         _ => None,
     }
 }
@@ -415,6 +522,7 @@ pub fn main_args(args: Vec<String>) -> i32 {
     }
     match args[0].as_str() {
         "xp3-patch" => xp3_patch(&args[1..]),
+        "cg-candidates" => cg_candidates(&args[1..]),
         "gui" => crate::gui::run(),
         "save-edit" => save_edit(&args[1..]),
         "text-mtl" => text_mtl(&args[1..]),
@@ -594,6 +702,7 @@ pub fn main_args(args: Vec<String>) -> i32 {
                 crate::features::unlock::route_keys()
             );
             println!("缺省为只读预览；覆盖写盘前自动备份为 .stool.bak，可用 stool restore 还原。");
+            println!("Unity 可先用 `stool cg-candidates <游戏目录>` 只读查看候选键名（完全不碰注册表）。");
             0
         }
         "precheck" => {
@@ -1022,7 +1131,7 @@ pub fn main_args(args: Vec<String>) -> i32 {
             }
         }
         _ => {
-            eprintln!("未知命令: {}。可用: gui / detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / mod-enable / mod-disable / diag-export", args[0]);
+            eprintln!("未知命令: {}。可用: gui / detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support / cg-candidates / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / mod-enable / mod-disable / diag-export", args[0]);
             2
         }
     }

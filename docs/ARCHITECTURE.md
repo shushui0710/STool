@@ -30,19 +30,36 @@ src/
 │   ├── generic.rs       未知引擎兜底：GARbro 委派 + KNOWN_EXT 扩展名提示
 │   ├── renpy.rs         Ren'Py（解包/回填/反编译/注入/persistent 解锁）
 │   ├── others.rs        RPG Maker MV·MZ / RGSS / KiriKiri / Godot / NScripter / Tyrano / HTML
-│   └── external.rs      Wolf（WolfDec 委派）、Unity（AssetRipper 委派 + 注册表解锁）
+│   ├── artemis.rs       Artemis Engine 原生支持（.pfs 解包/回封，识别 70 分）
+│   └── external.rs      Wolf（WolfDec 委派）、Unity（AssetRipper 委派 + 程序集精确键名 / 注册表解锁）
 ├── formats/           纯格式层（无 IO 之外的副作用），每个都有 roundtrip 测试
 │   ├── source.rs       [新增] 流式数据源（P2-1）：Mem(≤128MB)/File 双模式，read_at 按需读，MAX_ARCHIVE=4GB
 │   ├── safe.rs         边界安全读取原语（P0-2）：越界一律返回 None，解析器不再 panic
-│   ├── xp3.rs / pck.rs / asar.rs / rgss.rs / rpa.rs …
+│   │                   （`Cursor` 提供 u8/u16/u32/i32/u64 的顺序读，读完自动前进）
+│   ├── xp3.rs / pck.rs / asar.rs / rgss.rs / rpa.rs / pfs.rs …
 │   │                   各格式均提供 `parse_index(&mut Source)` + `read_entry(&mut Source, …)`
 │   │                   （按偏移按需读，替代整包 `read_to_end`；RGSS 为 parse_index_v1/v3 + read_entry_v1/v3）
 │   │                   xp3.rs 另含写侧：`Xp3Version{V1,V2}` / `version_of` / `write_paths_v` /
 │   │                   `encrypted_count`（见 §6 约定）
+│   │                   pfs.rs Artemis 封包：pf6 明文 / pf8 用 **SHA-1(index) 前 20 字节做 XOR**，
+│   │                   且**每条目从 key[0] 重新开始**（与 GARbro 的 `ByteStringEncryptedStream`
+│   │                   按全局偏移递进不同）；写侧 `write_archive` / `write_paths` 沿用原代次
+│   ├── dotnet.rs       [新增] 最小 .NET / PE 元数据读取（零依赖、只读、不执行）：
+│   │                   DOS→PE→可选头→节表(RVA2off)→CLI 头→元数据根(BSJB)→流头，
+│   │                   取 `#US`（UTF-16LE 用户字面量，长度前缀为 ECMA-335 压缩整数）
+│   │                   与 `#Strings`（NUL 分隔名字堆）
+│   └── il2cpp.rs       [新增] Unity IL2CPP 的 `global-metadata.dat` 字符串读取（零依赖、只读）：
+│                       `stringLiteral`（`{i32 len; i32 dataIndex}`，len 为**精确字节长度**）+
+│                       `stringLiteralData` 池 + `string` 名字堆；**只接受通过校验的输入**
+│                       （magic / 版本 / 三区首尾相接 / 字面量 UTF-8 可解率 ≥90%），否则退回启发式
 ├── features/          横向功能
 │   ├── unlock.rs        [新增] 统一解锁抽象：UnlockRoute / UnlockSpec / UNLOCK_CATALOG /
 │   │                    find_save_dirs / find_bundled_saves / pick_route / run
-│   ├── gallery.rs      Unity PlayerPrefs 注册表（djb2 哈希、Win32 读写、快照/还原）
+│   ├── gallery.rs      Unity 全CG解锁（PlayerPrefs 注册表路线）：djb2 哈希、Win32 读写、
+│   │                    快照/还原；**键名两级来源** —— `scan_precise`（Mono 程序集 `#US` /
+│   │                    IL2CPP 元数据字面量，精确）+ `scan_scene_strings`（场景二进制 ASCII
+│   │                    启发式兜底）；`looks_like_key` 白名单字符集过滤框架串、
+│   │                    `sort_candidates` 按相关性分层后再截断
 │   ├── inject.rs       运行时 JSON 注入汉化（SUPPORT_TABLE 声明范围与边界）
 │   ├── translate.rs    机翻（OpenAI 兼容；术语表、断点续翻、`jobs` 批并发 + 429/5xx 指数退避）
 │   ├── tpack.rs        翻译包导出/导入
@@ -244,6 +261,10 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **写内存要二次确认** | `features::memscan` + `gui/pages/runtime.rs` | 内存扫描会直接改写目标进程内存（修改器本质）。首次写入/锁定前必须确认（GUI 弹窗，`ms_ack` 勾选后不再问），失败/拒绝路径不得静默通过 |
 | **重扫按需** | `gui::StoolApp::det_dirty` | 操作完成后是否重扫引擎由 `det_dirty` 决定：解包/反编译/文本提取只写输出目录 → 不重扫（大目录下这一步很贵）；`spawn` 默认置 `true`，只有明确不改游戏目录的操作才置 `false` |
 | **列表要设上限** | `features::preview::MAX_MEDIA` | 素材目录可能有几万个文件，全量列表会拖垮 UI；达到上限提前停止并如实告知被截断 |
+| **格式解读必须用真机样本定案** | `verify/`、`tools/peek_*.py` | 合成样本由自己写，**自己写错的假设会被自己的样本"证实"**。例如 IL2CPP 的 `len` 到底是"精确字节长度"还是"含结尾 NUL"，两种解读都能 97% 解出合法 UTF-8 —— 只有真机样本（6 款游戏 / 6 个 metadata）能判：切出来的是**完整串**还是**被截尾的碎片**。结论记进模块文档顶部，并留一条**自检**把错误解读挡在门外 |
+| **解析器要"宁退回不硬读"** | `formats/il2cpp.rs`、`features::gallery::scan_precise` | 布局校验（magic / 版本 / 区首尾相接 / 字面量 UTF-8 可解率 ≥90%）任一不过就 `Err`，由调用方退回启发式扫描。**产出乱码候选比不产出更糟** —— 用户会把垃圾键写进注册表 |
+| **候选列表要先筛后排再截断** | `features::gallery::{looks_like_key, sort_candidates}` | 上千条候选里真键只有几条：白名单字符集（`[A-Za-z0-9_ .-]` + 非 ASCII、首末字符必须字母数字）+ base64 常量块剔除 + 按"像不像画廊键"分层排序，**最后才截断**（否则字典序 + 截断会把真键挤出去） |
+| **测试的临时目录每个用例必须唯一** | `src/formats/pfs.rs`（已踩坑） | `tmp()` 会先 `remove_dir_all`；两个用例共用同一目录时，cargo 并行跑测试会互相删掉对方的文件（表现为偶发 `fs::read` 失败）。标签必须逐调用点唯一 |
 | **代码风格：宽行（120 列）** | `stool-rs/rustfmt.toml` | 历史代码为手工维护的宽行风格；**不设 fmt 门禁**（全量格式化会改动约 2000 行/37 文件），改代码时对齐相邻代码即可 |
 
 ---
@@ -264,6 +285,8 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **新增一项环境预检** | `features/precheck.rs`（在 `run()` 里 push 一个 `Item`）；需限定触发范围时改 `scope_for_op` |
 | **新增一项游戏体检** | `features/health.rs`（在 `check()` 里 push 一个 `Item`） |
 | **新增一种可自检封包** | `features/selfcheck.rs`：`Kind` 加变体 + `sniff` 魔数 + `extract_all`/`repack` 两个 match 分支（含 `label`/`ext`） |
+| **新增一种 Unity 精确键名来源** | `features/gallery.rs`：`PreciseKind` 加变体 + `scan_precise` 里加一个分支（读出来 → `collect_literals` 进候选、`gallery_hits` 进报告）+ 报告里的 `precise_note`；若解析逻辑复杂，先落到 `formats/<fmt>.rs` 并配单测/模糊测试 |
+| **新增一个"读元数据字符串"的格式** | `formats/<fmt>.rs`：`read_strings(path)` + `parse_metadata(&[u8])`，复用 `dotnet::{parse_strings_heap, gallery_hits_of, is_gallery_like}`（名字堆与画廊判据是共用口径） |
 | **新增一个运行时补丁包引擎** | `features/xp3patch.rs`：`PATCH_TARGETS` 加一行 + `next_name` 的命名规则 +（若有新封包格式）`formats/<fmt>.rs` 的写侧；GUI/CLI 入口会自动读到新表 |
 
 ---

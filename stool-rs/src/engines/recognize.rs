@@ -275,20 +275,6 @@ pub static RECOGNIZERS: &[Rec] = &[
         ],
     },
     Rec {
-        id: "artemis",
-        name: "Artemis Engine",
-        priority: 32,
-        advice: "Artemis Engine。资源在 .pfs（**带分卷** x.pfs.000/001）/ .pfs2，.asb 是脚本字节码；\
-                 可用 GARbro 解包。注意单个 .pfs 与 BGI 同名，只有带分卷才可靠判定为 Artemis。\
-                 存档多在 savedata/。",
-        rules: &[
-            R { pts: 65, sig: Sig::Ext("pfs2") },
-            R { pts: 45, sig: Sig::NumberedVol },
-            R { pts: 30, sig: Sig::Ext("pfs") },
-            R { pts: 25, sig: Sig::Ext("asb") },
-        ],
-    },
-    Rec {
         id: "alicesoft",
         name: "AliceSoft System（.ald）",
         priority: 34,
@@ -468,7 +454,6 @@ mod tests {
         for (id, file) in [
             ("majiro", "script.mjo"),
             ("yuris", "data.ypf"),
-            ("artemis", "data.pfs2"),
             ("alicesoft", "data.ald"),
             ("nitroplus", "data.npk"),
             ("gamemaker", "data.win"),
@@ -533,18 +518,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    #[test]
-    fn test_artemis_needs_split_volume() {
-        // 单个 .pfs 不足以判定 Artemis（与 BGI 同名）
-        let d = dir("artemis_single");
-        std::fs::write(d.join("x.pfs"), b"x").unwrap();
-        assert!(!detect("artemis", &d).ok(), "单个 .pfs 不应判为 Artemis");
-        // 带分卷 → 可靠判定
-        std::fs::write(d.join("x.pfs.000"), b"x").unwrap();
-        std::fs::write(d.join("x.pfs.001"), b"x").unwrap();
-        assert!(detect("artemis", &d).ok(), "带分卷的 .pfs 应判为 Artemis");
-        let _ = std::fs::remove_dir_all(&d);
-    }
+    // Artemis 已升级为**原生插件**（`engines/artemis.rs`，可解包+回封），
+    // 因此不再由表驱动识别器覆盖；其检测/解包断言见 artemis.rs 的测试。
 
     #[test]
     fn test_new_recognizers_cocos_flash_qsp() {

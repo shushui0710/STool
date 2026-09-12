@@ -20,11 +20,11 @@ use std::time::Instant;
 
 use crate::features::precheck::{human_bytes, Item, Level, Report};
 use crate::formats::source::{Source, MAX_ARCHIVE};
-use crate::formats::{asar, pck, rpa, rgss, xp3};
+use crate::formats::{asar, pck, pfs, rpa, rgss, xp3};
 
 /// 解包以整包读入内存的类型（xp3/pck/asar/rgss）超过此体积时直接拒绝，避免无谓的内存压力。
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// RPA 重打包需要把全部条目读进内存（`write_archive` 是内存式 API）；超过此总量则跳过往返比对。
+/// 重打包需要把全部条目读进内存的类型（`write_archive` 是内存式 API）；超过此总量则跳过往返比对。
 const RPA_INMEM_CAP: u64 = 512 * 1024 * 1024;
 
 /// 可自检的封包类型。
@@ -36,6 +36,10 @@ pub enum Kind {
     Rpa,
     RgssV1,
     RgssV3,
+    /// Artemis `pf8`（数据用 SHA1(index) 做 XOR）。
+    Pfs8,
+    /// Artemis `pf6`（明文）。
+    Pfs6,
 }
 
 impl Kind {
@@ -47,6 +51,8 @@ impl Kind {
             Kind::Rpa => "RPA（Ren'Py）",
             Kind::RgssV1 => "RGSSAD v1（RPG Maker XP/VX）",
             Kind::RgssV3 => "RGSSAD v3（RPG Maker VX Ace）",
+            Kind::Pfs8 => "PFS v8（Artemis，XOR 混淆）",
+            Kind::Pfs6 => "PFS v6（Artemis，明文）",
         }
     }
 
@@ -59,6 +65,7 @@ impl Kind {
             Kind::Rpa => "rpa",
             Kind::RgssV1 => "rgssad",
             Kind::RgssV3 => "rgss3a",
+            Kind::Pfs8 | Kind::Pfs6 => "pfs",
         }
     }
 }
@@ -214,6 +221,10 @@ pub fn sniff(path: &Path) -> Option<Kind> {
     if head.starts_with(b"RGSSAD\x00") {
         return Some(if head.get(7) == Some(&3) { Kind::RgssV3 } else { Kind::RgssV1 });
     }
+    // Artemis PFS：头 3 字节为 "pf" + 版本数字（6 / 8）。
+    if head.len() >= 3 && &head[0..2] == b"pf" && head[2].is_ascii_digit() {
+        return Some(if head[2] == b'6' { Kind::Pfs6 } else { Kind::Pfs8 });
+    }
     if ext == "asar" && n >= 4 && u32::from_le_bytes(buf[0..4].try_into().unwrap()) == 4 {
         return Some(Kind::Asar);
     }
@@ -224,6 +235,8 @@ pub fn sniff(path: &Path) -> Option<Kind> {
         "rpa" => Some(Kind::Rpa),
         "rgssad" | "rgss2a" => Some(Kind::RgssV1),
         "rgss3a" => Some(Kind::RgssV3),
+        // 扩展名兜底：pfs 默认按现代 pf8 处理，实际解析会以文件头为准。
+        "pfs" => Some(Kind::Pfs8),
         _ => None,
     }
 }
@@ -254,7 +267,9 @@ pub fn check_archive(archive: &Path, work_root: &Path) -> Result<Outcome, String
     }
     let kind = sniff(archive).ok_or_else(|| format!("无法识别的封包类型: {}", archive.display()))?;
     let size = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
-    if !matches!(kind, Kind::Rpa) && size > MAX_ARCHIVE_BYTES {
+    // RPA / PFS 的索引与条目都是流式读的，大封包也不必整包进内存；
+    // 它们的重打包是内存式 API，改由 `RPA_INMEM_CAP` 单独把关（见 `roundtrip`）。
+    if !matches!(kind, Kind::Rpa | Kind::Pfs6 | Kind::Pfs8) && size > MAX_ARCHIVE_BYTES {
         return Err(format!("封包过大（{}），自检需要整包读入内存，已跳过", human_bytes(size)));
     }
 
@@ -306,7 +321,7 @@ fn roundtrip(kind: Kind, archive: &Path, base_dir: &Path) -> Result<Roundtrip, S
     let mut skipped_repack = false;
     let mut repack_bytes = 0u64;
     let mut mismatches = Vec::new();
-    if kind == Kind::Rpa && total_bytes > RPA_INMEM_CAP {
+    if matches!(kind, Kind::Rpa | Kind::Pfs6 | Kind::Pfs8) && total_bytes > RPA_INMEM_CAP {
         skipped_repack = true; // 内存式写 API，超阈值只验「可完整解包」
     } else if entries > 0 {
         repack(kind, &dir_extract, &recs_a, &new_archive)?;
@@ -426,6 +441,15 @@ fn extract_all(kind: Kind, archive: &Path, dir: &Path) -> Result<Vec<Entry>, Str
                 ex.put(&e.name, &bytes)?;
             }
         }
+        Kind::Pfs8 | Kind::Pfs6 => {
+            let idx = pfs::parse_index(&mut src)?;
+            // 自检要的是"解包 → 回封 → 再解"是否无损；PFS 的 XOR 是可逆的固定算法，
+            // 读出来的就是明文，不像 XP3 的加密条目那样会拿"乱码==乱码"糊弄自己。
+            for e in &idx.entries {
+                let bytes = pfs::read_entry(&mut src, &idx, e)?;
+                ex.put(&e.name, &bytes)?;
+            }
+        }
         Kind::Rpa => unreachable!("RPA 已在上面提前返回"),
     }
     Ok(ex.out)
@@ -455,6 +479,10 @@ fn repack(kind: Kind, extract_dir: &Path, recs: &[Entry], new_archive: &Path) ->
             }
             rpa::write_archive(new_archive, &map, 0)?;
             Ok(map.len())
+        }
+        Kind::Pfs8 | Kind::Pfs6 => {
+            let ver = if kind == Kind::Pfs6 { b'6' } else { b'8' };
+            pfs::write_paths(new_archive, &name_map, ver)
         }
     }
 }
@@ -655,6 +683,26 @@ mod tests {
         let o = check_archive(&arc, &d.join("work")).unwrap();
         assert_eq!(o.entries, 3);
         assert!(o.mismatches.is_empty(), "{:?}", o.mismatches);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pfs_roundtrip_is_lossless_both_versions() {
+        let d = tmpdir("pfs");
+        let files: Vec<(String, Vec<u8>)> = vec![
+            ("system\\ini\\config.ini".to_string(), b"[cfg]\nkey=1\n".to_vec()),
+            ("pc\\bg_cn.png".to_string(), vec![0x89, b'P', b'N', b'G', 9, 9, 9, 9]),
+            ("script\\main.ast".to_string(), b"ast = {}\n".to_vec()),
+        ];
+        for (ver, want) in [(b'8', Kind::Pfs8), (b'6', Kind::Pfs6)] {
+            let arc = d.join(format!("root_pf{}.pfs", ver as char));
+            pfs::write_archive(&arc, &files, ver).unwrap();
+            assert_eq!(sniff(&arc), Some(want), "pf{} 应被嗅探出来", ver as char);
+            let o = check_archive(&arc, &d.join("work")).unwrap();
+            assert_eq!(o.entries, 3, "pf{}", ver as char);
+            assert!(!o.skipped_repack, "小样本必须真正往返");
+            assert!(o.mismatches.is_empty(), "pf{}: {:?}", ver as char, o.mismatches);
+        }
         let _ = fs::remove_dir_all(&d);
     }
 

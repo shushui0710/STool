@@ -33,11 +33,12 @@
 | RPG Maker MV / MZ | 大量日系 RPG 游戏 | ✔（解密图片和音频） | ✔（重新加密） | — | ✔（台词、选项、词条） | ✔（导出成可读的 JSON 再改回） | 游戏数据本身是明文 JSON，可直接编辑 |
 | RPG Maker XP / VX / Ace（老三代） | 经典日系 RPG | ✔ | ✔ | ✔（提取 Ruby 脚本） | ✔（含 Marshal 脚本指令深度提取） | 只读查看 | 支持两种加密封包格式（.rgssad 和 .rgss3a 后缀）；封包逐文件流式回写并自动备份 |
 | 吉里吉里（KiriKiri） | 大量日系视觉小说 | ✔（标准头 + 网盘伪装变体：裸目录 / zlib 压缩目录、目录后置的翻译补丁变体） | ✔（按 GARbro / KiriKiri 规范回写，v1/v2 头均支持） | — | ✔（剧本对话） | — | 另有**运行时补丁包**：把改动文件打成 `patchN.xp3`（引擎按搜索顺序自动优先加载、删包即完全还原），几 GB 的 `data.xp3` 一个字节都不用动；Hxv4（合成文件名+数据加密）与目录加密的第三方汉化补丁属保护类，会给出明确提示而不是乱码 |
+| Artemis Engine | 部分日系视觉小说（除 BGI 外另一个常见引擎） | ✔（`.pfs` 的 pf6 / pf8 两种代次，含 pf8 的 SHA-1 流混淆） | ✔（沿用原代次回写，原封包自动备份） | — | — | — | 与 BGI 同为 `.pfs` 后缀——按封包内容与伴随特征区分，不靠后缀猜；分卷封包（`x.pfs.000`）会明确提示不支持拼接并给出替代做法 |
 | Godot | 部分独立游戏 | ✔ | ✔ | ✔（借助 GDRE Tools 一键下载） | — | — | 封包回写为未加密 v1，Godot 3.x/未加密 4.x 可用；遇到加密封包会明确提示 |
 | NScripter / ONScripter | 老牌视觉小说引擎 | ✔（解密主脚本） | — | — | ✔（台词提取 + Shift-JIS 校验回填，自动备份） | — | 自动尝试多种解密方式，选效果最好的 |
 | HTML / Electron 网页游戏 | 网页技术做的游戏 | ✔ | ✔ | — | — | — | 资源解出来就是普通网页文件，直接改 |
 | Wolf RPG Editor（Wolf 引擎） | 日系 RPG | ✔（借助 WolfDec 工具） | — | — | ✔（从 Game.dat 等提取对话） | — | 需要在设置页填写 WolfDec 的路径 |
-| Unity | 3D / 手游向游戏 | ✔（借助 AssetRipper 工具） | — | — | — | 存档位置定位 | 需要在设置页填写 AssetRipper 的路径 |
+| Unity（Mono / IL2CPP 都支持） | 3D / 手游向游戏 | ✔（借助 AssetRipper 工具） | — | — | — | ✔（可一键全 CG 解锁） | 全 CG 解锁**不需要反编译器、不需要 .NET 运行环境**：直接读 `Managed/Assembly-CSharp*.dll`（Mono 版）或 `il2cpp_data/Metadata/global-metadata.dat`（IL2CPP 版）里的字符串，把画廊的 PlayerPrefs 键名写进注册表——**不动游戏文件**，缺省只读预览、写入前自动备份原值、可一键还原。解包仍需在设置页填写 AssetRipper 的路径 |
 | 识别不出的游戏 | — | 借助 GARbro 工具兜底 | — | — | — | — | 同时给出文件后缀特征提示，方便人工判断 |
 
 ## MTool 式汉化（JSON 注入，不改游戏文件）
@@ -184,6 +185,11 @@ stool-cli save <游戏目录> -o 输出目录
 # 一键解锁 Ren'Py 游戏的完成度记录（如 CG 回廊、回想模式全开）
 stool-cli unlock <游戏目录> --opt set_true_all=1
 
+# Unity 全 CG 解锁：先只读看看会写哪些键（完全不碰注册表）
+stool-cli cg-candidates <游戏目录> --opt:filter=cg
+# 确认无误再真正写入（写前自动备份原值，可用 --opt:restore= 一键还原）
+stool-cli unlock <游戏目录> --opt:apply=1 --opt:route=registry
+
 # 命令行直接搜索/修改存档（适合批量脚本化处理）
 stool-cli save-edit <存档文件> --search 关键词
 stool-cli save-edit <存档文件> --set /system/gold=99999 --set /items/1/count=99
@@ -271,15 +277,19 @@ cargo clippy --all-targets -- -D warnings    # 质量门禁：必须零警告
 src/
 ├── formats/   # 各种游戏文件格式的"读 / 写"实现，每个格式一个独立模块，可以单独拿去复用
 │              #   safe.rs 越界安全读取（解析器永不 panic）/ source.rs 流式数据源（大封包不整包进内存）
+│              #   pfs.rs Artemis 封包（pf6/pf8，含 SHA-1 流混淆与写侧）
+│              #   dotnet.rs 最小 .NET/PE 元数据读取（#US / #Strings 堆，不反编译）
+│              #   il2cpp.rs Unity IL2CPP 的 global-metadata.dat 字符串读取
 ├── engines/   # 引擎插件：每个引擎一个插件（如何识别它、它能做哪些事），统一注册进插件列表
-│              #   scan.rs 单次遍历扫描 / recognize.rs 证据打分识别
+│              #   scan.rs 单次遍历扫描 / recognize.rs 证据打分识别 / artemis.rs Artemis 原生支持
 ├── features/  # 通用功能：文本表格读写、存档编辑器、运行时修改（MV/MZ 调试协议 + 内存扫描）、
 │              #   补丁管理、资源预览（图片/音频）、外部工具一键下载、MTool 式 JSON 注入汉化、
 │              #   precheck 预检 / selfcheck 封包自检 / health 游戏体检 / batch 批量 /
-│              #   unlock 解锁归纳 / xp3patch 吉里吉里运行时补丁包
+│              #   unlock 解锁归纳 / gallery Unity 全CG解锁（程序集精确键名 + 注册表快照还原）/
+│              #   xp3patch 吉里吉里运行时补丁包
 ├── cli.rs     # 命令行入口
 ├── gui/       # 图形界面（mod.rs + pages/ 各页 + util / save_tree；自动加载中文字体，界面不乱码）
-├── hash.rs    # 无依赖 SHA-256（校验一键下载的外部工具是否被篡改）
+├── hash.rs    # 无依赖 SHA-256 / SHA-1（校验一键下载的外部工具是否被篡改 + pf8 流混淆）
 └── settings.rs# 配置（~/.stool/config.json；机翻 API Key 用 Windows DPAPI 加密后落盘）
 ```
 
@@ -309,21 +319,24 @@ src/
 
 本项目的质量门禁：`cargo clippy --all-targets -- -D warnings`（零警告）+ `cargo test --tests`。
 
-当前 `cargo test --tests` 共 **199 项测试全部通过**（另有 1 项需联网的用例默认忽略）：
+当前 `cargo test --tests` 共 **228 项测试全部通过**（另有 1 项需联网/写真实注册表的用例默认忽略）：
 
-- **166 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
+- **193 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
   MTool 式 JSON 注入、MOD 管理、解锁策略、预检/自检/体检/批量、吉里吉里运行时补丁包
-  （含「只打包改动」比对）、断点续传、并行解包、机翻重试退避、SHA-256 官方向量、API Key 加解密……
-- **15 项回环测试**（`tests/roundtrip.rs`）：每种封包"生成样本 → 解析 → 写回 → 再解析"，
+  （含「只打包改动」比对）、断点续传、并行解包、机翻重试退避、SHA-256/SHA-1 官方向量、
+  API Key 加解密、Unity 精确键名提取（.NET 元数据 / IL2CPP 元数据，含逐字节变异模糊）……
+- **16 项回环测试**（`tests/roundtrip.rs`）：每种封包"生成样本 → 解析 → 写回 → 再解析"，
   与原文件逐字节比对
 - **9 项模糊测试**（`tests/fuzz_parsers.rs`）：对解析器投喂畸形/截断/随机输入，
   验证**永不 panic**（越界一律安全返回）
-- **5 项流式等价性测试**（`tests/streaming.rs`）：同一封包分别用内存模式与强制文件模式解析，
+- **6 项流式等价性测试**（`tests/streaming.rs`）：同一封包分别用内存模式与强制文件模式解析，
   要求逐字节一致
 - **4 项并行一致性测试**（`tests/parallel.rs`）：真实跑 `jobs=1` 与 `jobs=8`，
   产物逐文件逐字节相同
-- **交叉验证**：另有 Python 第三方解析器（`scripts/peek_xp3.py`）按 GARbro/KiriKiri 规范
-  独立实现，用来核对本工具写出的 XP3 封包头部/条目/校验和是否正确
+- **交叉验证**：另有 Python 第三方解析器（各写一份、不共用代码，用来核对 Rust 实现的解读）
+  - `scripts/peek_xp3.py` —— 按 GARbro/KiriKiri 规范独立核对 XP3 头部/条目/校验和
+  - `scripts/peek_dotnet.py` —— 独立核对 .NET `#US` / `#Strings` 堆
+  - `scripts/peek_il2cpp.py` —— 独立核对 `global-metadata.dat`（三区连续性、`dataIndex` 步进、UTF-8 可解率）
 
 关键格式的解密算法都对照了成熟的开源实现（GARbro、RPGMakerDecrypter、
 pieroxy/lz-string 官方源码）逐一核对过，确保对真实游戏文件有效。
@@ -339,6 +352,9 @@ pieroxy/lz-string 官方源码）逐一核对过，确保对真实游戏文件�
 | 吉里吉里 XP3（目录后置变体） | ライムライト unencrypted.xp3 | 189 文件全提取，TJS 脚本、TLG 图像均有效 |
 | 吉里吉里 XP3（引擎加密） | 小粥姉妹 | 3 个封包的 `info.flags` 均置加密位：解包**明确报错并给出替代路线，零产物、不输出乱码**；补丁包功能正确识别已占号（data/patch/patch2），自动取号 `patch3.xp3` |
 | 解包断点续传 | BLACK SOULS II（.rgss3a） | 解包中途强杀 → 重跑自动续传（跳过 2048 个已完成条目），最终 2591 文件完整、台账自动清理 |
+| Artemis（.pfs / pf8） | 美少女万華鏡 呪われし伝説の少女、アマカノ3 | 检测判定 70 分确认；`root.pfs`（1.5 GB / 2703 条目）与 `Amakano3.pfs`（1.7 GB / 3361 条目）索引 100% 解析零越界，解包产物 PNG/OTF/OGV/`.ast` 全部有效；`selfcheck` 重打包逐条目无损 |
+| Unity Mono 全CG解锁（.NET 元数据） | Inari | 精确定位 `Managed/Assembly-CSharp.dll`（+ `-firstpass`）；读出 10085 条 `#US` 字面量、26460 条 `#Strings` 名字，识别出 164 个画廊类型/字段（如 `<<OpenGallery>g__GoGalleryScene\|2>d`）；与独立 Python 解析器计数完全一致 |
+| Unity IL2CPP 全CG解锁（global-metadata.dat） | Yakuzarogue、MiraisMidnightStream、sinSister 等 6 款 | 6/6 样本正确解析（v24/v29/v31），字面量 UTF-8 可解率 99.99%（16662/16663）；Yakuzarogue 直接扫出真实键 `cg_button_name1`…`cg_button_name7`，Mirais 扫出 `CG0`…`CG9` |
 
 ## 网盘发布游戏的"伪装"适配
 

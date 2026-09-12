@@ -12,7 +12,8 @@ jobs:
       run:
         working-directory: stool-rs
     steps:
-      - uses: actions/checkout@v4
+      # v5：v4 仍指向 Node.js 20，GitHub 已弃用并强制跑在 Node 24 上（会有告警）。
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

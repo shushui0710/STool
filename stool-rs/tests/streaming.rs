@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use stool::formats::source::{Source, MAX_ARCHIVE};
-use stool::formats::{asar, pck, rgss, xp3};
+use stool::formats::{asar, pck, pfs, rgss, xp3};
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("stool_streaming_{tag}_{}", std::process::id()));
@@ -71,6 +71,32 @@ fn pck_stream_equals_in_memory() {
         for e in &idx {
             let got = pck::read_entry(src, e).expect("读条目");
             assert_eq!(&got, files.get(&e.path).unwrap(), "条目 {} 内容不一致", e.path);
+        }
+    });
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn pfs_stream_equals_in_memory() {
+    let d = tmpdir("pfs");
+    let arc = d.join("root.pfs");
+    let files: Vec<(String, Vec<u8>)> = vec![
+        ("system\\ini\\config.ini".to_string(), b"[cfg]\nkey=1\n".to_vec()),
+        ("pc\\bg_cn.png".to_string(), vec![0x89, b'P', b'N', b'G', 7, 7, 7, 7]),
+        ("script\\deep\\nested\\main.ast".to_string(), vec![0x5Au8; 5000]),
+        ("font\\a.otf".to_string(), Vec::new()),
+    ];
+    pfs::write_archive(&arc, &files, b'8').unwrap();
+
+    both_modes(&arc, |src| {
+        let idx = pfs::parse_index(src).expect("PFS 索引");
+        assert_eq!(idx.entries.len(), files.len());
+        assert!(idx.obfuscated(), "pf8 应带 XOR 混淆");
+        let by_name: BTreeMap<&str, &Vec<u8>> =
+            files.iter().map(|(n, b)| (n.as_str(), b)).collect();
+        for e in &idx.entries {
+            let got = pfs::read_entry(src, &idx, e).expect("读条目");
+            assert_eq!(&got, by_name[e.name.as_str()], "条目 {} 内容不一致", e.name);
         }
     });
     let _ = fs::remove_dir_all(&d);

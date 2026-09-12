@@ -31,6 +31,11 @@ pub fn list_files_by_ext_pub(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
     list_files_by_ext(root, exts)
 }
 
+/// 供兄弟模块使用的别名（`file_name` 本体是模块私有）。
+pub fn file_name_pub(p: &Path) -> String {
+    file_name(p)
+}
+
 // ---------------- RPG Maker MV / MZ ----------------
 
 pub struct RpgMakerMvPlugin;

@@ -6,7 +6,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use stool::formats::{asar, nscript, pickle, pck, rpa, rgss, rpgmmv, xp3};
+use stool::formats::source::{Source, MAX_ARCHIVE};
+use stool::formats::{asar, nscript, pck, pfs, pickle, rpa, rgss, rpgmmv, xp3};
 
 fn tmp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("stool_test_{}", std::process::id())).join(name);
@@ -196,6 +197,42 @@ fn asar_roundtrip() {
     assert_eq!(html, b"<html><body>hi</body></html>");
     let js = asar::read_file(&data, data_start, &files["js/main.js"]).unwrap();
     assert_eq!(js, b"console.log('hello')");
+}
+
+#[test]
+fn pfs_roundtrip() {
+    let dir = tmp_dir("pfs");
+    let files: Vec<(String, Vec<u8>)> = vec![
+        ("system.ini".to_string(), b"; Artemis config\n".to_vec()),
+        ("font\\SourceHanSerif-Bold.otf".to_string(), b"OTTO\x00\x10\x01\x00 fake font".to_vec()),
+        ("pc\\bg_cn.png".to_string(), b"\x89PNG\r\n\x1a\n fake png".to_vec()),
+        ("script\\deep\\nested\\main.ast".to_string(), b"ast={{}}\n".to_vec()),
+        ("empty.bin".to_string(), Vec::new()),
+    ];
+    for ver in *b"86" {
+        let arc = dir.join(format!("root_pf{}.pfs", ver as char));
+        pfs::write_archive(&arc, &files, ver).unwrap();
+        let mut src = Source::open(&arc, MAX_ARCHIVE).unwrap();
+        let ix = pfs::parse_index(&mut src).unwrap();
+        assert_eq!(ix.entries.len(), files.len(), "pf{}", ver as char);
+        let by_name: BTreeMap<&str, &Vec<u8>> =
+            files.iter().map(|(n, b)| (n.as_str(), b)).collect();
+        for e in &ix.entries {
+            assert_eq!(e.size, by_name[e.name.as_str()].len() as u64, "{} 大小不符", e.name);
+            let got = pfs::read_entry(&mut src, &ix, e).unwrap();
+            assert_eq!(&got, by_name[e.name.as_str()], "条目 {} 内容不一致", e.name);
+        }
+        // pf8 的数据区必须是密文（XOR 生效），读出来才是明文
+        if ver == b'8' {
+            let raw = {
+                let mut s2 = Source::open(&arc, MAX_ARCHIVE).unwrap();
+                s2.read_at(ix.entries[1].offset, 4).unwrap()
+            };
+            assert_ne!(raw, b"OTTO".to_vec(), "pf8 落盘的数据区应是密文");
+            let plain = pfs::read_entry(&mut src, &ix, &ix.entries[1]).unwrap();
+            assert_eq!(&plain[..4], b"OTTO", "解出的内容应是明文");
+        }
+    }
 }
 
 #[test]
