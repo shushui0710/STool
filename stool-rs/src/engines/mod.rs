@@ -261,8 +261,8 @@ pub fn effective_capabilities(e: &dyn Engine) -> Vec<Op> {
 
 /// 各入口调用 [`exec_op`] 时要用的路径参数。
 ///
-/// 三个入口对「回写源目录 / CSV / 翻译 JSON」的默认口径并不相同
-/// （CLI 认 `--opt:src_dir`、egui 用 `<游戏>/stool_repack_src`、Tauri 由界面传入），
+/// 两个入口对「回写源目录 / CSV / 翻译 JSON」的默认口径并不相同
+/// （CLI 认 `--opt:src_dir`、Tauri 由界面传入），
 /// 所以默认值留在各自入口算，这里只承载「已经决定好的三个路径」。
 pub struct OpPaths<'a> {
     /// 封包回写的源目录（`Op::Repack` 用）
@@ -275,8 +275,8 @@ pub struct OpPaths<'a> {
 
 /// **唯一**的操作分发。
 ///
-/// CLI（`cli::run_op`）、egui（`gui::exec_op`）、Tauri（`cmd::run_op`）三个入口
-/// 共用这一份 match —— 否则每加一个 `Op` 就要在三个地方各补一支，
+/// CLI（`cli::run_op`）、Tauri（`cmd::run_op`）两个入口
+/// 共用这一份 match —— 否则每加一个 `Op` 就要在多个地方各补一支，
 /// 漏掉一支的表现是「某个界面点了按钮没反应」，且不会有编译错误。
 ///
 /// 只做分发与目录缓存清理；预检（`features::precheck`）由各入口按自己的
@@ -430,7 +430,7 @@ thread_local! {
 /// 清空「已建父目录」缓存。
 ///
 /// 缓存只在**同一次操作**内有效：操作开始时调用一次，避免用户中途删掉输出目录后
-/// 缓存仍以为目录存在而导致写盘失败。（cli/gui 的 op 分发处各调一次。）
+/// 缓存仍以为目录存在而导致写盘失败。（cli / Tauri 的 op 分发处各调一次。）
 pub fn clear_dir_cache() {
     DIR_CACHE.with(|c| {
         if let Ok(mut s) = c.try_borrow_mut() {

@@ -9,6 +9,27 @@ use std::sync::{Arc, Mutex};
 
 use crate::engines::{Op, Registry};
 
+/// 无参数启动时的指引（`stool-cli` 与库调用共用这一处，避免两份文案漂移）。
+/// 图形界面已从本 crate 迁出（旧的 eframe/egui 版已删除），所以这里既要给命令行用法，
+/// 也要指出 GUI 的去处 —— 不许静默退 0 让人以为「打开了但没反应」。
+const NO_GUI_HINT: &str = "STool 命令行版。图形界面已统一到 Tauri 版（stool-tauri.exe），本程序不含 GUI。\n\
+                           \n\
+                           用法示例:\n\
+                           \x20 stool-cli detect  <游戏目录>              # 识别游戏引擎\n\
+                           \x20 stool-cli extract <游戏目录> -o 输出目录  # 解包资源\n\
+                           \x20 stool-cli save-edit <存档文件> --search 关键词\n\
+                           \x20 stool-cli --help                        # 列出全部命令\n\
+                           \n\
+                           要用图形界面：双击安装目录里的 stool-tauri.exe。";
+
+/// 所有可用子命令（单一来源：`--help` 与「未知命令」提示共用，避免两处漂移）。
+const CMD_LIST: &str = "detect / batch / engines / precheck / doctor / selfcheck / inject-support / \
+                        unlock-support / cg-candidates / guard / guard-regions / extract / repack / \
+                        decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / \
+                        save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / \
+                        pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / \
+                        mod-enable / mod-disable / diag-export";
+
 fn print_progress(frac: f32, msg: &str) {
     eprintln!("[{:>5.1}%] {}", (frac * 100.0).min(100.0), msg);
 }
@@ -654,34 +675,31 @@ fn missing_arg_usage(args: &[String]) -> Option<&'static str> {
 
 pub fn main_args(args: Vec<String>) -> i32 {
     if args.is_empty() {
-        #[cfg(feature = "gui")]
-        {
-            return crate::gui::run();
-        }
-        // gui feature 关掉时（如给 Tauri 壳复用内核的构建）要给出明确指引，
-        // 不能静默退 0 —— 那会让人以为「打开了但没反应」。
-        #[cfg(not(feature = "gui"))]
-        {
-            eprintln!("本构建未启用图形界面（gui feature 已关闭）。");
-            eprintln!("改法：给一个子命令（例如 stool-cli detect <目录>），或按默认 feature 重新构建。");
-            return 2;
-        }
+        // 图形界面已统一到 Tauri 版（stool-tauri.exe），本 crate 不再自带 GUI。
+        // 无参数启动要给出明确指引，不能静默退 0 让人以为「打开了但没反应」。
+        eprintln!("{NO_GUI_HINT}");
+        return 2;
     }
     if let Some(usage) = missing_arg_usage(&args) {
         eprintln!("✘ 参数不足。用法: {usage}");
         return 2;
     }
     match args[0].as_str() {
+        // 帮助入口：`stool-cli help` / `--help` / `-h` 都指到这里。写死不留死胡同。
+        "help" | "--help" | "-h" => {
+            println!("STool 命令行工具 —— 用法: stool-cli <命令> [参数…]");
+            println!("可用命令: {CMD_LIST}");
+            println!();
+            println!("{NO_GUI_HINT}");
+            0
+        }
         "xp3-patch" => xp3_patch(&args[1..]),
         "cg-candidates" => cg_candidates(&args[1..]),
         "guard" => guard_cmd(&args[1..]),
         "guard-regions" => guard_regions_cmd(&args[1..]),
-        #[cfg(feature = "gui")]
-        "gui" => crate::gui::run(),
-        #[cfg(not(feature = "gui"))]
+        // 图形界面已迁到 Tauri 版（见 NO_GUI_HINT）。留个子命令只为把老用户指过去，不留死胡同。
         "gui" => {
-            eprintln!("本构建未启用图形界面（gui feature 已关闭）。");
-            eprintln!("改法：按默认 feature 构建（cargo build --release）后再用 gui 子命令。");
+            eprintln!("{NO_GUI_HINT}");
             2
         }
         "save-edit" => save_edit(&args[1..]),
@@ -1291,7 +1309,8 @@ pub fn main_args(args: Vec<String>) -> i32 {
             }
         }
         _ => {
-            eprintln!("未知命令: {}。可用: gui / detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support / cg-candidates / guard / guard-regions / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / mod-enable / mod-disable / diag-export", args[0]);
+            eprintln!("未知命令: {}。可用: {CMD_LIST}", args[0]);
+            eprintln!("（想不起名字就 `stool-cli --help`；图形界面请直接双击 stool-tauri.exe。）");
             2
         }
     }
