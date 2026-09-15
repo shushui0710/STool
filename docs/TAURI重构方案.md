@@ -1,5 +1,11 @@
 # STool Tauri 重构方案（v1）
 
+> **状态：已实施完毕。** 验收结论见 `docs/TAURI验收报告.md`（§2 三张表 17 条全达标）。
+> 并在收尾时**把旧 egui 版整体删除**（`stool-rs/src/gui/`、`stool` 二进制、`eframe`/`rfd`
+> 依赖、`shots/capture.ps1`），本仓库现在**只有 Tauri 一个界面**。
+> 因此下文凡出现「两版并存 / 灰度对照 / feature 门控」的段落，都是**当时的过程计划**，
+> 不是现在的形态 —— 现已由「内核只出 `stool-cli` + 界面只有 `stool-tauri.exe`」取代。
+>
 > 目标：把 STool 从「Rust + egui 自绘控件」重构为「Rust 内核 + Tauri/WebView2 界面」，
 > 重点放在**好看**与**好用**；不必要的复杂度一律精简；页面结构按**任务**而非**技术机制**重排，
 > 让不懂技术的用户也能自己走完流程。
@@ -55,7 +61,7 @@
 
 | 标准 | 判定方式 |
 |---|---|
-| 核心层**逻辑零分叉**（`features/` `formats/` `engines/` 不为 Tauri 另写一份实现） | `git diff --stat` + 逐处确认改动性质。<br>**措辞已修正**：原先写的是「核心层零改动」——字面做不到，因为 `stool-rs/Cargo.toml` 必须加 `[features] default=["gui"]` 并把 `eframe`/`rfd` 改成 `optional`，否则 Tauri 壳要重复编译整套 egui。真正的目标是「**两个 GUI 共用同一份实现**」，这比「一行不动」更好，它消灭了「同义两份实现」这个漂移源。逐处核对见验收报告 §5.2 |
+| 核心层**逻辑零分叉**（`features/` `formats/` `engines/` 不为界面另写一份实现） | `git diff --stat` + 逐处确认改动性质。<br>**措辞已修正**：原先写的是「核心层零改动」——字面做不到，因为迁移期 `stool-rs/Cargo.toml` 必须加 `[features] default=["gui"]` 并把 `eframe`/`rfd` 改成 `optional`，否则 Tauri 壳要重复编译整套 egui。真正的目标是「**界面与 CLI 共用同一份实现**」，这比「一行不动」更好，它消灭了「同义两份实现」这个漂移源。<br>**收尾时又退回去了一步**：egui 版整体删除后，那个 `[features]` 与两个可选依赖也已移除，`stool-rs` 现在既没有 GUI 也没有 feature 门控。逐处核对见验收报告 §5.2 |
 | `cargo clippy --all-targets -- -D warnings` 零警告 + `cargo test --tests` 全过 | 门禁命令 |
 | 交付为**单个 exe**；运行时依赖仅系统 WebView2（Win10 1803+/Win11 自带） | 干净机器上试跑 |
 | CLI（`stool-cli`）功能不受影响 | 跑既有 CLI 冒烟 |
@@ -77,12 +83,12 @@
 背景：窗口底 / 卡片 / 悬浮        （三级，靠亮度差而非阴影）
 文本：主 / 次 / 弱                （弱用于说明文字与路径）
 主色：唯一，用于主按钮 + 选中态
-语义：成功 / 提醒 / 危险 / 中性    （沿用已建立的 C_OK C_WARN C_DANGER C_MUTED 口径）
+语义：成功 / 提醒 / 危险 / 中性    （沿用旧版已收敛的四档口径 → CSS `--ok/--warn/--danger/--muted`）
 值着色：文本 / 数值 / 布尔 / 容器   （等宽字体区专用，帮助长列表里快速分辨）
 ```
 
-把 STool 已经收敛好的 `gui/util.rs` 的 `C_*` 语义色**平移**成 CSS 变量，
-这样 egui 版与 Tauri 版**同一套配色口径**，A/B 对比才有意义。
+把 STool 已经收敛好的四档语义色**平移**成 CSS 变量（`css/tokens.css`），
+`tokens.css` 成为全站**唯一**取色/取尺寸来源：UI 上不得出现表外颜色。
 
 ### 3.3 排版
 
@@ -196,9 +202,10 @@ stool-tauri/               # 新增：Tauri 壳
   src-tauri/               # Rust 侧：命令 + 状态
 ```
 
-- 内核复用：把 `stool-rs/src/lib.rs` 的 `pub mod gui;` 改成 **feature 门控**
-  （`#[cfg(feature = "gui")]`），Tauri 侧只依赖内核、不开 `gui` feature，
-  这样 **egui 版与 Tauri 版共存**，不需要一次性替换。
+- 内核复用：~~把 `stool-rs/src/lib.rs` 的 `pub mod gui;` 改成 feature 门控，让两版共存~~
+  —— **当时的过渡做法**。收尾时判定「两版并存」只是暂时降低了迁移风险，`stool.exe` 与
+  `stool-tauri.exe` 同时存在反而增加维护面，于是**直接删掉 egui 版**：`stool-rs` 现在只出
+  内核 + `stool-cli`，`pub mod gui;` 与 `gui` feature 均已移除。
 - 命令边界：每个页面 1~2 个命令，返回**已算好的展示数据**（不给前端整棵 JSON 树）。
   进度类任务用 Tauri **事件流**推送，不要每 tick 一次 IPC。
 - 前端：静态 HTML/CSS/JS + `withGlobalTauri`，**不引入 npm 打包器**（少一个工具链）。
@@ -239,13 +246,14 @@ Tauri CLI 在生产构建时会自动加 `--features tauri/custom-protocol`，�
 ### 顺序（每步都可独立验收）
 
 1. **打地基**：`stool-tauri/` 骨架 + 内核 feature 门控 + 设计令牌（CSS 变量）+ 导航外壳 + 选游戏页
-2. **改存档页**（已有 egui 版做对照，最容易验证）
+2. **改存档页**（当时有 egui 版做对照，最容易验证）
 3. **取出素材 / 看素材**
 4. **解锁全CG**
 5. **翻译文字**
 6. **游戏里改数值**（最重，1,229 行要拆）
 7. **装MOD / 工具箱**
 8. 灰度对照 → 达到验收标准后把 egui 版降级为可选 feature
+   → **实际收尾时更进一步：直接删除**（见文首状态）
 
 ### 风险
 
@@ -282,9 +290,9 @@ Tauri CLI 在生产构建时会自动加 `--features tauri/custom-protocol`，�
 
 | 项 | 落地位置 |
 |---|---|
-| 内核 feature 门控 | `stool-rs/Cargo.toml` 加 `[features] gui = ["dep:eframe", "dep:rfd"]`（**默认开**）；`lib.rs` 里 `#[cfg(feature = "gui")] pub mod gui;`。egui 版与 Tauri 版并存，Tauri 侧不重复编译 egui |
-| 值 ↔ 文本单一实现 | 原先只在 `gui/util.rs` 的三个函数（`parse_edit_text` / `value_edit_text` / `type_hint`）搬进 `features/saves.rs` 并 `pub`，`gui/util.rs` 改为转发 —— 避免两个界面各写一套、日后漂移 |
-| **op 分发单点** | 新增 `engines::exec_op` + `engines::OpPaths`：CLI（`cli::run_op`）、egui（`gui::exec_op`）、Tauri（`cmd::run_op_core`）三处共用**同一份** `match op`。否则每加一个 `Op` 要改三处，漏一处不会有编译错误，只表现为「某个界面点了按钮没反应」 |
+| ~~内核 feature 门控~~ | 过渡期做法：`stool-rs/Cargo.toml` 加 `[features] gui = ["dep:eframe", "dep:rfd"]`（默认开）+ `lib.rs` 里 `#[cfg(feature = "gui")] pub mod gui;`，让两版并存、Tauri 侧不重复编译 egui。**收尾时已整体移除**（内核不再有 GUI，`stool-tauri` 直接依赖 `stool` 默认 feature） |
+| 值 ↔ 文本单一实现 | 原先只在 `gui/util.rs` 的三个函数（`parse_edit_text` / `value_edit_text` / `type_hint`）搬进 `features/saves.rs` 并 `pub` —— 避免界面侧另写一套、日后漂移。`gui/util.rs` 已随 egui 版删除，**这一处 `features/saves.rs` 就是唯一实现** |
+| **op 分发单点** | 新增 `engines::exec_op` + `engines::OpPaths`：CLI（`cli::run_op`）、Tauri（`cmd::run_op_core`）两处共用**同一份** `match op`。否则每加一个 `Op` 要改多处，漏一处不会有编译错误，只表现为「界面点了按钮没反应」 |
 | `human_bytes` 复用 | `features/precheck.rs` 由 `pub(crate)` 提升为 `pub` |
 | Tauri 应用骨架 | `stool-tauri/`：`src-tauri`（命令层 `cmd.rs` + 状态 `main.rs`）+ `src`（静态前端） |
 | 设计令牌 | `stool-tauri/src/css/tokens.css` —— 全站唯一取色/取尺寸来源，含深色版（只换令牌值） |
@@ -297,7 +305,7 @@ Tauri CLI 在生产构建时会自动加 `--features tauri/custom-protocol`，�
 | 验证通道 | `log_line` 写日志文件 + `STOOL_GAME` / `STOOL_SAVE` / `STOOL_QUERY` / `STOOL_OUT` 启动钩子（与手动点击同一条代码路径） |
 | 离线看界面 | `preview.html`：用同一套前端 + 内存假后端，不需要 WebView2 就能看界面长什么样 |
 | **③ 看素材** | `js/pages/preview.js` + `cmd::{scan_media,read_media,open_file}`。左列表**虚拟化**（`ROW_H=34` 窗口渲染）+ 右侧按类型分流 `<img>`/`<audio>`/`<pre>`；图片音频内联成 **data URL**（不走 asset 协议，避免放宽文件 scope 且能在 `preview.html` 里跑） |
-| **文本编码判定** | `features::preview::decode_text`（**内核唯一实现**，egui 与 Tauri 共用）：BOM → **无 BOM UTF-16 嗅探** → 严格 UTF-8 → Shift-JIS → 判为「不是文本」。改前只认带 BOM 的 UTF-16，真机 `tail_test` 的无 BOM `.tjs` 会掉进 Shift-JIS 解成一屏半角片假名 |
+| **文本编码判定** | `features::preview::decode_text`（**内核唯一实现**，界面只转录）：BOM → **无 BOM UTF-16 嗅探** → 严格 UTF-8 → Shift-JIS → 判为「不是文本」。改前只认带 BOM 的 UTF-16，真机 `tail_test` 的无 BOM `.tjs` 会掉进 Shift-JIS 解成一屏半角片假名 |
 | **乱码双重闸门** | `acceptable()`：替换字符占比 >1/8 **或** 半角片假名占比 >1/12 → 返回 `DecodedText::Binary`。加密封包解出的密文会被 Shift-JIS「成功」解码成 `ﾏ0沢Sｴ`（零替换字符），只靠替换字符闸拦不住 —— 真机实测正常文本半角片假名 1~4%、密文 12~33% |
 | **④ 翻译文字** | `js/pages/text.js` + `cmd::{text_extract,text_import,text_stats,csv_stats,text_make_json,text_inject,text_uninject,text_mtl,mtl_save,pick_file}`。**两条通道**并排摆出、各自说清代价：①「提取 → 翻 CSV → 回填」（通用、会改游戏文件）+ ②「生成 JSON → 运行时注入」（只四种引擎、不动游戏文件）。引擎**不支持注入时不当故障**：给出原因 + 指向通道 ① |
 | **机翻是预填不是全自动** | `text_mtl` 走内核 `features::translate::{translate_csv,OpenAiCompat}`（OpenAI 兼容端点，预设 DeepSeek / 智谱 / 本地 Ollama）。批量与并发取 `settings::Config` 的 `mtl_batch/mtl_jobs`，**命令层不再定一套数字** —— 两处各写一份会出现「设置改了没生效」。密钥存**设置文件**（DPAPI 加密）而非游戏目录，避免随汉化包泄露 |
@@ -344,7 +352,7 @@ Tauri CLI 在生产构建时会自动加 `--features tauri/custom-protocol`，�
    内核 `features::restore` 已就绪（`find_backups` / `restore_one`，237 行 4 个函数，CLI 的
    `stool restore` 就是薄转录），**补齐成本低**，但要同时加两页的 UI + 测试才算闭环，
    所以没有半做。
-3. **两项需真机交互才量的指标**：`500 条搜索结果 <100ms`、`诊断包 zip 与 egui 版逐字节比对`。
+3. **两项需真机交互才量的指标**：`500 条搜索结果 <100ms`、`诊断包 zip 逐字节比对`。
 
 ### 9.4 验收方式（本机可复现）
 

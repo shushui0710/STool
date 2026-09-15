@@ -2,6 +2,14 @@
 
 > 对应 `docs/TAURI重构方案.md` §2 的三张验收表 + §9.3 的三条收尾项。
 > 本报告只写**能复现的东西**：每条结论都带命令或文件位置，不写「体验良好」这类空话。
+>
+> **后续变更（2026-09，已超出本报告范围）**：验收通过后，**旧 egui 版被整体删除**
+> —— `stool-rs/src/gui/`、`stool` 二进制、`eframe`/`rfd` 依赖与 `[features] gui` 门控、
+> `shots/capture.ps1` / `crop.ps1` 及全部 egui 时期截图均已移除。现在内核只出
+> `stool-cli.exe`，界面只有 `stool-tauri.exe`。因此下文凡涉及「两版并存 / 共用 /
+> feature 门控」的表述，请按「迁出前的状态」理解；形态以 `docs/ARCHITECTURE.md` §1 为准。
+> 删除后重跑门禁：`stool-rs` **286 passed / 0 failed**、`stool-tauri` **51 passed / 0 failed**，
+> 两侧 clippy 均零警告。
 
 ---
 
@@ -67,7 +75,7 @@
 | 1 | 核心层零改动 | ✅ **按「逻辑零分叉」口径达标** | 见 §5.2：事实是「**逻辑零分叉**」，不是「一行没动」（方案 §2.3 第 1 条措辞已同步改掉） |
 | 2 | clippy 零警告 + 测试全过 | ✅ | `cargo clippy --all-targets -- -D warnings` → 退出 0；`cargo test --tests` → **51 passed; 0 failed** |
 | 3 | 单个 exe，仅依赖系统 WebView2 | ✅ | `stool-tauri/src-tauri/target/release/stool-tauri.exe` = **14,052,352 字节**（13.4 MB）。`tauri.conf.json` 的 `bundle.active=false` + `frontendDist:"../src"` + `custom-protocol` 写死在 `Cargo.toml` → 裸 `cargo build --release` 即得单文件（**不需要 Tauri CLI / npm**） |
-| 4 | CLI（`stool-cli`）功能不受影响 | ✅ | 两条都验了：<br>① `cargo build --release`（默认 feature，含 egui）✅<br>② `cargo build --release --no-default-features --bin stool-cli` ✅（**证明 `gui` 门控成立** —— 关掉 eframe/rfd 也能编出 CLI，这正是 Tauri 壳复用的前提）<br>③ 真机冒烟见 §7 |
+| 4 | CLI（`stool-cli`）功能不受影响 | ✅ | 当时两条都验了：<br>① `cargo build --release`（默认 feature，含 egui）✅<br>② `cargo build --release --no-default-features --bin stool-cli` ✅（**证明 `gui` 门控成立** —— 关掉 eframe/rfd 也能编出 CLI，这正是 Tauri 壳复用的前提）<br>③ 真机冒烟见 §7<br>**现状更新**：`gui` 门控与 egui 版已删除，`stool-rs` 只剩内核 + `stool-cli`，`cargo build --release` 直接产出 `stool-cli.exe` |
 
 ---
 
@@ -113,16 +121,16 @@
 
 | 改动 | 性质 |
 |---|---|
-| `stool-rs/Cargo.toml` 加 `[features] default=["gui"]`，`eframe`/`rfd` 改 `optional` | **为了让 Tauri 壳不重复编译整套 egui** —— 这是本次重构的硬前提，无法绕开 |
-| `features/preview.rs` 把「文本分类表 / 编码判定」下沉到内核 | **共享化**：改前只有 egui 侧有，Tauri 要用就得抄一份；下沉后两个前端取同一份（漂移的表现就是「界面说 A、内核做 B」） |
+| `stool-rs/Cargo.toml` 加 `[features] default=["gui"]`，`eframe`/`rfd` 改 `optional` | **为了让 Tauri 壳不重复编译整套 egui** —— 这是迁移期的硬前提，无法绕开。**该改动已被后续的 egui 删除再次抹平**：门控、可选依赖、`stool` 二进制都已移除 |
+| `features/preview.rs` 把「文本分类表 / 编码判定」下沉到内核 | **共享化**：改前只有 egui 侧有，Tauri 要用就得抄一份；下沉后界面与 CLI 取同一份（漂移的表现就是「界面说 A、内核做 B」）。界面侧那份已随 egui 版删除，现在内核这份是唯一实现 |
 | `features/saves.rs`、`features/mod.rs`（新增 `guard` 模块）等 | 属早前几轮的工作，与本次重构无关 |
 
-所以准确表述是：**内核逻辑零分叉 —— 两个 GUI 共用同一份实现；唯一的强制改动是 `Cargo.toml` 的 feature 门控。** 这比「一行不动」更好，因为它消灭了「同义两份实现」这个漂移源。建议把 §2.3 第 1 条的措辞改掉（已在方案文档中更新）。
+所以准确表述是：**内核逻辑零分叉 —— 界面与 CLI 共用同一份实现；唯一的强制改动是 `Cargo.toml` 的 feature 门控（现已随 egui 版删除回退）。** 这比「一行不动」更好，因为它消灭了「同义两份实现」这个漂移源。建议把 §2.3 第 1 条的措辞改掉（已在方案文档中更新）。
 
 ### 5.3 两项需要真机交互才能量的指标（本轮未做，不编数字）
 
 - 「500 条搜索结果响应 < 100ms」—— 需要真机 + DevTools 录一次。
-- 「诊断包 zip 内容与 egui 版一致」—— 需要两个版本各导一次包再比对（本轮只验了 `tools_export_diag` 走的是与 egui 同一个内核函数 `features::diagpack::export`）。
+- 「诊断包 zip 内容与旧版一致」—— 需要两个版本各导一次包再比对（本轮只验了 `tools_export_diag` 走的是与 CLI 同一个内核函数 `features::diagpack::export`；egui 版删除后这条只剩「与 CLI 比对」这一种做法）。
 
 ### 5.4 「一键撤销」——本轮已补完最后两处（写回存档 / 重新打包）
 
@@ -249,7 +257,7 @@ $ stool-cli selfcheck verify/tail_test/unencrypted.xp3 -o <临时目录>
 ✔ 无损：解包→重打包→回读逐条目一致。
 ```
 
-`detect` 给出 **140 分**，与 Tauri GUI 日志里的 `score=140` **完全一致** —— 两版共用同一份内核的直接证据。`doctor` 的 ⚠ 项自带「修法」，与工具箱页渲染的是同一份内核报告。
+`detect` 给出 **140 分**，与 Tauri GUI 日志里的 `score=140` **完全一致** —— CLI 与界面共用同一份内核的直接证据。`doctor` 的 ⚠ 项自带「修法」，与工具箱页渲染的是同一份内核报告。
 
 ---
 

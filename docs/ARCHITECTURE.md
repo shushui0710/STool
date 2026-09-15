@@ -7,30 +7,33 @@
 
 ## 1. 形态
 
+**只有一个界面**：Tauri v2 版（`stool-tauri/`）。旧的 eframe/egui 版已整体删除（见 §1.1 末）。
+
 | 二进制 | 入口 | 说明 |
 |---|---|---|
-| `stool`（GUI） | `src/main.rs` → `src/gui/mod.rs` | eframe/egui 图形界面（release 不弹控制台） |
-| `stool-cli`（CLI） | `src/cli_main.rs` → `src/cli.rs` | 命令行；无参数时 `cli_main` 也可拉起 GUI |
+| `stool-tauri`（GUI，**唯一界面**） | `stool-tauri/src-tauri/src/main.rs` → `cmd.rs` | Tauri v2 + WebView2；release 不弹控制台 |
+| `stool-cli`（CLI） | `stool-rs/src/cli_main.rs` → `stool-rs/src/cli.rs` | 命令行；`stool-cli --help` 列全部子命令 |
 
-`src/lib.rs` 导出 `VERSION` 与全部模块，两个二进制共用。
+`stool-rs/src/lib.rs` 导出 `VERSION` 与内核模块（`cli` `diag` `engines` `features` `formats` `hash` `memapi` `settings`），
+CLI 与 Tauri 壳共用同一份内核。`stool-rs` **不含任何 UI 代码、也不依赖任何 UI 框架**。
 
-### 1.1 第二个界面：`stool-tauri/`（Tauri v2 / WebView2）
+### 1.1 界面层：`stool-tauri/`（Tauri v2 / WebView2）
 
 内核（`features/` `formats/` `engines/` `memapi` `settings` `cli`）**对 UI 框架零依赖**，
-所以界面可以整体替换。仓库根目录新增 `stool-tauri/`：
+所以界面在 2026-09 从 egui 整体换成了 Tauri，功能不回退。仓库根目录的 `stool-tauri/`：
 
 | 位置 | 说明 |
 |---|---|
 | `stool-tauri/src/` | 前端：静态 HTML/CSS/JS，**无打包器** |
 | `stool-tauri/src-tauri/` | Rust 侧：命令层（`cmd.rs`）+ 全局状态（`main.rs`） |
 
-- 依赖方式：`stool = { path = "../../stool-rs", default-features = false }`。
-- `stool-rs` 的 `pub mod gui` 由 **`gui` feature**（默认开）门控；关掉后不再编译
-  eframe/rfd，Tauri 壳因此不必重复编译整套 egui。两版**并存**：
-  `stool.exe` 照旧可用，`stool-tauri.exe` 是新界面。
+- 依赖方式：`stool = { path = "../../stool-rs" }`（内核无 feature 门控，直接取）。
 - 命令层**不重写业务逻辑**：只调 `engines::Registry` / `features::*`，且返回**算好的展示数据**
   （不把整棵 JSON 树丢过 IPC）。
-- 方案与验收标准见 `docs/TAURI重构方案.md`。
+- 方案与验收标准见 `docs/TAURI重构方案.md`，验收结论见 `docs/TAURI验收报告.md`。
+- **旧 egui 版（`stool-rs/src/gui/`、`stool` 二进制、`eframe`/`rfd` 依赖）已删除。**
+  老用户按命令行习惯敲 `stool gui` 或裸启动时，会拿到一条指向 `stool-tauri.exe` 的明确提示
+  （`cli.rs::NO_GUI_HINT`），不会静默退 0。
 
 新增 / 改页面时的落点：
 
@@ -39,14 +42,14 @@
 | 页面结构与交互 | `stool-tauri/src/js/pages/*.js` + `css/app.css` |
 | 配色 / 间距 / 字号 | **只改** `stool-tauri/src/css/tokens.css`（UI 上不得出现表外颜色） |
 | 导航里加一页 | `stool-tauri/src/js/app.js` 的 `PAGE_META` / `NAV_GROUPS` |
-| 加一个后端能力 | `stool-tauri/src-tauri/src/cmd.rs` 加 `#[tauri::command]`，并在 `main.rs` 的 `generate_handler!` 里登记 || 值 ↔ 文本的口径 | `stool-rs/src/features/saves.rs` 的 `parse_edit_text` / `value_edit_text` / `type_hint` —— **两个界面共用，只有这一处实现** |
+| 加一个后端能力 | `stool-tauri/src-tauri/src/cmd.rs` 加 `#[tauri::command]`，并在 `main.rs` 的 `generate_handler!` 里登记 || 值 ↔ 文本的口径 | `stool-rs/src/features/saves.rs` 的 `parse_edit_text` / `value_edit_text` / `type_hint` —— **唯一实现，界面只做转发** |
 
 ---
 
 ## 2. 目录结构（模块职责）
 
 ```
-src/
+stool-rs/src/           内核库 + CLI（无 UI 依赖）
 ├── engines/           引擎层：检测 + 各引擎的解包/回填/注入/存档/解锁
 │   ├── mod.rs           Engine trait、Op 能力枚举、Registry（注册表 + 排序）、
 │   │                    DETECT_LINE / Confidence / Detection、safe_out_path（带目录缓存）/ write_out、
@@ -122,15 +125,8 @@ src/
 │   │                   运行库 DLL / 路径 / 写权限（复用 precheck 的 Item/Level/Report）
 │   └── selfcheck.rs    [新增] 封包自检（P2-6）：解包 → 重打包 → 逐条目比对
 │                       （XP3/PCK/asar/RPA/RGSSAD v1·v3；磁盘中转，只比对条目内容）
-├── gui/               GUI（P2-11 按页拆分）
-│   ├── mod.rs         核心：StoolApp 状态 + Default + `eframe::App::update` 派发 +
-│   │                  `exec_op` + 后台任务（spawn/log/refresh_detections/poll_worker）+ `run()`
-│   ├── util.rs         通用小工具（页头/路径转义/JSON 值显示与解析/类型提示）
-│   ├── save_tree.rs    存档结构树只读渲染（渲染预算、分批展开，见文件内性能注释）
-│   └── pages/*.rs      各页 `impl StoolApp`：home / extract / preview / text / save /
-│                       runtime / mods / settings / help / log
-│                       （子模块 `use crate::gui::*;`，可访问父模块私有字段）
-├── cli.rs             命令行入口（子命令分发）
+├── cli.rs             命令行入口（子命令分发；`--help` / `NO_GUI_HINT` 在此）
+├── cli_main.rs        `stool-cli.exe` 的 main（薄壳：diag::init + cli::main_args）
 ├── memapi.rs          [新增] 跨进程内存 API（`Proc` RAII 句柄 + `open/read/write/query/
 │                      regions/modules/force_write`；裸句柄自由函数 `read_raw/write_raw/
 │                      query_raw/protect_raw/force_write_raw`；页保护/类型名字映射
@@ -227,8 +223,8 @@ unlock::run(engine_id, ctx, |route| self.unlock_impl(route, ctx))
    └─ 其余     → 诚实告知"无内置自动实现 + 怎么做"
 ```
 
-**三个界面共用同一份策略表**（CLI `stool unlock` / egui 解包页 / Tauri 解锁页），
-所以「识别依据 / 可用手段 / 默认走法」三处**必须一致** —— 界面自己另判一遍，
+**两个入口共用同一份策略表**（CLI `stool-cli unlock` / Tauri 解锁页），
+所以「识别依据 / 可用手段 / 默认走法」两处**必须一致** —— 界面自己另判一遍，
 就会出现「界面说会走 A、内核实际走 B」，用户按界面点了却报错。
 Tauri 侧据此只做转述：
 
@@ -268,7 +264,7 @@ Report{ items } → ok()？继续 : 中止并把 fail_summary() 交给用户
 
 ### 3.5 游戏里改数值（Tauri 版转录链路）
 
-egui 版 `gui/pages/runtime.rs` 是 1,229 行的大页；Tauri 版拆成「四张卡」，但**能力一项没少**，
+Tauri 版把这块拆成「四张卡」，但**能力一项没少**，
 且内核侧**一行未改** —— 全部是既有 `features::{runtime,memscan,guard,xp3patch}` 的转录：
 
 ```
@@ -333,7 +329,7 @@ cmd::mods_uninstall→ mods::uninstall_mod                ← 卸载=还原并�
 
 ### 3.5.2 工具箱（Tauri 版转录链路）
 
-「设置 / 日志 / 帮助 / 体检 / 自检」在 egui 版里是五个独立入口，Tauri 版按
+「设置 / 日志 / 帮助 / 体检 / 自检」在旧版里是五个独立入口，Tauri 版按
 重构方案 §5.1 第 1 条**合并成一页** —— 它们都是「出问题才用」，不该各占顶级入口。
 页面内部用 `.tabs` 分三块（设置 / 诊断 / 帮助），但**命令层仍是六个单一职责命令**，
 页面只是它们的组合视图：
@@ -413,20 +409,21 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **密钥不明文落盘** | `settings::{encrypt_key, decrypt_key}` | `mtl_key` 用 **Windows DPAPI** 加密后写入配置（`enc:v1:<hex>`）。旧明文值仍能读，下次保存自动升级；密文绑定当前 Windows 用户，跨机器解不开时告警 + 清空该字段（不能把解不开的垃圾当密钥用） |
 | **外部工具下载必须校验** | `features::tools_dl` + `hash::Sha256` | 下载的是**随后会被执行**的可执行文件，只靠 HTTPS 不够。流式落盘 + 边算 SHA-256，与 GitHub Release `digest` 比对，不一致即中止并删除临时文件；上游无摘要时把校验和记到 `<工具目录>/.sha256` |
 | **不写死本机绝对路径** | `settings::{unrpyc_path, python_path}` | 硬编码 `D:/STool/...` 换机器即失效，且会静默回退到系统 `python`。改为**按跨机器成立的位置顺序探测**（配置 → 环境变量 → `~/.stool/tools` → skill 副本；Python 扫描 `versions/*` 取最新） |
-| **写内存要二次确认** | `features::memscan` + `gui/pages/runtime.rs` | 内存扫描会直接改写目标进程内存（修改器本质）。首次写入/锁定前必须确认（GUI 弹窗，`ms_ack` 勾选后不再问），失败/拒绝路径不得静默通过 |
+| **写内存要二次确认** | `features::memscan` + `stool-tauri/.../cmd.rs` + `js/pages/runtime.js` | 内存扫描会直接改写目标进程内存（修改器本质）。首次写入/锁定前必须确认（界面弹窗，`ms_ack` 勾选后不再问），失败/拒绝路径不得静默通过 |
 | **反修改探测零副作用 + 不碰反作弊** | `features::guard` + `memapi::force_write_raw` | 诊断只是"写探测值 → 观察 → 恢复原值"，探测值不写用户的真实值，每轮结束恢复原页保护。阈值判定要实测校准（`classify_revert` 用「存活满窗口」区分周期回滚与延迟回滚，`recommended_period_ms` 间隔 <1ms 时不给锁值方案）。识别到**在线反作弊**只提示风险、**不提供绕过** |
-| **重扫按需** | `gui::StoolApp::det_dirty` | 操作完成后是否重扫引擎由 `det_dirty` 决定：解包/反编译/文本提取只写输出目录 → 不重扫（大目录下这一步很贵）；`spawn` 默认置 `true`，只有明确不改游戏目录的操作才置 `false` |
+| **重扫按需** | `stool-tauri/.../cmd.rs` + `js/pages/*.js` | 操作完成后**不自动**重扫引擎：解包/反编译/文本提取只写输出目录，重扫在大目录下很贵。检测结果只在用户回到「选游戏」或显式重扫时才刷新 |
 | **列表要设上限** | `features::preview::MAX_MEDIA` | 素材目录可能有几万个文件，全量列表会拖垮 UI；达到上限提前停止并如实告知被截断 |
 | **格式解读必须用真机样本定案** | `verify/`、`tools/peek_*.py` | 合成样本由自己写，**自己写错的假设会被自己的样本"证实"**。例如 IL2CPP 的 `len` 到底是"精确字节长度"还是"含结尾 NUL"，两种解读都能 97% 解出合法 UTF-8 —— 只有真机样本（6 款游戏 / 6 个 metadata）能判：切出来的是**完整串**还是**被截尾的碎片**。结论记进模块文档顶部，并留一条**自检**把错误解读挡在门外 |
 | **解析器要"宁退回不硬读"** | `formats/il2cpp.rs`、`features::gallery::scan_precise` | 布局校验（magic / 版本 / 区首尾相接 / 字面量 UTF-8 可解率 ≥90%）任一不过就 `Err`，由调用方退回启发式扫描。**产出乱码候选比不产出更糟** —— 用户会把垃圾键写进注册表 |
 | **候选列表要先筛后排再截断** | `features::gallery::{looks_like_key, sort_candidates}` | 上千条候选里真键只有几条：白名单字符集（`[A-Za-z0-9_ .-]` + 非 ASCII、首末字符必须字母数字）+ base64 常量块剔除 + 按"像不像画廊键"分层排序，**最后才截断**（否则字典序 + 截断会把真键挤出去） |
 | **测试的临时目录每个用例必须唯一** | `src/formats/pfs.rs`（已踩坑） | `tmp()` 会先 `remove_dir_all`；两个用例共用同一目录时，cargo 并行跑测试会互相删掉对方的文件（表现为偶发 `fs::read` 失败）。标签必须逐调用点唯一 |
 | **代码风格：宽行（120 列）** | `stool-rs/rustfmt.toml` | 历史代码为手工维护的宽行风格；**不设 fmt 门禁**（全量格式化会改动约 2000 行/37 文件），改代码时对齐相邻代码即可 |
-| **GUI 语义色只从 `gui::util` 取** | `gui/util.rs`（`C_OK`/`C_WARN`/`C_DANGER`/`C_MUTED`） | 颜色散写在页面里 → 同一个含义在不同页面颜色不一样，换主题还要满仓找。新增状态色先进 `util.rs` |
-| **GUI 分区统一用卡片** | `gui/util::{card, card_title}` | 各页面用同一种容器（浅色圆角 + 内边距 + 描边），分区一眼可辨；别在页面里各写 `Frame::group(...)` 变体 |
-| **大列表必须虚拟化** | `egui::ScrollArea::show_rows` | egui 的 `ScrollArea::show` **不做视口裁剪**——它会把所有子控件布局一遍来量高度。上千行的列表/结构树必须走 `show_rows`（只布局可见行），否则滚动卡死 |
-| **每帧别读盘、别做重分配** | 如 `save.rs::save_locs_sync`、`on_hover_ui` | 渲染循环里读盘/拼 `String` 会按行数×帧率放大。列表数据要缓存 + 指纹校验；悬停提示用惰性 `on_hover_ui`，别用每帧分配 `String` 的 `on_hover_text` |
-| **不替换 GUI 框架（egui）** | `gui/` | 重写整层 UI（如换 Tauri）的收益只是"好看一点"，代价是全部页面 + 拖拽/文件对话框/硬件加速/无控制台诊断等基建重做，且与「好用优先、功能不回退」冲突。美观与易用性的整改**在 egui 内做**（卡片、语义色、排版、可操作空状态） |
+| **语义色只从令牌表取** | `stool-tauri/src/css/tokens.css`（`--ok`/`--warn`/`--danger`/`--muted`/`--accent`） | 颜色散写在页面里 → 同一个含义在不同页面颜色不一样，换主题还要满仓找。UI 上**不得出现表外颜色**；新增状态色先进 `tokens.css` |
+| **分区统一用卡片** | `css/app.css` 的 `.card` / `.card-head` / `.card-title` | 各页面用同一种容器（圆角 + 内边距 + 1px 描边），分区一眼可辨；别在页面里各写一套容器 |
+| **不靠阴影分层** | `tokens.css` | 用 1px 描边＋背景三级（`--bg-app`/`--bg-card`/`--bg-raise`）表达层次；阴影在深色下会脏 |
+| **IO 命令必须 `async` + `spawn_blocking`** | `stool-tauri/src-tauri/src/cmd.rs` 的 `offload()` | 非 async 命令跑在**主线程**上，读盘/遍历目录会直接冻住界面（坑②）。凡读盘/遍历/大计算一律 offload |
+| **不在页面里同步做重活** | `js/pages/*.js` | 前端算重了同样卡（WebView 单线程）。列表数据一次性拿"算好的展示数据"，别把整棵 JSON 树丢过 IPC 再在前端遍历 |
+| **界面已定在 Tauri，别再引第二个 UI 框架** | `stool-tauri/`、`stool-rs/` | 内核 `stool-rs` **对 UI 框架零依赖**，这条要一直守住：界面可以整体换，内核不跟着改。反之也不要在 `stool-rs` 里加任何 UI 依赖 |
 
 ---
 
@@ -439,11 +436,11 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **新增一个并行解包循环** | `engines::Resume::open(out, "extract", root).configured(ctx)` → 过滤 `already_done` 组装 `Vec<Job<T>>` → `parallel_extract(&jobs, out, worker_count(ctx), ctx, \|\| Source::open(arc, MAX_ARCHIVE), read_fn, &mut resume)` → 结尾 `resume.finish(failed == 0)` + `with_resume_note`；提前 return 前 `resume.flush()` |
 | **新增一种汉化注入** | `features/inject.rs` 的 `SUPPORT_TABLE` + 对应引擎的 `text_inject` |
 | **新增一个 CLI 子命令** | `cli.rs`：`missing_arg_usage`（若有必填参数）+ `main_args` 分支 + 未知命令提示 |
-| **新增一个 GUI 页面** | `gui/mod.rs`：`Page` 枚举 + 左侧导航 + `update` 派发分支；新页 `impl StoolApp` 放 `gui/pages/<name>.rs`（`use crate::gui::*;`），并在 `gui/pages/mod.rs` 声明 `mod <name>;` |
-| **改 GUI 风格 / 加一处分区** | `gui/util.rs`：`page_header` + `card`/`card_title` 做分区，语义色只用 `C_OK/C_WARN/C_DANGER/C_MUTED`；大列表走 `ScrollArea::show_rows` 虚拟化；页面级空状态用 `need_detect(ui, "页面名")`（给用户一条出路，别只丢"请先去首页"）。视觉验证见 §6.1 |
-| **新增外部工具** | `settings.rs`（字段 + `external_tool` 分支）+ `features/tools_dl.rs` + 设置页 |
+| **新增一个界面页面** | `stool-tauri/src/js/pages/<name>.js`（`Page = {...}`：`title`/`sub`/`actions`/`mount`）+ `js/app.js` 的 `PAGE_META` 与 `NAV_GROUPS` + `index.html` / `preview.html` 各加一行 `<script>` |
+| **改界面风格 / 加一处分区** | `css/tokens.css`（取色取尺寸的唯一来源）+ `css/app.css` 的 `.card`/`.card-head`；语义色只用 `--ok/--warn/--danger/--muted`；空状态必须给出**能点**的出路（`soon.js` 是这条规则的兜底实现）。视觉验证见 §6.2 |
+| **新增外部工具** | `settings.rs`（字段 + `external_tool` 分支）+ `features/tools_dl.rs` + 工具箱「设置」标签页 |
 | **新增配置项** | `settings.rs`（加 `#[serde(default)]` 字段；纯追加不用升版本） |
-| **新增一个机翻设置项** | `settings.rs`（`mtl_*` 字段 + `default_mtl_*()`）+ `gui/pages/text.rs`（`mtl_*: String` 字段在 `gui/mod.rs` 的 `StoolApp` 中 + 构造/`dirty` 判定/UI 输入）+ CLI `text-mtl --*` |
+| **新增一个机翻设置项** | `settings.rs`（`mtl_*` 字段 + `default_mtl_*()`）+ `stool-tauri/src-tauri/src/cmd.rs`（读写命令，**密钥只回 `mtl_key_set: bool`**）+ `js/pages/tools.js` 的表单 + CLI `text-mtl --*` |
 | **新增一项环境预检** | `features/precheck.rs`（在 `run()` 里 push 一个 `Item`）；需限定触发范围时改 `scope_for_op` |
 | **新增一项游戏体检** | `features/health.rs`（在 `check()` 里 push 一个 `Item`） |
 | **新增一种可自检封包** | `features/selfcheck.rs`：`Kind` 加变体 + `sniff` 魔数 + `extract_all`/`repack` 两个 match 分支（含 `label`/`ext`） |
@@ -472,35 +469,33 @@ cd stool-rs
 
 cargo clippy --all-targets -- -D warnings   # lint 门禁（CI 强制）
 cargo test --tests                  # 单元 + 集成（fuzz_parsers / roundtrip / streaming / parallel）
-cargo build --release
+cargo build --release               # 产物：target/release/stool-cli.exe
+
+# 界面（Tauri 版）：同样跑一遍门禁，再出单 exe
+cd ../stool-tauri/src-tauri
+cargo clippy --all-targets -- -D warnings
+cargo test --tests                  # 51 项（命令层的纯函数，包在 offload() 外的那层）
+cargo build --release               # 产物：target/release/stool-tauri.exe
+
 # cargo fmt 不设门禁（宽行风格，见 rustfmt.toml）；如要局部对齐可手动跑
 # cargo fmt --all -- --check
 ```
 
-### 6.1 GUI 视觉验证（改 GUI 后必做）
+> **两边都要过门禁**：内核改动只跑 `stool-rs` 是不够的，Tauri 壳依赖内核的公开 API，
+> 改签名会在这里才暴露。**别跑全量 `cargo test`**（见本节末 doctest 说明）。
+> 偶发 `拒绝访问 (os error 5)` / `LNK1104` 是 target 目录被占用（上一轮进程或杀软未放行），
+> **重跑即过** —— 不是代码问题，别去改代码。
 
-> 本节针对 **egui 版**（`stool-rs/src/gui/`）。**Tauri 版**（`stool-tauri/`）的验证见 §6.2 ——
-> 那边用 `preview.html` 离线渲染，不需要 `capture.ps1`。
+### 6.1 GUI 视觉验证（Tauri 版）
 
-窗口是硬件加速的，普通截屏抓不到内容，用 `shots/capture.ps1`（`PrintWindow` + `PW_RENDERFULLCONTENT`）：
+界面验证统一走 §6.2：**离线渲染 `preview.html`**（headless Edge 出图），
+既不需要 `PrintWindow` 抓屏，也不需要窗口调试钩子。
 
-```powershell
-# 启动页由环境变量 STOOL_PAGE 指定；页面名见 gui::Page
-powershell -ExecutionPolicy Bypass -File shots/capture.ps1 -Page save -OutPath D:\STool\shots\x.png
-```
+> 旧的 eframe/egui 界面（`stool-rs/src/gui/`）与它的抓图脚本 `shots/capture.ps1`、
+> `crop.ps1`，以及 `STOOL_PID` / `STOOL_SCAN` / `STOOL_SAVE` / `STOOL_SAVE_SEL` /
+> `STOOL_SEARCH` 这组窗口调试钩子，已于 2026-09 随 egui 版一起删除。
 
-`gui/mod.rs` 里另有一组**调试钩子**（都是环境变量，走与手动操作完全相同的代码路径）：
-
-| 变量 | 作用 |
-|---|---|
-| `STOOL_PAGE` | 启动即停在该页（`home` / `extract` / `preview` / `text` / `save` / `runtime` / `mods` / `settings` / `help` / `log`） |
-| `STOOL_PID=<pid>` | 预选内存扫描的目标进程并**建立扫描会话**（等价于手动在「目标进程」里点一下） |
-| `STOOL_SCAN=<数值>` | 配合 `STOOL_PID`，启动即跑一次「首次扫描」——用来无头验证扫描链路 |
-| `STOOL_SAVE=<路径>` | 启动即加载该存档并切到存档页 |
-| `STOOL_SAVE_SEL=<JSON Pointer>` | 载入存档后预选一个字段（验证编辑卡片） |
-| `STOOL_SEARCH=<关键词>` | 载入存档后立刻搜一次（验证虚拟化结果列表） |
-
-GUI 自身的 Windows 辅助文件在 `shots/`（截图）与 `scripts/`（`mock_mem_guard.py` 内存保护靶子、
+与界面无关的验证辅助仍在 `scripts/`（`mock_mem_guard.py` 内存保护靶子、
 `mock_mtl_server.py` 假机翻服务、`peek_xp3.py` 独立 xp3 解析器）。
 
 
@@ -551,7 +546,7 @@ Tauri 会去找前端 dev 服务器 —— 结果是**一个静默的白窗口**
 
 #### 6.2.1 文本预览的编码判定（`features::preview::decode_text`）
 
-**唯一实现在内核**，egui 版与 Tauri 版共用 —— 别在界面侧再写一份。
+**唯一实现在内核**，界面（Tauri 版）与 CLI 都用它 —— 别在界面侧再写一份。
 判定顺序与理由（每一条都是真机踩出来的）：
 
 | 顺序 | 判据 | 为什么必须在此时判 |
@@ -582,7 +577,7 @@ Tauri 会去找前端 dev 服务器 —— 结果是**一个静默的白窗口**
 | `STOOL_SAVE=<存档文件>` | 启动即在「改存档」页打开该存档 |
 | `STOOL_QUERY=<关键词>` | 打开存档后自动执行一次搜索 |
 | `STOOL_OUT=<目录>` | 「取出素材」的默认输出目录 |
-| `STOOL_PAGE=<页id>` | 启动即停在该页（与 egui 版同一口径） |
+| `STOOL_PAGE=<页id>` | 启动即停在该页 |
 | `STOOL_TUI_LOG=<日志文件>` | `log_line` 的落点（默认在系统临时目录） |
 
 ---
