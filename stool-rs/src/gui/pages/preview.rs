@@ -71,7 +71,7 @@ impl StoolApp {
             });
 
         // 右侧预览区
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card(ui, |ui| {
             let Some(path) = self.pv_sel.clone() else {
                 ui.add_space(ui.available_height() * 0.4);
                 ui.vertical_centered(|ui| {
@@ -133,6 +133,44 @@ impl StoolApp {
                         ui.label(RichText::new(err).weak().small());
                     }
                     ui.label(RichText::new(&self.pv_msg).weak().small());
+                }
+                preview::MediaKind::Text => {
+                    // 编码判定交给内核（BOM / UTF-8 / Shift-JIS），这里只管显示。
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            let head = &bytes[..bytes.len().min(preview::TEXT_PREVIEW_MAX)];
+                            match preview::decode_text(head) {
+                                preview::DecodedText::Ok(text, enc) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "文本预览 · 编码 {enc} · {}{}",
+                                            crate::features::precheck::human_bytes(bytes.len() as u64),
+                                            if bytes.len() > preview::TEXT_PREVIEW_MAX { "（只显示开头一段）" } else { "" }
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                        ui.monospace(text);
+                                    });
+                                }
+                                // 扩展名像文本、内容却是密文：说清楚，别显示一屏乱码
+                                preview::DecodedText::Binary => {
+                                    ui.label(
+                                        RichText::new(
+                                            "这个文件内容不是文本（按已知编码都解不出可读文字），\
+                                             多半是二进制或加密后的残留。",
+                                        )
+                                        .color(crate::gui::util::C_WARN),
+                                    );
+                                    ui.label(RichText::new("可尝试用系统程序打开看看。").weak().small());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            ui.label(RichText::new(format!("读取失败：{e}")).weak());
+                        }
+                    }
                 }
                 preview::MediaKind::Other => {
                     ui.label(RichText::new("不支持的预览类型").weak());

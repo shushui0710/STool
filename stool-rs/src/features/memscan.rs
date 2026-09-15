@@ -3,6 +3,11 @@
 //! 流程：选择进程 → 首次扫描（在全部可写内存中找值）→ 再次扫描
 //! （精确 / 变了 / 没变 / 变大 / 变小 过滤缩小结果）→ 写入新值。
 //! 支持 i32 / i64 / f32 / f64 / UTF-8 / UTF-16 字符串。
+//!
+//! 低层 API（打开进程 / 读写 / 查询区域 / 强制写入）在 [`crate::memapi`]，
+//! 与 `features::guard`（反修改保护识别）共用。
+
+use crate::memapi::{self, PageFix, Proc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
@@ -38,6 +43,18 @@ impl ScanType {
             ScanType::I32 | ScanType::F32 => 4,
             ScanType::I64 | ScanType::F64 => 8,
             ScanType::Utf8 | ScanType::Utf16 => 0,
+        }
+    }
+    /// 供 CLI / GUI 解析 `--opt:type=`。
+    pub fn parse(s: &str) -> Option<ScanType> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "i32" | "int" | "int32" | "整数" | "整数32" => Some(ScanType::I32),
+            "i64" | "long" | "int64" | "整数64" => Some(ScanType::I64),
+            "f32" | "float" | "小数32" => Some(ScanType::F32),
+            "f64" | "double" | "小数64" => Some(ScanType::F64),
+            "utf8" | "str" | "string" | "文本" => Some(ScanType::Utf8),
+            "utf16" | "wstr" | "文本16" => Some(ScanType::Utf16),
+            _ => None,
         }
     }
 }
@@ -99,7 +116,7 @@ pub struct Hit {
 
 /// 单个目标进程的扫描会话（持有进程句柄）。
 pub struct Scanner {
-    handle: isize,
+    proc: Option<Proc>,
     pub ty: ScanType,
     pub hits: Vec<Hit>,
     pub first_done: bool,
@@ -108,30 +125,21 @@ pub struct Scanner {
 }
 
 const MAX_HITS: usize = 2_000_000;
-const MAX_REGION: usize = 256 * 1024 * 1024;
-const PAGE_READWRITE: u32 = 0x04;
-const PAGE_WRITECOPY: u32 = 0x08;
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
-const PAGE_GUARD: u32 = 0x100;
-const MEM_COMMIT_STATE: u32 = 0x1000;
-
-impl Drop for Scanner {
-    fn drop(&mut self) {
-        if self.handle != 0 {
-            w_close(self.handle);
-        }
-    }
-}
+pub const MAX_REGION: usize = 256 * 1024 * 1024;
 
 impl Scanner {
     /// 打开进程（查询 + 读 + 写内存权限）。失败常见原因：权限不足（试试管理员运行）。
     pub fn open(pid: u32, ty: ScanType) -> Result<Scanner, String> {
-        let handle = w_open_process(0x0438, pid); // VM_OP|VM_READ|VM_WRITE|QUERY
-        if handle == 0 {
-            return Err("无法打开进程（权限不足或进程已退出）。可尝试以管理员身份运行 STool。".into());
-        }
-        Ok(Scanner { handle, ty, hits: Vec::new(), first_done: false, saved: Vec::new() })
+        let proc = Proc::open(pid)?;
+        Ok(Scanner { proc: Some(proc), ty, hits: Vec::new(), first_done: false, saved: Vec::new() })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.proc.as_ref().map(|p| p.pid()).unwrap_or(0)
+    }
+
+    fn proc(&self) -> Result<&Proc, String> {
+        self.proc.as_ref().ok_or_else(|| "进程句柄已失效，请重新打开".to_string())
     }
 
     /// 首次扫描全部可写内存。返回命中数量。
@@ -161,6 +169,7 @@ impl Scanner {
             None
         };
         let vsz = self.ty.value_size().max(1);
+        let h = self.proc()?.raw();
         self.hits.sort_by_key(|h| h.addr);
         let mut kept: Vec<Hit> = Vec::with_capacity(self.hits.len());
         let mut i = 0;
@@ -173,7 +182,7 @@ impl Scanner {
             }
             let last = self.hits[j].addr;
             let len = (last - start + vsz.max(256)).min(MAX_REGION);
-            if let Some(buf) = w_read(self.handle, start, len) {
+            if let Some(buf) = memapi::read_raw(h, start, len) {
                 for hit in &self.hits[i..=j] {
                     let off = hit.addr - start;
                     if off + vsz > buf.len() {
@@ -210,18 +219,21 @@ impl Scanner {
             Some(a) => vec![a],
             None => self.hits.iter().map(|h| h.addr).collect(),
         };
+        let h = self.proc()?.raw();
         let mut n = 0;
+        let mut saved = std::mem::take(&mut self.saved);
         for a in targets {
             // 只在首次写入某地址时记录原值，避免重复记录
-            if !self.saved.iter().any(|(sa, _)| *sa == a) {
-                if let Some(old) = w_read(self.handle, a, bytes.len()) {
-                    self.saved.push((a, old));
+            if !saved.iter().any(|(sa, _)| *sa == a) {
+                if let Some(old) = memapi::read_raw(h, a, bytes.len()) {
+                    saved.push((a, old));
                 }
             }
-            if w_write(self.handle, a, &bytes) {
+            if memapi::write_raw(h, a, &bytes) {
                 n += 1;
             }
         }
+        self.saved = saved;
         if n == 0 {
             return Err("写入失败（地址可能已失效，请重新扫描）".into());
         }
@@ -235,13 +247,14 @@ impl Scanner {
         }
         let needle = self.parse_value(input)?;
         let bytes = self.pattern_bytes(&needle).ok_or("该类型需要输入有效的值")?;
+        let h = self.proc()?.raw();
         let targets: Vec<usize> = match addr {
             Some(a) => vec![a],
             None => self.hits.iter().map(|h| h.addr).collect(),
         };
         let mut n = 0;
         for a in targets {
-            if w_write(self.handle, a, &bytes) {
+            if memapi::write_raw(h, a, &bytes) {
                 n += 1;
             }
         }
@@ -251,11 +264,54 @@ impl Scanner {
         Ok(n)
     }
 
+    /// 强制写入：页只读 / Guard 导致普通写入失败时，临时解除页保护再写。
+    ///
+    /// 返回成功写入的地址数 + 首个成功地址用了哪种页修复（用于给用户解释）。
+    pub fn force_write(&mut self, input: &str, addr: Option<usize>) -> Result<(usize, PageFix), String> {
+        if !self.first_done {
+            return Err("请先执行扫描".into());
+        }
+        let needle = self.parse_value(input)?;
+        let bytes = self.pattern_bytes(&needle).ok_or("该类型需要输入有效的值")?;
+        let targets: Vec<usize> = match addr {
+            Some(a) => vec![a],
+            None => self.hits.iter().map(|h| h.addr).collect(),
+        };
+        let h = self.proc()?.raw();
+        let mut n = 0usize;
+        let mut fix = PageFix::NotNeeded;
+        let mut last_err: Option<String> = None;
+        let mut saved = std::mem::take(&mut self.saved);
+        for a in targets {
+            if !saved.iter().any(|(sa, _)| *sa == a) {
+                if let Some(old) = memapi::read_raw(h, a, bytes.len()) {
+                    saved.push((a, old));
+                }
+            }
+            match memapi::force_write_raw(h, a, &bytes) {
+                Ok(f) => {
+                    n += 1;
+                    if f != PageFix::NotNeeded {
+                        fix = f;
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        self.saved = saved;
+        match (n, last_err) {
+            (0, Some(e)) => Err(e),
+            (0, None) => Err("写入失败（地址可能已失效，请重新扫描）".into()),
+            _ => Ok((n, fix)),
+        }
+    }
+
     /// 撤销写入：把所有记录过的地址恢复为写入前的值。返回恢复的数量。
     pub fn undo(&mut self) -> usize {
+        let Some(h) = self.proc.as_ref().map(|p| p.raw()) else { return 0 };
         let mut n = 0;
         for (a, old) in self.saved.drain(..) {
-            if w_write(self.handle, a, &old) {
+            if memapi::write_raw(h, a, &old) {
                 n += 1;
             }
         }
@@ -270,8 +326,9 @@ impl Scanner {
     /// 重新读取当前命中的最新值（刷新显示）。
     pub fn refresh(&mut self) {
         let vsz = self.ty.value_size().max(128);
+        let Some(h) = self.proc.as_ref().map(|p| p.raw()) else { return };
         for hit in self.hits.iter_mut() {
-            if let Some(buf) = w_read(self.handle, hit.addr, vsz) {
+            if let Some(buf) = memapi::read_raw(h, hit.addr, vsz) {
                 if let Some(v) = read_value_at(&buf, self.ty) {
                     hit.value = v;
                 }
@@ -283,53 +340,106 @@ impl Scanner {
         self.hits.len()
     }
 
+    /// 当前命中里，有多少个地址所在页**不能直接写**（只读 / Guard）——
+    /// 这类地址用「写入所有命中」会失败，需要「强制写入」。
+    pub fn readonly_hit_count(&self) -> usize {
+        let Some(h) = self.proc.as_ref().map(|p| p.raw()) else { return 0 };
+        self.hits
+            .iter()
+            .filter(|hit| {
+                memapi::region_raw(h, hit.addr)
+                    .map(|r| !memapi::is_directly_writable(r.protect))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
     fn parse_value(&self, input: &str) -> Result<ScanValue, String> {
-        let s = input.trim();
-        match self.ty {
-            ScanType::I32 => s.parse::<i32>().map(|v| ScanValue::Int(v as i64)).map_err(|e| format!("需要 32 位整数: {e}")),
-            ScanType::I64 => s.parse::<i64>().map(ScanValue::Int).map_err(|e| format!("需要 64 位整数: {e}")),
-            ScanType::F32 => s.parse::<f32>().map(|v| ScanValue::Float(v as f64)).map_err(|e| format!("需要小数: {e}")),
-            ScanType::F64 => s.parse::<f64>().map(ScanValue::Float).map_err(|e| format!("需要小数: {e}")),
-            ScanType::Utf8 | ScanType::Utf16 => Ok(ScanValue::Str(s.to_string())),
-        }
+        parse_value(self.ty, input)
     }
 
     fn pattern_bytes(&self, v: &ScanValue) -> Option<Vec<u8>> {
-        match (self.ty, v) {
-            (ScanType::I32, ScanValue::Int(i)) => Some((*i as i32).to_le_bytes().to_vec()),
-            (ScanType::I64, ScanValue::Int(i)) => Some(i.to_le_bytes().to_vec()),
-            (ScanType::F32, ScanValue::Float(f)) => Some((*f as f32).to_le_bytes().to_vec()),
-            (ScanType::F64, ScanValue::Float(f)) => Some(f.to_le_bytes().to_vec()),
-            (ScanType::Utf8, ScanValue::Str(s)) => Some(s.as_bytes().to_vec()),
-            (ScanType::Utf16, ScanValue::Str(s)) => Some(s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()),
-            _ => None,
-        }
+        pattern_bytes_of(self.ty, v)
     }
 
     /// 枚举全部可写已提交区域（VirtualQueryEx），逐块读出。
     fn writable_regions(&self) -> Result<Vec<(usize, Vec<u8>)>, String> {
+        let proc = self.proc()?;
         let mut out = Vec::new();
-        let mut addr: usize = 0x10000;
-        let max_addr = 0x7FFF_FFFF_FFFF;
-        while addr < max_addr {
-            let Some(mbi) = w_query(self.handle, addr) else { break };
-            let region_size = mbi.1.max(1);
-            let base = mbi.0;
-            let prot = mbi.2;
-            let writable = matches!(prot & 0xFF, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
-            let committed = mbi.3 == MEM_COMMIT_STATE;
-            if committed && writable && prot & PAGE_GUARD == 0 && region_size <= MAX_REGION {
-                if let Some(buf) = w_read(self.handle, base, region_size) {
-                    out.push((base, buf));
-                }
+        for reg in proc.regions() {
+            if !reg.is_scannable_writable(MAX_REGION) {
+                continue;
             }
-            match base.checked_add(region_size) {
-                Some(next) if next > addr => addr = next,
-                _ => break,
+            if let Some(buf) = proc.read(reg.base, reg.size) {
+                out.push((reg.base, buf));
             }
         }
         Ok(out)
     }
+}
+
+/// 把值编码成内存里的字节（供扫描与写入共用）。
+pub fn pattern_bytes_of(ty: ScanType, v: &ScanValue) -> Option<Vec<u8>> {
+    match (ty, v) {
+        (ScanType::I32, ScanValue::Int(i)) => Some((*i as i32).to_le_bytes().to_vec()),
+        (ScanType::I64, ScanValue::Int(i)) => Some(i.to_le_bytes().to_vec()),
+        (ScanType::F32, ScanValue::Float(f)) => Some((*f as f32).to_le_bytes().to_vec()),
+        (ScanType::F64, ScanValue::Float(f)) => Some(f.to_le_bytes().to_vec()),
+        (ScanType::Utf8, ScanValue::Str(s)) => Some(s.as_bytes().to_vec()),
+        (ScanType::Utf16, ScanValue::Str(s)) => Some(s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()),
+        _ => None,
+    }
+}
+
+/// 按数值类型解析用户输入的字符串（供 CLI / GUI / guard 共用同一套报错文案）。
+pub fn parse_value(ty: ScanType, input: &str) -> Result<ScanValue, String> {
+    let s = input.trim();
+    match ty {
+        ScanType::I32 => s.parse::<i32>().map(|v| ScanValue::Int(v as i64)).map_err(|e| format!("需要 32 位整数: {e}")),
+        ScanType::I64 => s.parse::<i64>().map(ScanValue::Int).map_err(|e| format!("需要 64 位整数: {e}")),
+        ScanType::F32 => s.parse::<f32>().map(|v| ScanValue::Float(v as f64)).map_err(|e| format!("需要小数: {e}")),
+        ScanType::F64 => s.parse::<f64>().map(ScanValue::Float).map_err(|e| format!("需要小数: {e}")),
+        ScanType::Utf8 | ScanType::Utf16 => Ok(ScanValue::Str(s.to_string())),
+    }
+}
+
+/// 该类型是否为可做「数值保护探测」的数值类型（文本类型没有 ± 语义，探测不适用）。
+pub fn is_numeric(ty: ScanType) -> bool {
+    matches!(ty, ScanType::I32 | ScanType::I64 | ScanType::F32 | ScanType::F64)
+}
+
+/// 自动构造一个探测值：在 `cur` 基础上往「明显不同」的方向推。
+/// 整数：< 1000 时 +1000，否则 +7；小数：×2 + 1。文本类型返回 None。
+pub fn auto_probe(ty: ScanType, cur: &ScanValue) -> Option<ScanValue> {
+    match (ty, cur) {
+        (ScanType::I32 | ScanType::I64, ScanValue::Int(v)) => {
+            let d = if v.abs() < 1000 { 1000 } else { 7 };
+            Some(ScanValue::Int(v.saturating_add(d)))
+        }
+        (ScanType::F32 | ScanType::F64, ScanValue::Float(f)) => Some(ScanValue::Float(f * 2.0 + 1.0)),
+        _ => None,
+    }
+}
+
+/// 把值编码成定长 8 字节小端（高位补 0），用于位运算层面的差分判定（XOR / 位移）。
+pub fn pattern_u64(ty: ScanType, v: &ScanValue) -> Option<u64> {
+    let b = pattern_bytes_of(ty, v)?;
+    if b.is_empty() || b.len() > 8 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf[..b.len()].copy_from_slice(&b);
+    Some(u64::from_le_bytes(buf))
+}
+
+/// 把内存里读到的字节补成定长 8 字节小端（高位补 0），与 [`pattern_u64`] 配对使用。
+pub fn bytes_u64(b: &[u8]) -> Option<u64> {
+    if b.is_empty() || b.len() > 8 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf[..b.len()].copy_from_slice(b);
+    Some(u64::from_le_bytes(buf))
 }
 
 fn value_gt(a: &ScanValue, b: &ScanValue) -> bool {
@@ -367,7 +477,7 @@ fn decode_utf16(bytes: &[u8]) -> String {
 }
 
 /// 从内存片段读一个值（失败返回 None）。
-fn read_value_at(buf: &[u8], ty: ScanType) -> Option<ScanValue> {
+pub fn read_value_at(buf: &[u8], ty: ScanType) -> Option<ScanValue> {
     match ty {
         ScanType::I32 if buf.len() >= 4 => Some(ScanValue::Int(i32::from_le_bytes(buf[..4].try_into().ok()?) as i64)),
         ScanType::I64 if buf.len() >= 8 => Some(ScanValue::Int(i64::from_le_bytes(buf[..8].try_into().ok()?))),
@@ -381,140 +491,68 @@ fn read_value_at(buf: &[u8], ty: ScanType) -> Option<ScanValue> {
 
 /// 列出系统进程 [(pid, 名字)]，按 pid 排序。
 pub fn list_processes() -> Vec<(u32, String)> {
-    w_enum_processes()
+    memapi::list_processes()
 }
 
-// ---------------------------------------------------------------------------
-// Windows API 薄封装（非 Windows 返回失败，保证跨平台编译）
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// (BaseAddress, RegionSize, Protect, State)
-type MemInfo = (usize, usize, u32, u32);
-
-#[cfg(windows)]
-mod winapi {
-    use super::MemInfo;
-    use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
-    use windows_sys::Win32::System::Threading::OpenProcess;
-
-    pub fn open_process(access: u32, pid: u32) -> isize {
-        unsafe { OpenProcess(access, 0, pid) as isize }
+    #[test]
+    fn scan_type_parse_covers_aliases() {
+        assert_eq!(ScanType::parse("i32"), Some(ScanType::I32));
+        assert_eq!(ScanType::parse("INT"), Some(ScanType::I32));
+        assert_eq!(ScanType::parse(" float "), Some(ScanType::F32));
+        assert_eq!(ScanType::parse("double"), Some(ScanType::F64));
+        assert_eq!(ScanType::parse("utf-16"), None);
+        assert_eq!(ScanType::parse("utf16"), Some(ScanType::Utf16));
+        assert_eq!(ScanType::parse("nope"), None);
     }
 
-    pub fn close_handle(h: isize) {
-        unsafe { CloseHandle(h as HANDLE) };
+    #[test]
+    fn pattern_bytes_roundtrip_for_numeric_types() {
+        let b = pattern_bytes_of(ScanType::I32, &ScanValue::Int(100)).unwrap();
+        assert_eq!(b, vec![100, 0, 0, 0]);
+        assert_eq!(read_value_at(&b, ScanType::I32), Some(ScanValue::Int(100)));
+
+        let b = pattern_bytes_of(ScanType::F32, &ScanValue::Float(1.5)).unwrap();
+        assert_eq!(read_value_at(&b, ScanType::F32), Some(ScanValue::Float(1.5)));
+
+        let b = pattern_bytes_of(ScanType::Utf16, &ScanValue::Str("ab".into())).unwrap();
+        assert_eq!(b, vec![b'a', 0, b'b', 0]);
     }
 
-    pub fn query_mem(h: isize, addr: usize) -> Option<MemInfo> {
-        unsafe {
-            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            let n = VirtualQueryEx(
-                h as HANDLE,
-                addr as *const core::ffi::c_void,
-                &mut mbi,
-                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            );
-            if n == 0 {
-                None
-            } else {
-                Some((mbi.BaseAddress as usize, mbi.RegionSize, mbi.Protect, mbi.State))
-            }
-        }
+    #[test]
+    fn scan_bytes_finds_all_occurrences_and_respects_bounds() {
+        let buf = vec![0u8, 100, 0, 0, 0, 7, 100, 0, 0, 0, 9];
+        let needle = (100i32).to_le_bytes().to_vec();
+        let mut out = Vec::new();
+        scan_bytes(&buf, 0x1000, &needle, ScanType::I32, &ScanValue::Int(100), &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].addr, 0x1001);
+        assert_eq!(out[1].addr, 0x1006);
+
+        // 空模式 / 过长模式不 panic 且不产生命中
+        let mut empty = Vec::new();
+        scan_bytes(&buf, 0, &[], ScanType::I32, &ScanValue::Int(0), &mut empty);
+        assert!(empty.is_empty());
+        let mut too_long = Vec::new();
+        scan_bytes(&[1u8, 2], 0, &[1, 2, 3], ScanType::I32, &ScanValue::Int(0), &mut too_long);
+        assert!(too_long.is_empty());
     }
 
-    pub fn read_mem(h: isize, addr: usize, size: usize) -> Option<Vec<u8>> {
-        unsafe {
-            let mut buf = vec![0u8; size];
-            let mut read = 0usize;
-            let ok = ReadProcessMemory(h as HANDLE, addr as *const core::ffi::c_void, buf.as_mut_ptr() as *mut core::ffi::c_void, size, &mut read);
-            if ok != 0 && read > 0 { buf.truncate(read); Some(buf) } else { None }
-        }
+    #[test]
+    fn read_value_at_rejects_short_slices_without_panic() {
+        assert_eq!(read_value_at(&[1u8, 2, 3], ScanType::I32), None);
+        assert_eq!(read_value_at(&[], ScanType::I64), None);
+        assert_eq!(read_value_at(&[1u8], ScanType::Utf8), Some(ScanValue::Str("\u{1}".into())));
     }
 
-    pub fn write_mem(h: isize, addr: usize, bytes: &[u8]) -> bool {
-        unsafe {
-            let mut written = 0usize;
-            WriteProcessMemory(h as HANDLE, addr as *const core::ffi::c_void, bytes.as_ptr() as *const core::ffi::c_void, bytes.len(), &mut written) != 0
-        }
+    #[test]
+    fn utf16_decoding_is_lossy_but_bounded() {
+        assert_eq!(decode_utf16(&[b'a', 0, b'b', 0]), "ab");
+        // 奇数长度：as_chunks 只取成对的部分，不 panic
+        assert_eq!(decode_utf16(&[b'a', 0, b'b']), "a");
+        assert_eq!(decode_utf16(&[]), "");
     }
-
-    pub fn enum_processes() -> Vec<(u32, String)> {
-        unsafe {
-            let mut out = Vec::new();
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap as isize == -1 {
-                return out;
-            }
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            if Process32FirstW(snap, &mut entry) != 0 {
-                loop {
-                    let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-                    out.push((entry.th32ProcessID, String::from_utf16_lossy(&entry.szExeFile[..len])));
-                    if Process32NextW(snap, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-            CloseHandle(snap);
-            out.sort();
-            out
-        }
-    }
-}
-
-#[cfg(windows)]
-use winapi as w;
-
-#[cfg(windows)]
-fn w_open_process(access: u32, pid: u32) -> isize {
-    w::open_process(access, pid)
-}
-#[cfg(windows)]
-fn w_close(h: isize) {
-    w::close_handle(h)
-}
-#[cfg(windows)]
-fn w_query(h: isize, addr: usize) -> Option<MemInfo> {
-    w::query_mem(h, addr)
-}
-#[cfg(windows)]
-fn w_read(h: isize, addr: usize, size: usize) -> Option<Vec<u8>> {
-    w::read_mem(h, addr, size)
-}
-#[cfg(windows)]
-fn w_write(h: isize, addr: usize, bytes: &[u8]) -> bool {
-    w::write_mem(h, addr, bytes)
-}
-#[cfg(windows)]
-fn w_enum_processes() -> Vec<(u32, String)> {
-    w::enum_processes()
-}
-
-#[cfg(not(windows))]
-fn w_open_process(_access: u32, _pid: u32) -> isize {
-    0
-}
-#[cfg(not(windows))]
-fn w_close(_h: isize) {}
-#[cfg(not(windows))]
-fn w_query(_h: isize, _addr: usize) -> Option<MemInfo> {
-    None
-}
-#[cfg(not(windows))]
-fn w_read(_h: isize, _addr: usize, _size: usize) -> Option<Vec<u8>> {
-    None
-}
-#[cfg(not(windows))]
-fn w_write(_h: isize, _addr: usize, _bytes: &[u8]) -> bool {
-    false
-}
-#[cfg(not(windows))]
-fn w_enum_processes() -> Vec<(u32, String)> {
-    Vec::new()
 }

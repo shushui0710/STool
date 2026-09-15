@@ -1,6 +1,6 @@
 //! 命令行入口：detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support /
-//! cg-candidates / extract / repack / decompile / text-extract / text-import / text-inject / text-uninject /
-//! save / unlock / mod-* / gui。
+//! cg-candidates / guard / guard-regions / extract / repack / decompile / text-extract / text-import /
+//! text-inject / text-uninject / save / unlock / mod-* / gui。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,10 +26,6 @@ fn run_op(reg: &Registry, det_id: &str, op: Op, root: &Path, out: &Path, opts: H
     if !rep.ok() {
         return crate::engines::OpOutcome::fail(rep.fail_summary());
     }
-    let engine = match reg.get(det_id) {
-        Some(e) => e,
-        None => return crate::engines::OpOutcome::fail("插件不存在"),
-    };
     let cancel = Arc::new(AtomicBool::new(false));
     let ctx = crate::engines::Ctx {
         root,
@@ -38,21 +34,11 @@ fn run_op(reg: &Registry, det_id: &str, op: Op, root: &Path, out: &Path, opts: H
         progress: &print_progress,
         cancel: &cancel,
     };
-    // 解包并行化（P2-2）：每次操作前清空「已建目录」缓存，避免上一操作删过目录后缓存失真。
-    crate::engines::clear_dir_cache();
-    match op {
-        Op::Extract => engine.extract(&ctx),
-        Op::Repack => {
-            let src = PathBuf::from(opts.get("src_dir").map(|s| s.as_str()).unwrap_or("patch_src"));
-            engine.repack(&ctx, &src)
-        }
-        Op::Decompile => engine.decompile(&ctx),
-        Op::TextExtract => engine.text_extract(&ctx, out),
-        Op::TextImport => engine.text_import(&ctx, out),
-        Op::TextInject => engine.text_inject(&ctx, out),
-        Op::Save => engine.save(&ctx),
-        Op::Unlock => engine.unlock(&ctx),
-    }
+    // 各入口的默认路径口径不同：CLI 认 --opt:src_dir，文本类一律落输出目录。
+    let repack_src = PathBuf::from(opts.get("src_dir").map(|s| s.as_str()).unwrap_or("patch_src"));
+    let paths = crate::engines::OpPaths { repack_src: &repack_src, csv: out, translation: out };
+    // 分发（含「插件不存在」）统一走内核单点，见 engines::exec_op。
+    crate::engines::exec_op(reg, det_id, op, &ctx, &paths)
 }
 
 /// cg-candidates 子命令：**只读**列出 Unity 全 CG 解锁的候选键名。
@@ -257,6 +243,156 @@ fn xp3_patch(args: &[String]) -> i32 {
     }
     println!("下一个可用的补丁包名: {}", crate::features::xp3patch::next_name(&root));
     0
+}
+
+/// 解析目标进程：位置参数（pid 或进程名）→ `--opt:pid=` → `--opt:name=`。
+fn resolve_pid(args: &[String], opts: &HashMap<String, String>) -> Result<u32, String> {
+    if let Some(p) = opts.get("pid").and_then(|s| s.trim().parse::<u32>().ok()) {
+        return Ok(p);
+    }
+    if let Some(n) = opts.get("name") {
+        return crate::memapi::find_pid(n)
+            .ok_or_else(|| format!("没找到名为「{n}」的进程（可能没启动，或名字拼错）"));
+    }
+    if let Some(a) = args.first().filter(|a| !a.starts_with("--")) {
+        if let Ok(p) = a.trim().parse::<u32>() {
+            return Ok(p);
+        }
+        return crate::memapi::find_pid(a).ok_or_else(|| format!("没找到名为「{a}」的进程"));
+    }
+    Err("请给出进程 ID（位置参数 / --opt:pid=）或进程名（--opt:name=）".into())
+}
+
+/// guard 子命令：诊断「改了立刻被还原 / 改了没用」的保护机制，并给出应对方案。
+///
+/// 只读诊断（写入探测会临时写入再恢复原值），不修改游戏数据。
+///
+/// 用法:
+///   stool guard <pid|游戏进程名> --opt:addr=0x1234ABCD [--opt:type=i32|i64|f32|f64]
+///                [--opt:probe=探测值] [--opt:window=400] [--opt:rounds=5]
+///                [--opt:no-mirror] [--opt:no-code]
+fn guard_cmd(args: &[String]) -> i32 {
+    use crate::features::{guard, memscan};
+
+    let pairs: Vec<String> = args
+        .iter()
+        .filter(|a| a.starts_with("--opt:"))
+        .map(|a| a.trim_start_matches("--opt:").to_string())
+        .collect();
+    let opts = opts_from(&pairs);
+
+    let pid = match resolve_pid(args, &opts) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("✘ {e}");
+            return 2;
+        }
+    };
+    let Some(addr) = opts.get("addr").and_then(|s| guard::parse_addr(s)) else {
+        eprintln!("✘ 需要 --opt:addr=0x... （先用内存扫描或 cg-candidates 之外的扫描流程拿到地址）");
+        return 2;
+    };
+    let ty = match opts.get("type").map(|s| memscan::ScanType::parse(s)) {
+        None => memscan::ScanType::I32,
+        Some(Some(t)) => t,
+        Some(None) => {
+            eprintln!("✘ --opt:type 只支持 i32 / i64 / f32 / f64");
+            return 2;
+        }
+    };
+
+    let po = guard::ProbeOpts {
+        probe: opts.get("probe").cloned(),
+        window_ms: opts.get("window").and_then(|s| s.parse().ok()).unwrap_or(400),
+        rounds: opts.get("rounds").and_then(|s| s.parse().ok()).unwrap_or(5),
+        mirror: !opts.contains_key("no-mirror"),
+        code: !opts.contains_key("no-code"),
+        max_mirrors: opts.get("max-mirrors").and_then(|s| s.parse().ok()).unwrap_or(64),
+    };
+
+    println!("诊断进程 {pid} 的 {}", guard::fmt_addr(addr));
+    println!("（会临时写入探测值再恢复原值；不做任何持久修改）");
+    println!();
+
+    match guard::analyze(pid, addr, ty, &po) {
+        Ok(rep) => {
+            for line in rep.lines() {
+                println!("{line}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("✘ {e}");
+            1
+        }
+    }
+}
+
+/// guard-regions 子命令：只读列出目标进程的内存区域与页保护统计。
+///
+/// 用法:
+///   stool guard-regions <pid|游戏进程名> [--opt:max=40]
+fn guard_regions_cmd(args: &[String]) -> i32 {
+    use crate::features::guard;
+
+    let pairs: Vec<String> = args
+        .iter()
+        .filter(|a| a.starts_with("--opt:"))
+        .map(|a| a.trim_start_matches("--opt:").to_string())
+        .collect();
+    let opts = opts_from(&pairs);
+
+    let pid = match resolve_pid(args, &opts) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("✘ {e}");
+            return 2;
+        }
+    };
+    let max = opts.get("max").and_then(|s| s.parse().ok()).unwrap_or(40usize);
+
+    match guard::regions_of(pid) {
+        Ok((stats, sum)) => {
+            println!("进程 {pid} 的内存区域（已合并相邻同保护区域）");
+            println!(
+                "已提交 {} 个区域 / {}：可写 {} · 只读 {} · 可执行 {} · 可写可执行 {} · Guard {}",
+                sum.committed,
+                crate::features::precheck::human_bytes(sum.total_bytes as u64),
+                sum.writable,
+                sum.readonly,
+                sum.execute,
+                sum.rwx,
+                sum.guard
+            );
+            println!(
+                "按类型：映像 {} · 映射 {} · 私有 {}",
+                sum.image, sum.mapped, sum.private
+            );
+            if sum.rwx > 0 {
+                println!("⚠ 检测到 {} 个「可写且可执行」页面（正常程序极少）——加壳/自修改代码的常见特征。", sum.rwx);
+            }
+            println!();
+            println!("{:<20} {:>12}  {:<14} {:<18} 合并区数", "基址", "大小", "保护", "类型");
+            for s in stats.iter().take(max) {
+                println!(
+                    "{:<20} {:>12}  {:<14} {:<18} {}",
+                    guard::fmt_addr(s.base),
+                    crate::features::precheck::human_bytes(s.size as u64),
+                    crate::memapi::protect_name(s.protect),
+                    crate::memapi::kind_name(s.kind),
+                    s.merged
+                );
+            }
+            if stats.len() > max {
+                println!("…其余 {} 条省略（--opt:max= 可调）", stats.len() - max);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("✘ {e}");
+            1
+        }
+    }
 }
 
 fn opts_from(pairs: &[String]) -> HashMap<String, String> {
@@ -508,13 +644,28 @@ fn missing_arg_usage(args: &[String]) -> Option<&'static str> {
         "cg-candidates" => (n < 2).then_some(
             "stool cg-candidates <Unity 游戏目录> [--opt:filter=<子串>] [--opt:max=<n>]",
         ),
+        "guard" => (n < 2).then_some(
+            "stool guard <pid|进程名> --opt:addr=0x1234ABCD [--opt:type=i32|i64|f32|f64] [--opt:probe=值] [--opt:window=ms] [--opt:rounds=n] [--opt:no-mirror] [--opt:no-code]",
+        ),
+        "guard-regions" => (n < 2).then_some("stool guard-regions <pid|进程名> [--opt:max=<n>]"),
         _ => None,
     }
 }
 
 pub fn main_args(args: Vec<String>) -> i32 {
     if args.is_empty() {
-        return crate::gui::run();
+        #[cfg(feature = "gui")]
+        {
+            return crate::gui::run();
+        }
+        // gui feature 关掉时（如给 Tauri 壳复用内核的构建）要给出明确指引，
+        // 不能静默退 0 —— 那会让人以为「打开了但没反应」。
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("本构建未启用图形界面（gui feature 已关闭）。");
+            eprintln!("改法：给一个子命令（例如 stool-cli detect <目录>），或按默认 feature 重新构建。");
+            return 2;
+        }
     }
     if let Some(usage) = missing_arg_usage(&args) {
         eprintln!("✘ 参数不足。用法: {usage}");
@@ -523,7 +674,16 @@ pub fn main_args(args: Vec<String>) -> i32 {
     match args[0].as_str() {
         "xp3-patch" => xp3_patch(&args[1..]),
         "cg-candidates" => cg_candidates(&args[1..]),
+        "guard" => guard_cmd(&args[1..]),
+        "guard-regions" => guard_regions_cmd(&args[1..]),
+        #[cfg(feature = "gui")]
         "gui" => crate::gui::run(),
+        #[cfg(not(feature = "gui"))]
+        "gui" => {
+            eprintln!("本构建未启用图形界面（gui feature 已关闭）。");
+            eprintln!("改法：按默认 feature 构建（cargo build --release）后再用 gui 子命令。");
+            2
+        }
         "save-edit" => save_edit(&args[1..]),
         "text-mtl" => text_mtl(&args[1..]),
         "detect" => {
@@ -1131,7 +1291,7 @@ pub fn main_args(args: Vec<String>) -> i32 {
             }
         }
         _ => {
-            eprintln!("未知命令: {}。可用: gui / detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support / cg-candidates / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / mod-enable / mod-disable / diag-export", args[0]);
+            eprintln!("未知命令: {}。可用: gui / detect / batch / engines / precheck / doctor / selfcheck / inject-support / unlock-support / cg-candidates / guard / guard-regions / extract / repack / decompile / text-extract / text-mtl / text-import / text-inject / text-uninject / save / save-edit / unlock / restore / pack-apply / archive-toggle / pack-export / pack-import / xp3-patch / mod-install / mod-list / mod-conflicts / mod-uninstall / mod-enable / mod-disable / diag-export", args[0]);
             2
         }
     }

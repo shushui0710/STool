@@ -1,6 +1,7 @@
-//! 横向功能：文本 CSV、存档、MOD、内存扫描、运行时修改、资源预览、外部工具下载、JSON 注入汉化。
+//! 横向功能：文本 CSV、存档、MOD、内存扫描、保护诊断、运行时修改、资源预览、外部工具下载、JSON 注入汉化。
 
 pub mod memscan;
+pub mod guard;
 pub mod mods;
 pub mod gallery;
 pub mod inject;

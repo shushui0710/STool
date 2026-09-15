@@ -1,5 +1,6 @@
 //! 存档结构树的只读渲染（性能要点见文件内注释）。
 
+use crate::features::saves;
 use eframe::egui;
 use super::util::*;
 use std::collections::{HashMap};
@@ -17,7 +18,11 @@ use eframe::egui::{Color32, RichText};
 // 现在的做法：
 //   1) 叶子 = 单行 SelectableLabel（纯文本、无状态），编辑收敛到右侧单一面板；
 //   2) 单个容器最多渲染 SAVE_RENDER_CAP 行，超出用“显示更多”分批展开；
-//   3) 加一道单帧总行数预算 SAVE_ROW_BUDGET 兜底，防止多个大分支同时展开。
+//   3) 加一道单帧总行数预算 SAVE_ROW_BUDGET 兜底，防止多个大分支同时展开；
+//   4) 悬停详情用 `on_hover_ui`（**惰性**）：旧写法每帧都为每一行拼一个 `String` 提示，
+//      1500 行就是 1500 次分配，纯属白费；
+//   5) 结构树本身已降级为「原始数据浏览」辅助视图（默认折叠，见 save.rs），
+//      日常改值走搜索结果列表（虚拟化渲染，只布局可见行）。
 // ---------------------------------------------------------------------------
 
 /// 单个容器一次最多渲染的行数（超出用“显示更多”分批展开）。
@@ -25,7 +30,10 @@ pub(crate) const SAVE_RENDER_CAP: usize = 200;
 /// 每次点“显示更多”追加的行数。
 pub(crate) const SAVE_RENDER_STEP: usize = 200;
 /// 一帧内整棵树最多渲染的行数（兜底）。
-pub(crate) const SAVE_ROW_BUDGET: usize = 1500;
+///
+/// 600 行 ≈ 明暗两套主题下都能保持 60fps 的量级；整棵树只作辅助浏览，
+/// 真要在大存档里找字段请用搜索（结果列表是虚拟化渲染，不受这个预算限制）。
+pub(crate) const SAVE_ROW_BUDGET: usize = 600;
 
 /// 单帧渲染预算：用完后停止渲染并只提示一次，避免多分支重复刷提示。
 pub(crate) struct RenderBudget {
@@ -138,34 +146,109 @@ pub(crate) fn render_row(ui: &mut egui::Ui, key: &str, node: &serde_json::Value,
     let (key_c, sep_c, val_c) = if is_sel {
         (sel_c, sel_c, sel_c)
     } else {
-        (weak_c, weak_c, value_color(dark, node))
+        (weak_c, weak_c, val_kind_color(dark, val_kind(node)))
     };
-    let font = egui::FontId::monospace(11.0);
+    let font = egui::FontId::monospace(ROW_FONT_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(&short_text(key, 38), 0.0, egui::TextFormat { font_id: font.clone(), color: key_c, ..Default::default() });
     job.append("  :  ", 0.0, egui::TextFormat { font_id: font.clone(), color: sep_c, ..Default::default() });
     job.append(&value_preview(node), 0.0, egui::TextFormat { font_id: font, color: val_c, ..Default::default() });
+    // 悬停详情用惰性回调：只有真的悬停时才拼字符串（旧写法每帧每行都拼一次，白费分配）
     ui.add(egui::SelectableLabel::new(is_sel, job))
-        .on_hover_text(format!("{ptr}\n类型：{}", type_hint(node)))
+        .on_hover_ui(|ui| {
+            ui.label(RichText::new(ptr).monospace().small());
+            ui.label(RichText::new(format!("类型：{}", type_hint(node))).small());
+        })
         .clicked()
 }
 
-/// 值按类型着色，方便在长列表里快速分辨（明暗主题各一套）。
-pub(crate) fn value_color(dark: bool, v: &serde_json::Value) -> Color32 {
+/// 结构树行的等宽字号（11 号在长列表里太挤，可读性差）。
+pub(crate) const ROW_FONT_SIZE: f32 = 12.0;
+
+/// 值的类别。只存类别、颜色在渲染时按当前主题算，这样主题切换不用重建缓存。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValKind {
+    Other,
+    Str,
+    Num,
+    Bool,
+}
+
+pub(crate) fn val_kind(v: &serde_json::Value) -> ValKind {
     match v {
-        serde_json::Value::String(_) if dark => Color32::from_rgb(140, 205, 160),
-        serde_json::Value::String(_) => Color32::from_rgb(30, 120, 70),
-        serde_json::Value::Number(_) if dark => Color32::from_rgb(130, 180, 250),
-        serde_json::Value::Number(_) => Color32::from_rgb(30, 80, 190),
-        serde_json::Value::Bool(_) if dark => Color32::from_rgb(232, 180, 110),
-        serde_json::Value::Bool(_) => Color32::from_rgb(170, 100, 20),
-        _ => {
-            if dark {
-                Color32::from_gray(150)
-            } else {
-                Color32::from_gray(110)
+        serde_json::Value::String(_) => ValKind::Str,
+        serde_json::Value::Number(_) => ValKind::Num,
+        serde_json::Value::Bool(_) => ValKind::Bool,
+        _ => ValKind::Other,
+    }
+}
+
+/// 值按类型着色，方便在长列表里快速分辨（明暗主题各一套）。
+pub(crate) fn val_kind_color(dark: bool, k: ValKind) -> Color32 {
+    match (k, dark) {
+        (ValKind::Str, true) => Color32::from_rgb(140, 205, 160),
+        (ValKind::Str, false) => Color32::from_rgb(30, 120, 70),
+        (ValKind::Num, true) => Color32::from_rgb(130, 180, 250),
+        (ValKind::Num, false) => Color32::from_rgb(30, 80, 190),
+        (ValKind::Bool, true) => Color32::from_rgb(232, 180, 110),
+        (ValKind::Bool, false) => Color32::from_rgb(170, 100, 20),
+        (ValKind::Other, true) => Color32::from_gray(150),
+        (ValKind::Other, false) => Color32::from_gray(110),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 搜索结果行（预计算 + 虚拟化渲染）
+// ---------------------------------------------------------------------------
+
+/// 搜索结果的一行。**预先算好**，渲染时不再查树、不再格式化。
+///
+/// 旧实现每帧对每条命中做 `doc.get()` + `to_string()` + `format!()` + `short_text()`，
+/// 命中上千条时每帧上千次堆分配 —— 这就是「搜索结果一多就卡」的原因。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SaveRow {
+    pub(crate) path: String,
+    /// 可直接编辑的文本形态（字符串带引号、数字原样）。
+    pub(crate) value: String,
+    /// 单行预览（截断后的展示用文本）。
+    pub(crate) preview: String,
+    pub(crate) kind: ValKind,
+    pub(crate) ty: &'static str,
+}
+
+impl SaveRow {
+    fn of(doc: &saves::SaveDoc, path: &str) -> SaveRow {
+        match doc.get(path) {
+            Some(v) => {
+                let value = value_edit_text(v);
+                SaveRow {
+                    path: path.to_string(),
+                    preview: short_text(&value, 42),
+                    value,
+                    kind: val_kind(v),
+                    ty: type_hint(v),
+                }
             }
+            None => SaveRow {
+                path: path.to_string(),
+                value: String::new(),
+                preview: "(已不存在)".into(),
+                kind: ValKind::Other,
+                ty: "-",
+            },
         }
+    }
+}
+
+/// 按路径列表构建结果行（搜索后调用一次）。
+pub(crate) fn save_rows_of(doc: &saves::SaveDoc, paths: &[String]) -> Vec<SaveRow> {
+    paths.iter().map(|p| SaveRow::of(doc, p)).collect()
+}
+
+/// 某一行被改动后重算它自己（避免整表重建）。
+pub(crate) fn refresh_save_row(doc: &saves::SaveDoc, rows: &mut [SaveRow], path: &str) {
+    if let Some(r) = rows.iter_mut().find(|r| r.path == path) {
+        *r = SaveRow::of(doc, path);
     }
 }
 

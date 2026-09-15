@@ -356,7 +356,8 @@ fn io_fix(e: &std::io::Error, what: &str) -> String {
 }
 
 /// 人类可读的体积（保留一位小数）。供 selfcheck 等模块复用。
-pub(crate) fn human_bytes(n: u64) -> String {
+/// 人类可读体积（1000 进制）。GUI 各版本共用一份口径。
+pub fn human_bytes(n: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;

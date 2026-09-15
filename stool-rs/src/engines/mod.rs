@@ -259,6 +259,49 @@ pub fn effective_capabilities(e: &dyn Engine) -> Vec<Op> {
     v
 }
 
+/// 各入口调用 [`exec_op`] 时要用的路径参数。
+///
+/// 三个入口对「回写源目录 / CSV / 翻译 JSON」的默认口径并不相同
+/// （CLI 认 `--opt:src_dir`、egui 用 `<游戏>/stool_repack_src`、Tauri 由界面传入），
+/// 所以默认值留在各自入口算，这里只承载「已经决定好的三个路径」。
+pub struct OpPaths<'a> {
+    /// 封包回写的源目录（`Op::Repack` 用）
+    pub repack_src: &'a Path,
+    /// 文本提取 / 回填的 CSV（`TextExtract` / `TextImport` 用）
+    pub csv: &'a Path,
+    /// JSON 注入的翻译文件（`TextInject` 用）
+    pub translation: &'a Path,
+}
+
+/// **唯一**的操作分发。
+///
+/// CLI（`cli::run_op`）、egui（`gui::exec_op`）、Tauri（`cmd::run_op`）三个入口
+/// 共用这一份 match —— 否则每加一个 `Op` 就要在三个地方各补一支，
+/// 漏掉一支的表现是「某个界面点了按钮没反应」，且不会有编译错误。
+///
+/// 只做分发与目录缓存清理；预检（`features::precheck`）由各入口按自己的
+/// 输出目录口径先行执行。
+pub fn exec_op(reg: &Registry, plugin_id: &str, op: Op, ctx: &Ctx, paths: &OpPaths) -> OpOutcome {
+    let Some(engine) = reg.get(plugin_id) else {
+        return OpOutcome::fail(format!(
+            "找不到名为 {plugin_id} 的引擎插件。\n改法：回「选游戏」页重新检测一次；若仍如此，说明检测结果与插件表不一致，请导出诊断包反馈。"
+        ));
+    };
+    // 解包并行化（P2-2）：每次操作前清空「已建目录」缓存，
+    // 避免上一操作删过目录后缓存失真。
+    clear_dir_cache();
+    match op {
+        Op::Extract => engine.extract(ctx),
+        Op::Repack => engine.repack(ctx, paths.repack_src),
+        Op::Decompile => engine.decompile(ctx),
+        Op::TextExtract => engine.text_extract(ctx, paths.csv),
+        Op::TextImport => engine.text_import(ctx, paths.csv),
+        Op::TextInject => engine.text_inject(ctx, paths.translation),
+        Op::Save => engine.save(ctx),
+        Op::Unlock => engine.unlock(ctx),
+    }
+}
+
 pub struct Registry {
     pub engines: Vec<Box<dyn Engine>>,
 }

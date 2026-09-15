@@ -9,7 +9,18 @@ fn main() {
     stool::diag::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = if args.is_empty() {
-        stool::gui::run()
+        #[cfg(feature = "gui")]
+        {
+            stool::gui::run()
+        }
+        // 关掉 gui feature 时的构建（如给 Tauri 壳复用内核）：无参数启动要给出明确指引，
+        // 不能静默退 0 让人以为"打开了但没反应"。
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("本构建未启用图形界面（gui feature 已关闭）。");
+            eprintln!("改法：用 stool-cli.exe 走命令行，或按默认 feature 重新构建（cargo build --release）。");
+            2
+        }
     } else {
         // 带参数时仍路由到 CLI（提示：图形版在终端里可能看不到输出，
         // 终端场景请改用 stool-cli.exe）

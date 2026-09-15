@@ -10,7 +10,7 @@ pub(crate) use eframe::egui;
 use egui::{Color32, RichText};
 
 pub(crate) use crate::engines::{self, Confidence, Detection, Op, OpOutcome, Registry};
-pub(crate) use crate::features::{memscan, preview, runtime, saves, tools_dl};
+pub(crate) use crate::features::{guard, memscan, preview, runtime, saves, tools_dl};
 
 mod pages;
 mod save_tree;
@@ -69,6 +69,22 @@ pub(crate) struct MsStatus {
 pub(crate) enum MsPending {
     WriteAll,
     Freeze,
+    ForceWrite,
+    /// 保护诊断会临时写入探测值（随后恢复原值），同样属于「动内存」。
+    GuardProbe,
+}
+
+/// 反修改保护诊断的后台任务状态。
+#[derive(Default)]
+pub(crate) struct GdStatus {
+    /// 地址诊断（写探测值 → 恢复）。
+    busy: bool,
+    msg: String,
+    report: Option<guard::ProbeReport>,
+    /// 页保护分布（只读遍历，与上面的诊断各自独立，互不干扰）。
+    regions_busy: bool,
+    regions_msg: String,
+    regions: Option<(Vec<guard::RegionStat>, guard::PageSummary)>,
 }
 
 /// 外部工具下载结果：`(工具名, 结果)`。
@@ -119,6 +135,11 @@ pub(crate) struct StoolApp {
     save_path_str: String,
     save_query: String,
     save_hits: Vec<String>,
+    /// 搜索结果行的**预计算缓存**（路径 / 值 / 类型），渲染时不再查树、不再格式化。
+    save_rows: Vec<SaveRow>,
+    /// 「检测到的存档位置 → 文件列表」缓存 + 指纹（避免每帧读盘）。
+    save_locs_files: Vec<(String, Vec<PathBuf>)>,
+    save_locs_key: String,
     /// 容器“显示更多”状态：路径 → 已额外展开的行数（把大容器分页，避免一次布局上千行）
     save_more: HashMap<String, usize>,
     /// 调试钩子（STOOL_SAVE_OPEN）：首帧自动展开顶层容器，便于截图/自动化
@@ -163,6 +184,14 @@ pub(crate) struct StoolApp {
     ms_ack: bool,
     /// 待确认的写内存动作。
     ms_pending: Option<MsPending>,
+    /// 锁值写入间隔（毫秒）。默认 150；「自适应锁值」会按诊断结果改写它。
+    ms_freeze_ms: u64,
+    /// 锁值只写这一个地址（None = 写所有命中）。保护诊断面板会用它锁定诊断过的地址。
+    ms_freeze_addr: Option<usize>,
+    /// 反修改保护诊断（地址 / 探测值 / 后台状态）。
+    gd_addr: String,
+    gd_probe: String,
+    gd_sh: Arc<Mutex<GdStatus>>,
     save_scope: saves::SearchScope,
 
     // ---- 资源预览 ----
@@ -239,7 +268,7 @@ impl Default for StoolApp {
             "preview" => Some(Page::Preview),
             _ => None,
         }).unwrap_or(Page::Home);
-        StoolApp {
+        let mut app = StoolApp {
             page,
             registry: Registry::new(),
             game_root: PathBuf::from("."),
@@ -266,6 +295,9 @@ impl Default for StoolApp {
             save_path_str: String::new(),
             save_query: String::new(),
             save_hits: Vec::new(),
+            save_rows: Vec::new(),
+            save_locs_files: Vec::new(),
+            save_locs_key: String::new(),
             save_more: HashMap::new(),
             save_auto_open: std::env::var("STOOL_SAVE_OPEN").is_ok(),
             save_sel: None,
@@ -302,6 +334,11 @@ impl Default for StoolApp {
             ms_freeze_stop: Arc::new(AtomicBool::new(false)),
             ms_ack: false,
             ms_pending: None,
+            ms_freeze_ms: 150,
+            ms_freeze_addr: None,
+            gd_addr: String::new(),
+            gd_probe: String::new(),
+            gd_sh: Arc::new(Mutex::new(GdStatus::default())),
             save_scope: saves::SearchScope::All,
 
             pv_dir_str: String::new(),
@@ -340,7 +377,39 @@ impl Default for StoolApp {
             unlock_filter: String::new(),
             unlock_route: None,
             engine_detail: Vec::new(),
+        };
+        // 调试/截图辅助：STOOL_PID=<pid> 预选内存扫描的目标进程（走与手动选进程完全相同的路径）
+        if let Some(pid) = std::env::var("STOOL_PID").ok().and_then(|v| v.parse::<u32>().ok()).filter(|p| *p != 0) {
+            app.ms_procs = crate::features::memscan::list_processes();
+            app.ms_pid = pid;
+            app.ms_pid_label = app
+                .ms_procs
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(p, n)| format!("{p} — {n}"))
+                .unwrap_or_else(|| format!("{pid} — (未知进程)"));
+            app.ms_open_scanner();
+            // 调试/截图辅助：STOOL_SCAN=<数值> 启动即跑一次「首次扫描」（配合 STOOL_PID 做无头验证）。
+            // 之所以需要它：修复前扫描会话从未被建立，GUI 的扫描路径一直没被真正跑过，得能自动验一遍。
+            if let Some(v) = std::env::var("STOOL_SCAN").ok().filter(|s| !s.trim().is_empty()) {
+                app.page = Page::Runtime;
+                app.ms_value = v;
+                app.ms_start_scan(true);
+            }
         }
+        // 调试/截图辅助：STOOL_SAVE=<存档文件> 启动即加载（走与拖入文件相同的加载结果通道）
+        if let Some(p) = std::env::var("STOOL_SAVE").ok().filter(|s| !s.trim().is_empty()) {
+            app.page = Page::Save;
+            app.save_path_str = p.clone();
+            let result = app.save_load_result.clone();
+            std::thread::spawn(move || {
+                let res = crate::features::saves::SaveDoc::load(std::path::Path::new(&p)).map_err(|e| e.to_string());
+                if let Ok(mut r) = result.lock() {
+                    *r = Some(res);
+                }
+            });
+        }
+        app
     }
 }
 
@@ -623,10 +692,6 @@ pub(crate) fn exec_op(
     csv: Option<&PathBuf>,
 ) -> OpOutcome {
     let registry = Registry::new();
-    let engine = match registry.get(plugin_id) {
-        Some(e) => e,
-        None => return OpOutcome::fail("插件不存在"),
-    };
     let cancel = shared.cancel.clone();
     let progress = |frac: f32, msg: &str| {
         if let Ok(mut p) = shared.progress.lock() {
@@ -634,18 +699,18 @@ pub(crate) fn exec_op(
         }
     };
     let ctx = engines::Ctx { root, out_dir: out, options: opts, progress: &progress, cancel: &cancel };
-    // 解包并行化（P2-2）：每次操作前清空「已建目录」缓存。
-    engines::clear_dir_cache();
-    match op {
-        Op::Extract => engine.extract(&ctx),
-        Op::Repack => engine.repack(&ctx, &root.join("stool_repack_src")),
-        Op::Decompile => engine.decompile(&ctx),
-        Op::Save => engine.save(&ctx),
-        Op::Unlock => engine.unlock(&ctx),
-        Op::TextExtract => engine.text_extract(&ctx, csv.unwrap_or(&out.join("text.csv"))),
-        Op::TextImport => engine.text_import(&ctx, csv.unwrap_or(&out.join("text.csv"))),
-        Op::TextInject => engine.text_inject(&ctx, csv.unwrap_or(&root.join("translation.json"))),
-    }
+    // 各入口的默认路径口径不同：egui 把回写源放在 <游戏>/stool_repack_src，
+    // 文本类默认落输出目录，JSON 注入默认读 <游戏>/translation.json。
+    let repack_src = root.join("stool_repack_src");
+    let csv_default = out.join("text.csv");
+    let tr_default = root.join("translation.json");
+    let paths = engines::OpPaths {
+        repack_src: &repack_src,
+        csv: csv.unwrap_or(&csv_default),
+        translation: csv.unwrap_or(&tr_default),
+    };
+    // 分发统一走内核单点，见 engines::exec_op。
+    engines::exec_op(&registry, plugin_id, op, &ctx, &paths)
 }
 
 impl eframe::App for StoolApp {
@@ -735,6 +800,7 @@ impl eframe::App for StoolApp {
                     Ok(d) => {
                         self.save_doc = Some(d);
                         self.save_hits.clear();
+                        self.save_rows.clear();
                         self.save_sel = None;
                         self.save_dirty = false;
                         self.save_more.clear();
@@ -746,6 +812,17 @@ impl eframe::App for StoolApp {
                                     self.save_sel_buf = doc.get(&sel).map(value_edit_text).unwrap_or_default();
                                 }
                                 self.save_sel = Some(sel);
+                            }
+                        }
+                        // 调试钩子：STOOL_SEARCH=<关键词> 载入后立刻搜一次，便于截图验证虚拟化结果列表
+                        if let Ok(q) = std::env::var("STOOL_SEARCH") {
+                            let q = q.trim().to_string();
+                            if !q.is_empty() {
+                                if let Some(doc) = self.save_doc.as_ref() {
+                                    self.save_query = q;
+                                    self.save_hits = doc.search(&self.save_query, self.save_scope);
+                                    self.save_rows = save_rows_of(doc, &self.save_hits);
+                                }
                             }
                         }
                         self.toast = Some(("存档加载完成".into(), std::time::Instant::now()));
@@ -879,7 +956,7 @@ impl eframe::App for StoolApp {
                 ui.separator();
                 ui.label(RichText::new(format!("输出: {}", short_text(&self.out_dir.display().to_string(), 46))).small());
                 if self.save_dirty {
-                    ui.label(RichText::new("存档未保存").small().color(Color32::from_rgb(230, 170, 60)));
+                    ui.label(RichText::new("存档未保存").small().color(C_WARN));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("📂 输出目录").clicked() {

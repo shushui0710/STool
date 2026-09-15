@@ -340,12 +340,58 @@ fn search_node(node: &serde_json::Value, prefix: &str, q: &str, scope: SearchSco
 }
 
 /// 标量值的文本表示（用于搜索命中），容器返回 None。
-fn value_text(v: &serde_json::Value) -> Option<String> {
+pub fn value_text(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 值 <-> 编辑文本：**唯一**口径
+//
+// 这三个原先只在 `gui/util.rs` 里。Tauri 侧要用就得抄一份，而「同一个意思、
+// 两处实现」正是日后行为漂移的来源（两个界面改同一字段却解析规则不同）。
+// 所以搬到这里做单一实现，`gui/util.rs` 只做转发。
+// ---------------------------------------------------------------------------
+
+/// 值 → 编辑框文本：字符串去引号，其余用 JSON 形式。
+pub fn value_edit_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 编辑框文本 → 值：true/false/null → 对应类型，数字 → 数值，其余 → 字符串。
+pub fn parse_edit_text(s: &str) -> serde_json::Value {
+    let t = s.trim();
+    match t {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        _ => {
+            if let Ok(i) = t.parse::<i64>() {
+                serde_json::json!(i)
+            } else if let Ok(f) = t.parse::<f64>() {
+                serde_json::json!(f)
+            } else {
+                serde_json::Value::String(s.to_string())
+            }
+        }
+    }
+}
+
+/// 值的类型提示（中文，供 UI 直接显示）；容器返回空串。
+pub fn type_hint(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::String(_) => "文本",
+        serde_json::Value::Number(_) => "数值",
+        serde_json::Value::Bool(_) => "布尔",
+        serde_json::Value::Null => "空",
+        _ => "",
     }
 }
 

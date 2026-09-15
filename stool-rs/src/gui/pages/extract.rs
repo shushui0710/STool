@@ -8,7 +8,9 @@ impl StoolApp {
     pub(crate) fn page_extract(&mut self, ui: &mut egui::Ui) {
         page_header(ui, "资源解包 / 封包", "");
         let Some(d) = self.selected_det().cloned() else {
-            ui.label("请先在首页完成检测。");
+            if need_detect(ui, "资源解包") {
+                self.page = Page::Home;
+            }
             return;
         };
         ui.label(format!("当前引擎: {} ({})", d.name, d.plugin_id));
@@ -56,7 +58,7 @@ impl StoolApp {
         if supports_unlock {
             ui.add_space(8.0);
             let spec = crate::features::unlock::spec_or_generic(&d.plugin_id);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            card(ui, |ui| {
                 ui.set_max_width(ui.available_width());
                 ui.label(
                     RichText::new("全 CG 解锁（统一抽象：自带存档 / 注册表 / 存档位 / 配置）")

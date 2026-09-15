@@ -9,7 +9,9 @@ impl StoolApp {
     pub(crate) fn page_text(&mut self, ui: &mut egui::Ui) {
         page_header(ui, "文本 / 汉化", "两条汉化通道：左=CSV 回填（改动游戏资源文件）；右=JSON 运行时注入（MTool 式，不改游戏文件）");
         let Some(d) = self.selected_det().cloned() else {
-            ui.label("请先在首页完成检测。");
+            if need_detect(ui, "文本 / 汉化") {
+                self.page = Page::Home;
+            }
             return;
         };
         ui.label(format!("当前引擎: {} ({})", d.name, d.plugin_id));

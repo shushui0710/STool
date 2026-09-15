@@ -26,6 +26,8 @@ impl StoolApp {
                 "MV/MZ 游戏：首页检测后进入本页自动启动并连接，改金币/变量/物品立即生效",
                 "其他游戏：用通用内存扫描，用法与 Cheat Engine 相同：首次扫描 → 变数值 → 再次扫描过滤 → 写入",
                 "扫描完成后可以“锁定数值”（游戏里改不掉）或“撤销写入”（恢复原值）",
+                "改完立刻被还原/改了没用？“方式二·五”诊断这个地址：区分周期回滚、只读页、副本覆盖、代码还原，方案里可直接「锁值 / 强制写入 / 写入数据源」",
+                "“页保护分布”只读看整块内存（不动游戏）：只读页、Guard 页、以及加壳特征「可写且可执行」页",
             ]),
             ("🧩 补丁 MOD", vec![
                 "选择补丁文件夹一键覆盖安装，可随时停用/卸载，卸载时自动还原原文件",
@@ -33,6 +35,7 @@ impl StoolApp {
             ("⌨ 命令行", vec![
                 "stool detect/extract/decompile/text-extract/text-import/save/unlock/mod-*",
                 "stool save-edit 存档文件 --search 关键词 / --set /路径=新值（脚本批量改存档）",
+                "stool guard <pid> --opt:addr=0x… --opt:type=i32（诊断反修改保护）/ stool guard-regions <pid>",
             ]),
             ("❓ 常见问题", vec![
                 "扫不到内存或打不开进程 → 以管理员身份运行 STool",
@@ -42,7 +45,7 @@ impl StoolApp {
         ];
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (title, lines) in sections {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                card(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new(title).strong());
                     for l in lines {
