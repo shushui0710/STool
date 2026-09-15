@@ -204,6 +204,13 @@
 | P2-11 | **UI 拆分**：`gui.rs` 按页拆成 `gui/pages/*.rs`，为后续功能腾出可读空间 | ✅ |
 | P2-12 | **C2 运行时注入**：定案为**文件级**（不进目标进程），KiriKiri 系走「patchN.xp3 运行时补丁包」，其余引擎按替代路线收敛 | ✅ |
 
+### P3｜反修改对抗（用户新提需求，见 §10）
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| P3-1 | **反修改保护识别**：针对「CE 改完立刻被还原 / 改了没用」，诊断地址被什么保护着并给可执行方案 | ✅ |
+| P3-2 | **诊断结论在 GUI 里可执行**：方案按钮化（锁值 / 强制写入 / 写数据源）+ 进程级页保护分布视图 | ✅ |
+
 ### 明确不做（沿用原方案边界）
 
 - 不做云服务/账号体系；机翻只走自有 key 或本地模型。
@@ -352,4 +359,38 @@
    另修一个**偶发测试竞态**：`pfs.rs` 的 `sample()` 被两个用例共用同一临时目录，`tmp()` 的先删后建在并行测试下互相踩踏。
 
 **门禁**：`cargo clippy --all-targets -- -D warnings` 零警告；`cargo test --tests` **228 项全过**
-（193 单元 + 9 模糊 + 4 并行 + 16 回环 + 6 流式，1 项需真实注册表的用例默认 `#[ignore]`）。
+（193 单元 + 9 模糊 + 4 并行 + 16 回环 + 6 流式，1 项需真实注册表的用例暂时 `#[ignore]`）。
+
+---
+
+## 10. 本轮增量：反修改保护识别（P3-1 / P3-2）
+
+**要解决的问题**（用户原话）：CE 改完数值**立刻被还原 / 改了没用**，希望工具能识别这类保护机制
+并给出可行应对方案。这是"内存修改器"常见却没人正面回答的一类问题：普通扫描器只会说"写入成功"。
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| **共享内存 API 抽取** | `src/memapi.rs`：`Proc` RAII 句柄 + 裸句柄自由函数（`read_raw/write_raw/query_raw/region_raw/protect_raw/force_write_raw`）+ 页保护/类型名字映射；`memscan` 与 `guard` 共用，不再各写一套 Win32 调用 | `memscan` 回归全过；`force_write_raw` 有单测 |
+| **诊断引擎** | `src/features/guard.rs`：写入-存活探测（`Verdict` 稳定/立即/周期/延迟）→ 两次写入差分（`Rewrite` XOR/偏移/常量/不透明）→ 同值镜像 + 数据源反测 → 页保护汇总 → 保护机制线索（模块名单 + PE 导入表反调试 API）→ 可执行区立即数写入点扫描 → 按 `Feasibility` 生成 `Plan` | `features/guard_tests.rs` 单测覆盖每条判定、指令解码、方案生成、PE 导入表解析、报告渲染 |
+| **不改页面也能写** | `force_write_raw`：普通写失败 → `VirtualProtectEx` 临时改可写 → 写 → 恢复原保护（返回 `PageFix`） | 真机 `readonly` 靶子模式验证 |
+| **反测的安全约束**（P3-2 补齐） | `pick_writable_mirrors`：只试「可写**且不可执行**」的副本，每个立刻恢复，最多 24 个；一个都没试成要如实说明 | 4 项单测 + 真机报告文案 |
+| **CLI** | `stool guard <pid\|名> --opt:addr= … [--opt:type/probe/window/rounds/no-mirror/no-code]`、`stool guard-regions <pid> [--opt:max=]` | 真机冒烟 + 6 条错误路径（缺地址/非法地址/不存在进程/文本类型/参数不足 → 退出码 2 或 1） |
+| **GUI（P3-2）** | 「运行时修改」页新增**方式二·五**：地址/探测值 + 诊断按钮 + 四条事实表 + 方案清单（**按钮化**：按周期锁值 / 强制写入该地址 / 写入这个数据源）+ **页保护分布**（只读遍历，报 RWX 页并展开区域明细）；命中列表每条带「诊断」按钮 | `clippy --all-targets` 编译通过；真机冒烟覆盖 |
+| **硬边界** | 识别到在线反作弊（EAC / BattlEye / Vanguard / ACE）**只给风险提示，不提供绕过**；探测只写探测值、每轮恢复原值，零持久副作用 | 单测 `online_anticheat_is_first_and_not_advised` |
+
+**真机验证（受控靶子，非合成数据）**：`scripts/mock_mem_guard.py`（`VirtualAlloc` 独占一页放整数，
+`none`/`periodic`/`fast`/`readonly`/`constant` 五种模式）+ `scripts/_guard_smoke.sh` 端到端：
+
+| 靶子模式 | 期望 | 实测 |
+|---|---|---|
+| `none` | 判定"稳定"、提示问题在别处 | ✅ |
+| `periodic`（10ms 回写） | 周期性回滚 + 自适应锁值 | ✅ 间隔 10.4ms → 锁值 3ms |
+| `fast`（1ms 回写） | 周期性回滚 | ✅ 间隔 1.2ms → 锁值 1ms |
+| `readonly` | 页只读 → 强制写入 | ✅ |
+| `constant`（只读页 + 1ms 自写回） | 页只读 + 周期回滚 | ✅ |
+
+**定案记录**：判定阈值靠真机校准 —— `classify_revert` 用「有一轮存活满窗口」区分周期/延迟回滚
+（否则 1ms 回滚会被误判成"立即回滚"）；`recommended_period_ms` 间隔 <1ms 时不给锁值方案（压不住）。
+
+**门禁**：`cargo clippy --all-targets -- -D warnings` 零警告；`cargo test --tests` **278 项全过**
+（243 单元 + 9 模糊 + 4 并行 + 16 回环 + 6 流式，1 项需真实注册表的用例默认 `#[ignore]`）。

@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STool 界面预览（假数据）</title>
+<link rel="stylesheet" href="src/css/tokens.css">
+<link rel="stylesheet" href="src/css/app.css">
+</head>
+<body>
+
+<!--
+  这是**界面预览**，不是真实运行：
+  用的就是 stool-tauri/src/ 下的同一套 HTML/CSS/JS，只是把 window.__TAURI__ 换成了
+  一个内存假后端（下面那个脚本块），于是不需要 WebView2 也能看到界面长什么样。
+  真实运行请用 stool-tauri.exe。
+-->
+
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-mark">S</div>
+      <div class="brand-text"><b>STool</b><span>游戏汉化工具箱</span></div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot">
+      <button class="game-chip" id="gameChip" type="button" hidden>
+        <span class="game-chip-k">当前游戏</span>
+        <span class="game-chip-v" id="gameChipName"></span>
+      </button>
+      <button class="btn btn-ghost btn-sm btn-block" id="themeBtn" type="button">深色模式</button>
+      <div class="ver" id="ver"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-text">
+        <h1 class="page-title" id="pageTitle"></h1>
+        <p class="page-sub" id="pageSub"></p>
+      </div>
+      <div class="topbar-actions" id="topActions"></div>
+    </header>
+    <section class="content" id="content"></section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+/* ---- 假后端：把 Rust 命令换成内存实现，只为预览界面 ---- */
+(function () {
+  const GAME = "D:\\Games\\示例游戏 - 汉化测试版";
+  const OUT = GAME + "\\_extracted";
+
+  // 假事件总线：对应 Rust 侧的 app.emit("op:progress", ...)
+  const listeners = {};
+  function emit(ev, payload) {
+    (listeners[ev] || []).slice().forEach((cb) => {
+      try {
+        cb({ payload });
+      } catch (_) {}
+    });
+  }
+
+  // 假存档树（形状贴近 RPG Maker MV 存档）
+  let SAVE = {
+    gold: 12345,
+    level: 27,
+    exp: 8421,
+    hp: 640,
+    mp: 210,
+    system: { saveCount: 14, frameCount: 992813, versionId: 8123122 },
+    party: { _gold: 12345, _items: { 1: 12, 2: 3, 7: 1 }, _actors: [1, 2, 3, 5] },
+    switches: { 1: true, 12: false, 43: true, 88: true },
+    variables: { 1: 100, 2: 0, 3: 7, 12: 250, 44: 3 },
+    player: { x: 23, y: 41, dir: 2 },
+    map: { _mapId: 12, name: "旧校舍 3F" },
+  };
+
+  const kindOf = (v) =>
+    typeof v === "string" ? "str" : typeof v === "number" ? "num" : typeof v === "boolean" ? "bool" : "other";
+  const tyOf = (v) =>
+    typeof v === "string" ? "文本" : typeof v === "number" ? "数值" : typeof v === "boolean" ? "布尔" : "";
+
+  function flatten(node, prefix, out) {
+    if (node === null || typeof node !== "object") return;
+    for (const [k, v] of Object.entries(node)) {
+      const p = prefix + "/" + k;
+      out.push({
+        path: p,
+        key: k,
+        value: typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v),
+        kind: kindOf(v),
+        ty: tyOf(v) || "容器",
+      });
+      flatten(v, p, out);
+    }
+  }
+  const allRows = () => {
+    const out = [];
+    flatten(SAVE, "", out);
+    return out;
+  };
+
+  function setByPath(ptr, raw) {
+    const parts = ptr.split("/").filter(Boolean);
+    let node = SAVE;
+    for (let i = 0; i < parts.length - 1; i++) node = node[parts[i]];
+    const last = parts[parts.length - 1];
+    let v = raw.trim();
+    if (v === "true") v = true;
+    else if (v === "false") v = false;
+    else if (v !== "" && !isNaN(Number(v))) v = Number(v);
+    if (node && typeof node === "object") node[last] = v;
+    return allRows().find((r) => r.path === ptr) || null;
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ---- 假素材目录：对应 Rust 侧 scan_media / read_media -------------------
+  // 字段与真实 MediaRow 对齐（name/rel/path/kind/size/renderable），
+  // 外加两个只给假后端用的私有字段（_color / _body / _enc）。
+  const IMG = (name, rel, size, color, renderable = true) => ({
+    name, rel, path: GAME + "\\" + rel, kind: "image", size, renderable, _color: color,
+  });
+  const AUD = (name, rel, size) => ({
+    name, rel, path: GAME + "\\" + rel, kind: "audio", size, renderable: true,
+  });
+  const TXT = (name, rel, size, body, enc) => ({
+    name, rel, path: GAME + "\\" + rel, kind: "text", size, renderable: true, _body: body, _enc: enc,
+  });
+
+  const KS_JP = [
+    "*start",
+    "【朔】",
+    "　おはよう。今日もいい天気だね。",
+    "【樹】",
+    "　うん、ちょっと早起きしすぎたかな。",
+    "【朔】",
+    "　それじゃ、行こうか。",
+    "",
+    "*choice_01",
+    "　放課後はどうする？",
+  ].join("\n");
+
+  const MEDIA = [
+    IMG("bg_title.png", "www/img/titles/bg_title.png", "1.2 MB", "#2b6cb0"),
+    IMG("cg_01_heroine.png", "www/img/pictures/cg_01_heroine.png", "2.4 MB", "#c05621"),
+    IMG("cg_02_school.png", "www/img/pictures/cg_02_school.png", "1.9 MB", "#2f855a"),
+    IMG("cg_03_night.png", "www/img/pictures/cg_03_night.png", "2.1 MB", "#4c51bf"),
+    IMG("akari.png", "www/img/faces/akari.png", "96 KB", "#b83280"),
+    IMG("logo.tga", "www/img/system/logo.tga", "512 KB", "#718096", false),
+    IMG("title_back.tif", "www/img/titles/title_back.tif", "3.3 MB", "#4a5568", false),
+    AUD("theme_main.ogg", "www/audio/bgm/theme_main.ogg", "4.1 MB"),
+    AUD("bgm_school_day.ogg", "www/audio/bgm/bgm_school_day.ogg", "3.6 MB"),
+    AUD("bgm_battle.ogg", "www/audio/bgm/bgm_battle.ogg", "3.2 MB"),
+    AUD("se_click.ogg", "www/audio/se/se_click.ogg", "18 KB"),
+    TXT("scene01.ks", "scenario/scene01.ks", "38 KB", KS_JP, "Shift-JIS"),
+    TXT("scene02.ks", "scenario/scene02.ks", "41 KB", KS_JP, "Shift-JIS"),
+    TXT("System.json", "www/data/System.json", "6.2 KB", '{\n  "gameTitle": "示例游戏",\n  "versionId": 8123122,\n  "locale": "ja_JP"\n}', "UTF-8"),
+    TXT("README.txt", "README.txt", "1.1 KB", "STool 预览假数据\n这些文件并不真实存在。", "UTF-8"),
+  ];
+
+  // 预览用的图片：现场画一张 SVG 当素材，省得往 HTML 里塞几 MB base64
+  function svgDataUrl(color, label) {
+    const w = 640, h = 400;
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">` +
+      `<rect width="${w}" height="${h}" fill="${color}"/>` +
+      `<rect x="24" y="24" width="${w - 48}" height="${h - 48}" fill="none" stroke="rgba(255,255,255,.35)" stroke-width="2"/>` +
+      `<text x="${w / 2}" y="${h / 2}" font-family="sans-serif" font-size="38" fill="#fff" text-anchor="middle" dominant-baseline="middle">${label}</text>` +
+      `</svg>`;
+    try {
+      return "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)));
+    } catch (_) {
+      return "data:image/svg+xml," + encodeURIComponent(svg);
+    }
+  }
+
+  // 预览用的音频：一段 0.05 秒的静音 WAV，让 <audio> 控件是"能放"的正常样子
+  function tinyWav() {
+    const rate = 8000, samples = 400;
+    const buf = new ArrayBuffer(44 + samples);
+    const dv = new DataView(buf);
+    const w = (o, s) => {
+      for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i));
+    };
+    w(0, "RIFF"); dv.setUint32(4, 36 + samples, true); w(8, "WAVE");
+    w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, rate, true); dv.setUint32(28, rate, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);
+    w(36, "data"); dv.setUint32(40, samples, true);
+    for (let i = 0; i < samples; i++) dv.setUint8(44 + i, 128);
+    let bin = "";
+    const u8 = new Uint8Array(buf);
+    for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    return "data:audio/wav;base64," + btoa(bin);
+  }
+
+  // 假表格统计：96 已翻 / 32 待翻，前几条给预览表填上具体内容
+  const CSV_STATS = {
+    exists: true,
+    path: GAME + "\\_extracted\\text.csv",
+    total: 128,
+    done: 96,
+    todo: 32,
+    sample: [
+      { file: "scenario/scene01.ks", key: "*start", source: "【朔】おはよう。今日もいい天気だね。", target: "【朔】早上好。今天天气也不错呢。", done: true },
+      { file: "scenario/scene01.ks", key: "*start", source: "【樹】うん、ちょっと早起きしすぎたかな。", target: "【树】嗯，可能是起得有点太早了。", done: true },
+      { file: "scenario/scene01.ks", key: "*choice_01", source: "　放課後はどうする？", target: "　放学后做什么？", done: true },
+      { file: "scenario/scene02.ks", key: "*night", source: "　静かな夜だった。", target: "", done: false },
+      { file: "www/data/Map001.json", key: "message", source: "ここは旧校舎の三階だ。", target: "", done: false },
+    ],
+  };
+
+  // ⑥ 内存扫描会话的可变状态：扫描 → 再次扫描 → 写入会依次改它，
+  // 预览里也演一遍这条链路（否则界面永远是「还没扫描」的空状态）。
+  let RUNTIME_SCAN = {
+    active: false,
+    pid: 0,
+    proc_name: "",
+    ty: "i32",
+    ty_label: "",
+    first_done: false,
+    hits: 0,
+    readonly_hits: 0,
+    can_undo: false,
+    frozen: false,
+    freeze_period_ms: 0,
+    list: [],
+    truncated: false,
+    bytes: 4,
+    numeric: true,
+  };
+
+  // ⑧ 装MOD：可变状态。默认带两个互相抢文件的 MOD，好在首屏就演一遍「冲突告警」。
+  const CONFLICT_ROWS = [
+    { rel: "Data/CommonEvents.rvdata2", mods: ["汉化补丁", "剧情魔改"] },
+    { rel: "Graphics/Pictures/title.png", mods: ["汉化补丁", "高清材质"] },
+  ];
+  let MODS = {
+    mods: [
+      {
+        name: "汉化补丁",
+        enabled: true,
+        files: 42,
+        overwritten: 18,
+        file_list: [
+          "Data/CommonEvents.rvdata2",
+          "Data/Map001.rvdata2",
+          "Data/Map002.rvdata2",
+          "Graphics/Pictures/title.png",
+          "Graphics/Pictures/logo.png",
+          "Audio/BGM/title.ogg",
+        ],
+      },
+      {
+        name: "高清材质",
+        enabled: true,
+        files: 7,
+        overwritten: 7,
+        file_list: [
+          "Graphics/Pictures/title.png",
+          "Graphics/Characters/hero.png",
+          "Graphics/Characters/heroine.png",
+        ],
+      },
+      {
+        name: "跳过战斗动画",
+        enabled: false,
+        files: 1,
+        overwritten: 1,
+        file_list: ["Data/System.rvdata2"],
+      },
+    ],
+    conflicts: CONFLICT_ROWS,
+    store_dir: (GAME || "") + "\\stool_mods",
+    conflict_count: CONFLICT_ROWS.length,
+  };
+
+  // ⑨ 工具箱：一份可变设置 + 体检/自检结果 + 日志尾部。
+  let TOOLS = {
+    output_dir: "D:\\Games\\_stool_out",
+    tools: [
+      { key: "wolfdec", label: "WolfDec.exe", hint: "解 Wolf RPG 的封包", path: "C:\\Users\\me\\.stool\\tools\\WolfDec.exe", downloadable: true },
+      { key: "asset_ripper", label: "AssetRipper", hint: "解 Unity 的封包", path: "", downloadable: true },
+      { key: "garbro", label: "GARbro", hint: "认不出格式时的兜底解包", path: "", downloadable: true },
+      { key: "gdre_tools", label: "GDRE Tools", hint: "反编译 Godot 的脚本", path: "", downloadable: true },
+      { key: "unrpyc", label: "unrpyc.py", hint: "反编译 Ren'Py 的脚本", path: "C:\\Users\\me\\.stool\\tools\\unrpyc.py", downloadable: true },
+      { key: "python", label: "Python", hint: "上面两个脚本工具要用它来跑", path: "C:\\Python313\\python.exe", downloadable: false },
+      { key: "proxy", label: "代理", hint: "下载工具时走它（形如 http://127.0.0.1:7890）", path: "http://127.0.0.1:7892", downloadable: false },
+    ],
+    mtl_base_url: "https://api.deepseek.com/v1/chat/completions",
+    mtl_model: "deepseek-chat",
+    mtl_key_set: true,
+    proxy: "http://127.0.0.1:7892",
+    config_path: "C:\\Users\\me\\AppData\\Roaming\\stool\\config.json",
+  };
+
+  const HEALTH_OK = {
+    summary: "体检完成：1 项提示，未发现阻断性问题。",
+    ok: true,
+    items: [
+      { level: "ok", name: "写权限", detail: "游戏目录可写", fix: "" },
+      { level: "ok", name: "路径长度", detail: "路径不含特殊字符，长度正常", fix: "" },
+      { level: "warn", name: "游戏占用", detail: "游戏当前正在运行", fix: "改文件前先退出游戏，否则改动可能被覆盖。" },
+    ],
+    text: "✔ 写权限: 游戏目录可写\n✔ 路径长度: 路径不含特殊字符，长度正常\n⚠ 游戏占用: 游戏当前正在运行\n    修法: 改文件前先退出游戏，否则改动可能被覆盖。",
+  };
+  const HEALTH_BAD = {
+    summary: "体检发现问题，见下（按「修法」处理即可）。",
+    ok: false,
+    items: [
+      { level: "ok", name: "写权限", detail: "游戏目录可写", fix: "" },
+      { level: "fail", name: "非 Unicode 程序语言", detail: "当前是「简体中文」，老日文游戏可能显示乱码", fix: "把「非 Unicode 程序语言」改成「日语(日本)」后重启电脑。" },
+      { level: "warn", name: "日文字体", detail: "系统缺少日文字体，日文可能显示成方块", fix: "安装一个日文字体（如 Noto Sans JP）即可。" },
+    ],
+    text: "✔ 写权限: 游戏目录可写\n✘ 非 Unicode 程序语言: 当前是「简体中文」\n    修法: 改成「日语(日本)」后重启\n⚠ 日文字体: 系统缺少日文字体\n    修法: 安装 Noto Sans JP",
+  };
+  const SELFCHECK_ROWS = {
+    summary: "自检通过：2 个封包往返一致。",
+    ok: true,
+    items: [
+      { level: "ok", name: "data.xp3", detail: "解包→重打包→回读，逐条目一致", fix: "" },
+      { level: "ok", name: "patch.xp3", detail: "解包→重打包→回读，逐条目一致", fix: "" },
+    ],
+    text: "✔ data.xp3: 一致\n✔ patch.xp3: 一致",
+  };
+
+  const LOG_LINES = [
+    "[20:23:01] ▶ STool 启动（内核 0.6.4）",
+    "[20:23:01] ✔ 配置载入完成",
+    "[20:23:03] ▶ 检测游戏 D:\\Games\\示例游戏 - 汉化测试版",
+    "[20:23:05] ✔ 识别为 KiriKiri（置信度 92%）",
+    "[20:23:12] ▶ 取出素材 → D:\\Games\\_stool_out",
+    "[20:23:41] ✔ 取出 1234 个文件",
+    "[20:24:02] ▶ 文本提取 data.xp3",
+    "[20:24:30] ✔ 提取台词 8421 条",
+    "[20:25:10] ▶ 机翻（deepseek-chat，并发 2）",
+    "[20:25:55] ⚠ 机翻第 128 条超时，重试中…",
+    "[20:26:03] ✔ 机翻完成，共 8421 条",
+    "[20:26:20] ▶ 回填 data.xp3",
+    "[20:26:58] ✔ 回填完成，原文件已备份为 data.xp3.stool.bak",
+  ];
+
+  const MOCK = {
+    app_info: { name: "STool", version: "预览", core_version: "假数据" },    log_line: null,
+    // 预览时直接给一个游戏，省得每次先点一遍「选游戏」（真实运行下这两个是环境变量钩子）
+    env_game_root: GAME,
+    env_save_path: null,
+    env_query: "",
+    env_out_dir: OUT,
+    pick_folder: GAME,
+    detect_game: {
+      root: GAME,
+      engine_id: "rpgmaker_mv",
+      engine_name: "RPG Maker MV",
+      score: 92,
+      level: "high",
+      confidence: "高置信",
+      confirmed: true,
+      summary: "RPG Maker MV 游戏",
+      verdict: "没问题，这个游戏 STool 能处理。下面是可以直接做的事。",
+      notes: "",
+      evidence: ["找到 www/data/System.json（MV 数据目录特征）", "找到 www/js/rpg_core.js（MV 运行时）", "找到 Game.exe + nw.js 结构"],
+      capabilities: [
+        { id: "extract", label: "资源解包" },
+        { id: "text_extract", label: "文本提取" },
+        { id: "text_inject", label: "JSON 注入汉化" },
+        { id: "save", label: "存档编辑" },
+        { id: "unlock", label: "解锁辅助" },
+      ],
+      alternatives: [{ name: "RPG Maker MZ", score: 38, confidence: "疑似（证据不足）" }],
+      elapsed_ms: 41,
+    },
+
+    // 解包：真的走一遍「推进度 → 返回结果」，好让预览里能看见进度条在动
+    extract_assets: async () => {
+      const dirs = ["www/img/pictures/", "www/audio/bgm/", "www/data/", "www/js/", "www/img/faces/"];
+      for (let i = 0; i < 42; i++) {
+        emit("op:progress", {
+          frac: (i + 1) / 45,
+          msg: dirs[i % dirs.length] + "文件" + (i + 1) + ".png",
+        });
+        await sleep(45);
+      }
+      emit("op:progress", { frac: 1, msg: "完成" });
+      return { success: true, message: "解包 1234 个文件", files_done: 1234, out_dir: OUT, logs: [] };
+    },
+    repack_assets: async () => {
+      for (let i = 0; i < 20; i++) {
+        emit("op:progress", { frac: (i + 1) / 22, msg: "写回 data/Map00" + i + ".json" });
+        await sleep(45);
+      }
+      emit("op:progress", { frac: 1, msg: "完成" });
+      return { success: true, message: "重新打包完成", files_done: 320, out_dir: "", logs: [] };
+    },
+    cancel_task: true,
+    open_folder: null,
+
+    // ③ 看素材：按 kind 过滤后返回；total = 该类型的命中数（与真实内核一致）
+    scan_media: (a) => {
+      const k = a.kind || "all";
+      const pick = MEDIA.filter((m) => k === "all" || m.kind === k);
+      const files = pick.map((m) => ({
+        name: m.name, rel: m.rel, path: m.path,
+        kind: m.kind, size: m.size, renderable: m.renderable,
+      }));
+      return { dir: a.dir, files, total: pick.length, elapsed_ms: 34 };
+    },
+    read_media: (a) => {
+      const m = MEDIA.find((x) => x.path === a.path);
+      if (!m) {
+        return { kind: "other", mime: "", data_url: "", text: "", encoding: "", size: "", truncated: false };
+      }
+      if (m.kind === "image") {
+        return {
+          kind: "image", mime: "image/png", data_url: svgDataUrl(m._color, m.name),
+          text: "", encoding: "", size: m.size, truncated: false,
+        };
+      }
+      if (m.kind === "audio") {
+        return {
+          kind: "audio", mime: "audio/wav", data_url: tinyWav(),
+          text: "", encoding: "", size: m.size, truncated: false,
+        };
+      }
+      return {
+        kind: "text", mime: "text/plain", data_url: "",
+        text: m._body, encoding: m._enc, size: m.size, truncated: false,
+      };
+    },
+    open_file: null,
+
+    save_locations: [{ label: "游戏目录/save", path: GAME + "\\save" }],
+    save_files: [
+      { name: "file1.rpgsave", path: GAME + "\\save\\file1.rpgsave", size: "21.4 KB", age: "3 小时前" },
+      { name: "file2.rpgsave", path: GAME + "\\save\\file2.rpgsave", size: "19.8 KB", age: "1 天前" },
+      { name: "global.rpgsave", path: GAME + "\\save\\global.rpgsave", size: "2.1 KB", age: "1 天前" },
+    ],
+    load_save: {
+      path: GAME + "\\save\\file1.rpgsave",
+      format: "RPG Maker MV 存档（lz-string）",
+      writable: true,
+      top_fields: 8,
+    },
+    pick_and_load_save: null,
+    search_save: (a) => {
+      const q = String(a.query || "").toLowerCase();
+      if (!q) return [];
+      return allRows()
+        .filter((r) =>
+          a.scope === "keys"
+            ? r.key.toLowerCase().includes(q)
+            : a.scope === "values"
+            ? r.value.toLowerCase().includes(q)
+            : r.key.toLowerCase().includes(q) || r.value.toLowerCase().includes(q)
+        )
+        .slice(0, 500);
+    },
+    set_save_value: (a) => setByPath(a.ptr, a.raw),
+    save_dirty: false,
+    commit_save: "已写回 " + GAME + "\\save\\file1.rpgsave（备份 file1.rpgsave.stool.bak）",
+
+    // 备份与还原：内核的 find_backups 是「在目录里找 .stool.bak」，
+    // 假后端照同样的规则来 —— 按目录前缀过滤，别回一堆不属于这个目录的。
+    restore_list: (a) => {
+      if (window.__MOCK_NO_BAK__) return [];
+      const all = [
+        { name: "file1.rpgsave.stool.bak", path: GAME + "\\save\\file1.rpgsave.stool.bak", size: "21.4 KB", age: "2 分钟前" },
+        { name: "file2.rpgsave.stool.bak", path: GAME + "\\save\\file2.rpgsave.stool.bak", size: "19.8 KB", age: "1 天前" },
+        { name: "data.xp3.stool.bak", path: GAME + "\\data.xp3.stool.bak", size: "128.6 MB", age: "3 天前" },
+      ];
+      const dir = String(a.dir || "");
+      return all.filter((b) => b.path.startsWith(dir));
+    },
+    restore_one: (a) => "已还原 " + a.bak.replace(/\.stool\.bak$/, "") + "（备份保留，可再次还原）",
+
+    // ---- ④ 翻译文字 ------------------------------------------------------
+    // 假表格：列约定与内核一致（id,file,key,原文,译文），前几条已翻、后面留空，
+    // 这样「已翻/待翻」的统计和预览表都能看出效果。
+    pick_file: GAME + "\\_extracted\\text.csv",
+    shell_open: null,
+    text_extract: async () => {
+      const dirs = ["scenario/scene01.ks", "scenario/scene02.ks", "www/data/Map001.json"];
+      for (let i = 0; i < 30; i++) {
+        emit("op:progress", { frac: (i + 1) / 32, msg: "提取 " + dirs[i % dirs.length] });
+        await sleep(40);
+      }
+      emit("op:progress", { frac: 1, msg: "完成" });
+      return {
+        success: true,
+        message: "从 3 个文件里提取出 128 条台词。",
+        files_done: 3,
+        csv: { ...CSV_STATS, exists: true },
+      };
+    },
+    text_import: async () => {
+      for (let i = 0; i < 20; i++) {
+        emit("op:progress", { frac: (i + 1) / 22, msg: "写回 scenario/scene01.ks" });
+        await sleep(45);
+      }
+      emit("op:progress", { frac: 1, msg: "完成" });
+      return { success: true, message: "已把 96 条译文写回游戏（原文件已备份）。", files_done: 3, csv: CSV_STATS };
+    },
+    csv_stats: () => CSV_STATS,
+    text_stats: () => ({
+      inject_supported: true,
+      inject_mechanism:
+        "安装 js/plugins/stool_translate.js 并登记进 plugins.js，运行时在内存里替换数据库与显示文本",
+      inject_limits: "首次注入会备份 plugins.js 后追加一条；仅覆盖 JS 文本，图片内文字不在范围内",
+      installed: false,
+      entries: 0,
+      json_path: GAME + "\\stool_translate.json",
+    }),
+    text_make_json: () => ({ ...CSV_STATS, total: 128, done: 96, todo: 32 }),
+    // 文案照内核 inject.rs 的真实返回格式写 —— 假后端要像真后端，否则界面上看到的
+    // 就不是用户实际会得到的反馈（之前吃过的教训）。
+    text_inject: () => ({
+      success: true,
+      message: "注入完成：96 条翻译已挂载（32 条空译文跳过，保留原文）。重新启动游戏生效。",
+      installed: true,
+      entries: 96,
+    }),
+    text_uninject: () => ({
+      success: true,
+      message: "已从备份还原 plugins.js；已从 plugins.js 移除注入条目。重新启动游戏生效。",
+      installed: false,
+      entries: 0,
+    }),
+    mtl_save: null,
+    text_mtl: async () => {
+      for (let i = 0; i < 24; i++) {
+        emit("op:progress", { frac: (i + 1) / 26, msg: "机翻中 " + (i * 4) + "/96" });
+        await sleep(45);
+      }
+      emit("op:progress", { frac: 1, msg: "完成" });
+      return { done: 96, todo: 0, csv: CSV_STATS };
+    },
+
+    // ⑦ 解锁全CG：一个「有自带存档、手段齐全」的典型局面，好把三张卡都填满。
+    unlock_plan: {
+      engine_id: "rpgmaker_mv",
+      known: true,
+      basis: "data/Actors.json + js/rpg_core.js（或 game.rpgproject）",
+      action: "替换 www/save/ 下 Save*.rpgsave；或改 js 插件里的回廊开关",
+      note: "存档是明文 JSON（.rpgsave），可直接搜 unlock/gallery 字段",
+      routes: [
+        { key: "bundled", label: "替换自带全CG存档", desc: "把网盘包附带的《全CG存档》按同名复制进存档目录（不动游戏文件，与引擎无关）", automated: true, recommended: true },
+        { key: "config", label: "改配置文件开关", desc: "改 json / ini / xml 等配置文件里的解锁开关", automated: true, recommended: false },
+        { key: "ingame", label: "游戏内全开开关", desc: "不少作品在设置 / 隐藏界面留了 toggle，打开即全解锁（需人工找）", automated: false, recommended: false },
+      ],
+      bundled: [
+        "全CG存档\\file1.rpgsave",
+        "全CG存档\\file2.rpgsave",
+        "全CG存档\\global.rpgsave",
+      ],
+      bundled_dirs: [GAME + "\\全CG存档"],
+      save_dirs: [GAME + "\\www\\save", GAME + "\\save"],
+      default_route: "bundled",
+      default_route_label: "替换自带全CG存档",
+    },
+    unlock_backups: [
+      GAME + "\\www\\save\\file1.rpgsave.stool.bak",
+      GAME + "\\www\\save\\file2.rpgsave.stool.bak",
+    ],
+    unlock_restore: "已还原 " + GAME + "\\www\\save\\file1.rpgsave（备份保留，可再次还原）",
+    unlock_run: async (a) => {
+      if (!a.apply) {
+        return {
+          success: true,
+          message:
+            "【自带全CG存档 · 只读预览】发现 3 个候选文件（未复制）\n" +
+            "  1. 全CG存档\\file1.rpgsave\n  2. 全CG存档\\file2.rpgsave\n" +
+            "  3. 全CG存档\\global.rpgsave\n" +
+            '目标存档目录: ["' + GAME + '\\\\www\\\\save"]\n' +
+            "→ 确认后加 --opt:apply=1 复制；被覆盖的存档会先备份为 .stool.bak。",
+          files_done: 3,
+          out_dir: "",
+          logs: [],
+        };
+      }
+      // 勾了确认就演一遍「复制 → 进度 → 完成」
+      for (let i = 0; i < 6; i++) {
+        emit("op:progress", {
+          frac: (i + 1) / 7,
+          msg: GAME + "\\www\\save\\file" + (i + 1) + ".rpgsave",
+        });
+        await sleep(60);
+      }
+      emit("op:progress", { frac: 1, msg: "完成" });
+      return {
+        success: true,
+        message:
+          "✔ 已替换自带全CG存档：复制 3 个文件（失败 0，覆盖前备份 2 个）\n" +
+          '目标目录: ["' + GAME + '\\\\www\\\\save"]\n' +
+          "提示：启动游戏查看画廊/CG 回廊是否全开；若仍缺项，说明该存档不含全部条目。",
+        files_done: 3,
+        out_dir: "",
+        logs: ["已备份 " + GAME + "\\www\\save\\file1.rpgsave → …\\file1.rpgsave.stool.bak"],
+      };
+    },
+
+    // ⑥ 游戏里改数值
+    runtime_options: {
+      types: [
+        { key: "i32", label: "4 字节", hint: "最常用。金币、经验、等级、好感度绝大多数是这种。", bytes: 4, numeric: true },
+        { key: "i64", label: "8 字节", hint: "数值超过 21 亿（如累计经验、时间戳）时用它。", bytes: 8, numeric: true },
+        { key: "f32", label: "小数（4 字节）", hint: "显示成 12.5 这类小数、且不像血量整数时用。", bytes: 4, numeric: true },
+        { key: "f64", label: "小数（8 字节）", hint: "高精度小数，少见；前三种都不中再来试。", bytes: 8, numeric: true },
+        { key: "utf8", label: "文本（UTF-8）", hint: "搜玩家名、存档里的英文字符串。", bytes: 0, numeric: false },
+        { key: "utf16", label: "文本（UTF-16）", hint: "搜中文 / 日文名字符串。", bytes: 0, numeric: false },
+      ],
+      filters: [
+        { key: "exact", label: "等于", hint: "再输入一个数，只留「现在正好等于它」的地址。" },
+        { key: "changed", label: "变了", hint: "只留「和上次扫描比变过」的地址。" },
+        { key: "unchanged", label: "没变", hint: "只留「和上次扫描完全一样」的地址。" },
+        { key: "increased", label: "变大了", hint: "只留「变大了」的地址。" },
+        { key: "decreased", label: "变小了", hint: "只留「变小了」的地址。" },
+      ],
+    },
+    runtime_mvmz_status: {
+      applicable: true,
+      exe: GAME + "\\Game.exe",
+      port_open: false,
+      port: 7654,
+      note: "点「启动并连接」：STool 会用调试参数打开游戏（游戏窗口会正常弹出），再自动连上。",
+    },
+    runtime_mvmz_connect: {
+      ready: true,
+      gold: 12345,
+      note: "已连接 · 金币 12345 · 变量 128 个 · 开关（开）36 个 · 持有物品 12 种",
+      variables: [
+        { id: 1, name: "主角好感度", value: "100" },
+        { id: 2, name: "进度标记", value: "0" },
+        { id: 3, name: "旧校舍钥匙", value: "7" },
+        { id: 12, name: "学生的好感度", value: "250" },
+        { id: 44, name: "当前章节", value: "3" },
+        { id: 61, name: "主角名字", value: "雪村透" },
+      ],
+      switches: [
+        { id: 1, name: "拿到初始装备", on: true },
+        { id: 12, name: "CG 回廊全开", on: true },
+        { id: 43, name: "隐藏结局解锁", on: true },
+        { id: 88, name: "二周目已开启", on: true },
+      ],
+      items: [
+        { id: 1, name: "回复药", count: 12 },
+        { id: 2, name: "魔力药", count: 3 },
+        { id: 7, name: "旧校舍钥匙", count: 1 },
+        { id: 21, name: "银之怀表", count: 1 },
+      ],
+    },
+    runtime_mvmz_refresh: null, // 预览里不需要单独刷新
+    runtime_mvmz_set: {
+      ready: true,
+      gold: 99999,
+      note: "已连接 · 金币 99999 · 变量 128 个 · 开关（开）36 个 · 持有物品 12 种",
+      variables: [{ id: 1, name: "主角好感度", value: "9999" }],
+      switches: [{ id: 12, name: "CG 回廊全开", on: true }],
+      items: [{ id: 1, name: "回复药", count: 99 }],
+    },
+    runtime_mvmz_disconnect: true,
+
+    runtime_processes: [
+      { pid: 12345, name: "game.exe", label: "12345 — game.exe" },
+      { pid: 23456, name: "nw.exe", label: "23456 — nw.exe" },
+      { pid: 34567, name: "RPG_RT.exe", label: "34567 — RPG_RT.exe" },
+      { pid: 45678, name: "Game.exe", label: "45678 — Game.exe" },
+      { pid: 999, name: "explorer.exe", label: "999 — explorer.exe" },
+    ],
+    runtime_state: () => RUNTIME_SCAN,
+    runtime_open: () => {
+      RUNTIME_SCAN = {
+        active: true,
+        pid: 12345,
+        proc_name: "game.exe",
+        ty: "i32",
+        ty_label: "4 字节",
+        first_done: false,
+        hits: 0,
+        readonly_hits: 0,
+        can_undo: false,
+        frozen: false,
+        freeze_period_ms: 0,
+        list: [],
+        truncated: false,
+        bytes: 4,
+        numeric: true,
+      };
+      return RUNTIME_SCAN;
+    },
+    runtime_scan: async (a) => {
+      RUNTIME_SCAN.first_done = true;
+      if (a.first) {
+        RUNTIME_SCAN.hits = 1873;
+        RUNTIME_SCAN.truncated = true;
+      } else {
+        RUNTIME_SCAN.hits = Math.max(3, Math.round(RUNTIME_SCAN.hits / 260));
+        RUNTIME_SCAN.truncated = RUNTIME_SCAN.hits > 12;
+      }
+      RUNTIME_SCAN.readonly_hits = a.first ? 4 : 0;
+      RUNTIME_SCAN.list = Array.from({ length: Math.min(12, RUNTIME_SCAN.hits) }).map((_, i) => ({
+        addr: "0x" + (0x1f4a0000 + i * 0x40).toString(16).toUpperCase().padStart(16, "0"),
+        value: String(100 + i),
+      }));
+      return RUNTIME_SCAN;
+    },
+    runtime_hits: [],
+    runtime_write: (a) => {
+      RUNTIME_SCAN.can_undo = true;
+      RUNTIME_SCAN.list = RUNTIME_SCAN.list.map((h) => ({ ...h, value: a.value }));
+      return RUNTIME_SCAN;
+    },
+    runtime_undo: () => {
+      RUNTIME_SCAN.can_undo = false;
+      return RUNTIME_SCAN;
+    },
+    runtime_freeze: (a) => {
+      RUNTIME_SCAN.frozen = !!a.on;
+      RUNTIME_SCAN.freeze_period_ms = a.on ? 200 : 0;
+      return RUNTIME_SCAN;
+    },
+    runtime_freeze_tick: true,
+    runtime_diag: {
+      headline: "每 250.0 毫秒被还原一次（5 轮实测）—— 用自适应锁值（周期 100 毫秒）可稳定住。",
+      addr: "0x0000000000F4A0000",
+      verdict: "周期性回滚 —— 每 250.0 毫秒被还原一次（5 轮实测）",
+      reverted: true,
+      page: "PAGE_READWRITE（MEM_PRIVATE）",
+      page_blocked: false,
+      mirrors: 6,
+      mirror_truncated: false,
+      rewrite: "",
+      modules: [],
+      anti_debug: [],
+      source_addr: "0x0000000000F4B1040",
+      writers: ["0x00007FF6A1C40A21", "0x00007FF6A1C40B02"],
+      read_only: false,
+      notes: [],
+      plans: [
+        {
+          title: "自适应锁值",
+          feasibility: "可行性高",
+          level: "high",
+          detail: "按实测周期（250 毫秒）的一半反复写回，通常能稳定住数值。",
+          steps: ["保持游戏运行", "点下面的按钮开始锁值", "回游戏确认数值不再变化"],
+          auto: "freeze",
+          auto_period_ms: 100,
+          auto_addr: "",
+        },
+        {
+          title: "改数据源",
+          feasibility: "可行性中",
+          level: "medium",
+          detail: "找到真正被游戏采纳的「源」地址，写它会连带更新原地址。",
+          steps: ["先写入数据源地址", "回游戏看数值是否随之变化"],
+          auto: "write_source",
+          auto_period_ms: 0,
+          auto_addr: "0x0000000000F4B1040",
+        },
+        {
+          title: "代码补丁",
+          feasibility: "可行性低",
+          level: "low",
+          detail: "在还原指令处打补丁，一劳永逸，但需要改写可执行代码。",
+          steps: ["先备份游戏", "需要更进阶的工具链"],
+          auto: "",
+          auto_period_ms: 0,
+          auto_addr: "",
+        },
+      ],
+    },
+    runtime_regions: {
+      writable: 412,
+      readonly: 1180,
+      execute: 96,
+      rwx: 2,
+      guard: 3,
+      image: 210,
+      mapped: 88,
+      private: 1294,
+      total_bytes: "1.9 GB",
+      total_rows: 1682,
+      rows: Array.from({ length: 8 }).map((_, i) => ({
+        base: "0x" + (0x140000000 + i * 0x10000).toString(16).toUpperCase().padStart(16, "0"),
+        size: (i + 1) * 64 + " KB",
+        protect: i % 3 === 0 ? "PAGE_EXECUTE_READ" : "PAGE_READWRITE",
+        kind: i % 2 === 0 ? "MEM_IMAGE" : "MEM_PRIVATE",
+        merged: 4 + i,
+      })),
+    },
+    runtime_patch_list: {
+      supported: true,
+      note: "",
+      next_name: "patch2.xp3",
+      patches: [
+        { name: "data.xp3", ours: false, size: "1.4 GB", entries: 21430 },
+        { name: "patch.xp3", ours: true, size: "1.2 MB", entries: 42 },
+      ],
+    },
+    runtime_patch_build: "✔ 已生成 patch2.xp3（仅含改动文件 6 个，共 812 KB）",
+    runtime_patch_remove: "已移除 patch.xp3（游戏自带补丁包未受影响）",
+
+    // ⑧ 装MOD：MODS 是一份可变状态，装/停用/卸载都会改它，好让截图与交互自洽。
+    mods_state: () => MODS,
+    mods_preview: (a) => {
+      // 有冲突目录就演一遍「会抢文件」，否则给「没问题」
+      MODS.conflicts = String(a.srcDir || "").includes("conflict") ? CONFLICT_ROWS : [];
+      MODS.conflict_count = MODS.conflicts.length;
+      return MODS;
+    },
+    mods_install: (a) => {
+      const dir = String(a.srcDir || "");
+      const nm = a.name || "玩家补丁";
+      MODS.mods = MODS.mods.concat([
+        {
+          name: nm,
+          enabled: true,
+          files: 12,
+          overwritten: 5,
+          file_list: [
+            "Data/CommonEvents.rvdata2",
+            "Data/Map001.rvdata2",
+            "Graphics/Pictures/title.png",
+            "Graphics/Characters/hero.png",
+            "Audio/BGM/title.ogg",
+          ],
+        },
+      ]);
+      MODS.conflict_count = MODS.conflicts.length;
+      return MODS;
+    },
+    mods_toggle: (a) => {
+      MODS.mods = MODS.mods.map((m) => (m.name === a.name ? { ...m, enabled: !!a.enabled } : m));
+      MODS.conflicts = a.enabled ? CONFLICT_ROWS : [];
+      MODS.conflict_count = MODS.conflicts.length;
+      return MODS;
+    },
+    mods_uninstall: (a) => {
+      MODS.mods = MODS.mods.filter((m) => m.name !== a.name);
+      MODS.conflicts = MODS.mods.filter((m) => m.enabled).length >= 2 ? CONFLICT_ROWS : [];
+      MODS.conflict_count = MODS.conflicts.length;
+      return MODS;
+    },
+
+    // ⑨ 工具箱：设置 / 体检 / 自检 / 日志 / 导出诊断包
+    tools_settings: () => TOOLS,
+    tools_save: (a) => {
+      if (a.outputDir !== undefined) TOOLS.output_dir = a.outputDir;
+      if (a.proxy !== undefined) TOOLS.proxy = a.proxy;
+      if (a.mtlBaseUrl !== undefined) TOOLS.mtl_base_url = a.mtlBaseUrl;
+      if (a.mtlModel !== undefined) TOOLS.mtl_model = a.mtlModel;
+      return TOOLS;
+    },
+    tool_set: (a) => {
+      TOOLS.tools = TOOLS.tools.map((t) => (t.key === a.key ? { ...t, path: a.path } : t));
+      if (a.key === "proxy") TOOLS.proxy = a.path;
+      return TOOLS;
+    },
+    tool_download: (a) => {
+      TOOLS.tools = TOOLS.tools.map((t) =>
+        t.key === a.key ? { ...t, path: "C:\\Users\\me\\.stool\\tools\\" + t.label } : t
+      );
+      return TOOLS;
+    },
+    tools_health: () => (window.__MOCK_TOOLS__ && window.__MOCK_TOOLS__.health === "bad" ? HEALTH_BAD : HEALTH_OK),
+    tools_selfcheck: () => SELFCHECK_ROWS,
+    tools_log: (a) => ({
+      path: "C:\\Users\\me\\AppData\\Roaming\\stool\\logs\\stool.log",
+      lines: LOG_LINES.slice(-Math.max(1, (a && a.tail) || 300)),
+      total: 128,
+    }),
+    tools_export_diag: () => "C:\\Users\\me\\AppData\\Local\\Temp\\stool-diag-1757860803.zip",
+  };
+
+  window.__MOCK_DETECT__ = MOCK.detect_game;
+
+  // ?engine=unknown —— 演「引擎认不出来」：能力表清空，用来验这一页给出的出路
+  // 是不是真的能点（§2.2「任何页面没有死胡同」）。必须在这里改，因为预览 hook
+  // 对 #detect 是**直接 return** 的（见下面 `if (page === "detect") return`）。
+  if (new URLSearchParams(location.search).get("engine") === "unknown") {
+    Object.assign(window.__MOCK_DETECT__, {
+      engine_id: "",
+      engine_name: "未识别",
+      score: 12,
+      level: "low",
+      confidence: "低（证据不足）",
+      confirmed: false,
+      capabilities: [],
+      alternatives: [],
+      verdict: "没认出这是什么引擎 —— 但它照样能用。下面这些不依赖引擎识别。",
+    });
+  }
+
+  // 跨脚本块共享：第二个内联脚本（预览 hook）读不到这里的 MOCK（它是 IIFE 局部），
+  // 所以把 hook 用得到的假数据挂到 window 上 —— 与 __MOCK_DETECT__ 同一个道理。
+  window.__MOCK_RUNTIME__ = {
+    mvmzState: MOCK.runtime_mvmz_connect,
+    scan: RUNTIME_SCAN,
+  };
+  window.__MOCK_MODS__ = { state: MODS, conflicts: CONFLICT_ROWS };
+  window.__MOCK_TOOLS__ = { settings: TOOLS, health: "ok", log: LOG_LINES };
+
+  window.__TAURI__ = {
+    core: {
+      async invoke(cmd, args) {
+        const h = MOCK[cmd];
+        if (h === undefined) return null;
+        return typeof h === "function" ? h(args || {}) : h;
+      },
+    },
+    event: {
+      async listen(ev, cb) {
+        (listeners[ev] = listeners[ev] || []).push(cb);
+        return () => {
+          listeners[ev] = (listeners[ev] || []).filter((f) => f !== cb);
+        };
+      },
+    },
+  };
+})();
+</script>
+
+<script src="src/js/bridge.js"></script>
+<script src="src/js/ui.js"></script>
+<script src="src/js/pages/detect.js"></script>
+<script src="src/js/pages/extract.js"></script>
+<script src="src/js/pages/preview.js"></script>
+<script src="src/js/pages/text.js"></script>
+<script src="src/js/pages/save.js"></script>
+<script src="src/js/pages/runtime.js"></script>
+<script src="src/js/pages/unlock.js"></script>
+<script src="src/js/pages/mods.js"></script>
+<script src="src/js/pages/tools.js"></script>
+<script src="src/js/pages/soon.js"></script>
+<script>
+/* 预览专用：直接停在某一页看效果（真实运行没有这一段）。
+   必须放在**所有页面脚本之后** —— 它要直接改 PreviewPage 的字段，
+   放前面会因 PreviewPage 还没定义而静默失效（踩过一次）。
+
+   例：preview.html#extract —— 直接看「取出素材」，并当作「已经选好游戏」。
+   可选参数：
+     ?theme=dark   深色版
+     ?kind=image   看「看素材」时预选某个类型（all|image|audio|text）
+     ?pick=3       看「看素材」时预选列表第几个文件（截文本预览用）
+*/
+(function () {
+  const q = new URLSearchParams(location.search);
+  if (q.get("theme") === "dark") {
+    try {
+      localStorage.setItem("stool.theme", "dark");
+    } catch (_) {}
+  }
+  const page = (location.hash || "").replace(/^#/, "");
+  if (!page || page === "detect") return;
+  if (window.__MOCK_DETECT__) {
+    Store.gameRoot = window.__MOCK_DETECT__.root;
+    Store.detect = window.__MOCK_DETECT__;
+  }
+  // ?nogame=1 —— 演「还没选游戏」。用来验各页空状态是否给得出路
+  // （§2.2「任何页面没有死胡同」）。放在 setPage 之前才生效。
+  if (q.get("nogame") === "1") {
+    Store.gameRoot = null;
+    Store.detect = null;
+  }
+  // 「看素材」：预置好类型筛选与选中的文件，这样截图时列表和右侧都是满的。
+  if (page === "preview") {
+    const k = q.get("kind");
+    if (k) PreviewPage.kind = k;
+    PreviewPage.dir = window.__MOCK_DETECT__.root + "\\_extracted";
+    const pick = Number(q.get("pick"));
+    if (Number.isFinite(pick)) window.__PV_PICK__ = pick;
+  }
+  // 「翻译文字」：预置好目录与表格，这样统计、预览表、注入状态都是满的。
+  // 与「看素材」同理 —— 不预置的话截出来只有两个空输入框和一堆 0。
+  if (page === "text") {
+    TextPage.outDir = window.__MOCK_DETECT__.root + "\\_extracted";
+    TextPage.csvPath = TextPage.outDir + "\\text.csv";
+    TextPage.jsonPath = window.__MOCK_DETECT__.root + "\\stool_translate.json";
+    TextPage.csv = {
+      exists: true,
+      path: TextPage.csvPath,
+      total: 128,
+      done: 96,
+      todo: 32,
+      sample: [],
+    };
+    // ?mtl=1：把机翻设置折叠块展开，方便看那一块的样子。
+    // 它挂在 .fold 上（页面上第一个折叠块就是它），用 open 属性展开即可。
+    if (q.get("mtl") === "1") {
+      TextPage._openMtl = true;
+    }
+    // ?fold=1：展开「表格预览」，看 CSV 三列渲染效果。
+    if (q.get("fold") === "1") {
+      TextPage._openCsv = true;
+    }
+  }
+  // ?autorun=1 时自动跑一次「取出素材」，好把进行中的进度条也看到
+  // （假后端会按 45ms 一步推进度，配合 --virtual-time-budget 就能截到中途）。
+  if (q.get("autorun") === "1") {
+    setTimeout(() => {
+      try {
+        ExtractPage.run("extract");
+      } catch (_) {}
+    }, 80);
+  }
+  // 「解锁全CG」：预置勾选/展开状态，好把「确认写入」和备份列表也截到。
+  //   ?apply=1      勾上「我确认要写入」（按钮变红、文案变「确认写入并解锁」）
+  //   ?bak=1        展开备份列表
+  //   ?run=1        直接跑一次写入（看进度条与结果卡）
+  if (page === "unlock") {
+    if (q.get("apply") === "1") UnlockPage.apply = true;
+    // showBackups 必须在 mount() 之后设 —— mount 会把它重置为 false（每次进页面重采）。
+    if (q.get("bak") === "1") {
+      const orig = UnlockPage.mount.bind(UnlockPage);
+      UnlockPage.mount = async function (h) {
+        const r = await orig(h);
+        this.showBackups = true;
+        await this.render();
+        return r;
+      };
+    }
+    if (q.get("run") === "1") {
+      UnlockPage.apply = q.get("apply") === "1";
+      setTimeout(() => {
+        try {
+          UnlockPage.run();
+        } catch (_) {}
+      }, 120);
+    }
+  }
+
+  // 「装MOD」辅助之外的通用延时器：备份/还原那几个 hook 都要等 mount 跑完。
+  const later = (fn, ms) =>
+    setTimeout(() => {
+      try {
+        fn();
+      } catch (e) {
+        console.log("hook 失败: " + e.message);
+      }
+    }, ms || 400);
+
+  // 「改存档」：预置一份已打开的存档，好把编辑器、常用字段、搜索列表都截满。
+  //   ?save=undo     演「刚写回一次」—— 写回卡片下面出现就地还原条
+  //   ?save=bak      展开「备份与还原」并列出备份
+  //   ?save=bakempty 同上，但目录里没有备份（验空状态给出路）
+  //
+  // 注意 GAME / OUT 都是上面那个脚本块里的 IIFE 局部变量，这里拿不到（坑⑩），
+  // 只能经 window 上的假检测结果取根目录。
+  if (page === "save") {
+    const mode = q.get("save");
+    if (mode) {
+      const ROOT = window.__MOCK_DETECT__.root;
+      later(async () => {
+        await SavePage.loadSave(ROOT + "\\save\\file1.rpgsave");
+        await SavePage.doSearch(mode === "undo" ? "gold" : "");
+        if (mode === "undo") {
+          // 内核的备份路径规则是「原路径 + .stool.bak」，这里照抄一份当作刚生成的那份。
+          SavePage.lastBackup = ROOT + "\\save\\file1.rpgsave.stool.bak";
+          SavePage.paintCommit();
+        } else {
+          if (mode === "bakempty") window.__MOCK_NO_BAK__ = true;
+          for (const d of SavePage.root.querySelectorAll("details.fold")) {
+            if (d.querySelector("#bkHost")) d.open = true;
+          }
+          const btn = SavePage.root.querySelector('#bkHost [data-bk="load"]');
+          if (btn) btn.click();
+        }
+      });
+    }
+  }
+
+  // 「取出素材」：
+  //   ?repack=done 跑一遍「重新打包」，看写回结果卡 + 里面的还原入口
+  //   ?repack=bak  只展开「进阶」里的备份列表（模拟「上次打包过、这次想退回」）
+  if (page === "extract") {
+    const mode = q.get("repack");
+    if (mode) {
+      const OUT = window.__MOCK_DETECT__.root + "\\_extracted";
+      later(async () => {
+        if (mode === "done") {
+          ExtractPage.repackSrc = OUT;
+          ExtractPage.repackAck = true;
+          await ExtractPage.run("repack");
+          // 「重新打包完成」卡片里那份备份列表也要列出来，否则截图里只有一个按钮。
+          const btn = ExtractPage.root.querySelector('#bkGame [data-bk="load"]');
+          if (btn) btn.click();
+        } else {
+          for (const d of ExtractPage.root.querySelectorAll("details.fold")) {
+            if (d.querySelector("#bkGameFold")) d.open = true;
+          }
+          const btn = ExtractPage.root.querySelector('#bkGameFold [data-bk="load"]');
+          if (btn) btn.click();
+        }
+      });
+    }
+  }
+
+  // 「游戏里改数值」：预置两条链路的中间状态，好把各块都截满。
+  //   ?scan=1   演一遍「选进程 → 首次扫描 → 再次扫描」（命中列表 + 只读提示）
+  //   ?diag=1   演一遍保护诊断（回滚判定 / 方案清单）
+  //   ?mv=1     方式一直接显示「已连接」的编辑器 + 变量一览
+  if (page === "runtime") {
+    // 注意：这些 hook 必须推迟到 mount 之后执行 —— mount 里会把 mvState/scan
+    // 重置并根据后端返回值重画（与 unlock 的 ?bak=1 是同一个坑，见 pitfall ⑤）。
+    // 用延时而不是包 mount()：包 mount 时后进的 render 会被 mount 内部的 render 覆盖。
+    const later = (fn, ms) =>
+      setTimeout(() => {
+        try {
+          fn();
+        } catch (e) {
+          console.log("runtime hook 失败: " + e.message);
+        }
+      }, ms || 300);
+
+    // 方式一：mvState 不被 mount 重置（mount 只清 msg/err），所以直接预置即可 ——
+    // 不需要定时器，也就不会和 --virtual-time-budget 抢时间。
+    if (q.get("mv") === "1") {
+      RuntimePage.mvState = window.__MOCK_RUNTIME__.mvmzState;
+      RuntimePage.mvKind = "variable";
+      RuntimePage.mvId = "12";
+      RuntimePage.mvVal = "9999";
+      RuntimePage.mvMsg = "已连上，开始改吧。";
+    }
+    if (q.get("scan") === "1") {
+      later(async () => {
+        RuntimePage.pid = 12345;
+        RuntimePage.scanValue = "100";
+        RuntimePage.riskAck = true;
+        RuntimePage.showProcs = false;
+        await RuntimePage.openScanner();
+        await RuntimePage.scanRun(true);
+        RuntimePage.scanValue = "137";
+        RuntimePage.filter = "increased";
+        await RuntimePage.scanRun(false);
+      }, 500);
+    }
+    if (q.get("diag") === "1") {
+      later(async () => {
+        RuntimePage.pid = 12345;
+        RuntimePage.scanValue = "100";
+        RuntimePage.riskAck = true;
+        await RuntimePage.openScanner();
+        await RuntimePage.scanRun(true);
+        RuntimePage.diagAddr = "0x0000000000F4A0000";
+        await RuntimePage.diagRun();
+        await RuntimePage.loadRegions();
+      }, 500);
+    }
+    if (q.get("procs") === "1") {
+      later(() => RuntimePage.loadProcs(), 500);
+    }
+  }
+
+  // ⑧ 装MOD：?mods=pick 演「选好补丁目录 + 预演出冲突」；?mods=clean 演「没冲突的预演」。
+  if (page === "mods") {
+    const later = (fn, ms) =>
+      setTimeout(() => {
+        try {
+          fn();
+        } catch (e) {
+          console.log("mods hook 失败: " + e.message);
+        }
+      }, ms || 300);
+    const mode = q.get("mods");
+    if (mode) {
+      later(async () => {
+        // MODS 是上面那个脚本块的 IIFE 局部变量，这里只能经 window 拿 —— 见坑⑩。
+        const M = window.__MOCK_MODS__.state;
+        if (mode === "empty") {
+          // 「一个 MOD 都还没装」：验空状态给出的出路（§2.2「没有死胡同」）。
+          // 没有已装 MOD 就不可能有冲突，所以冲突行一起清掉 —— 否则假后端自相矛盾。
+          M.mods = [];
+          M.conflicts = [];
+          M.conflict_count = 0;
+          ModsPage.srcDir = "";
+          ModsPage.name = "";
+          await ModsPage.loadState();
+          await ModsPage.render();
+          return;
+        }
+        if (mode === "clean") {
+          // 「干净环境」演示：先清掉预置的冲突，再演一遍无冲突的预演
+          M.mods = M.mods.map((m) => ({ ...m, enabled: m.name === "汉化补丁" }));
+          M.conflicts = [];
+          M.conflict_count = 0;
+          ModsPage.srcDir = "D:\\下载\\新补丁";
+          ModsPage.name = "新补丁";
+        } else if (mode === "hits") {
+          // 「会抢文件」演示：目录名带 conflict，假后端才返回冲突行
+          ModsPage.srcDir = "D:\\下载\\汉化补丁_v2_conflict";
+          ModsPage.name = "汉化补丁_v2";
+        } else {
+          ModsPage.srcDir = "D:\\下载\\汉化补丁_v2";
+          ModsPage.name = "汉化补丁_v2";
+        }
+        ModsPage.previewing = true;
+        await ModsPage.loadState();
+        await ModsPage.runPreview();
+        ModsPage.previewing = false;
+        await ModsPage.render();
+      }, 400);
+    }
+    // 折叠一个 MOD 的文件清单
+    if (q.get("fold") === "1") {
+      later(() => {
+        ModsPage.open["汉化补丁"] = true;
+        ModsPage.render();
+      }, 400);
+    }
+  }
+
+  if (page === "tools") {
+    const later = (fn, ms) =>
+      setTimeout(() => {
+        try {
+          fn();
+        } catch (e) {
+          console.log("tools hook 失败: " + e.message);
+        }
+      }, ms || 300);
+    // 默认停诊断页；?tools=settings / ?tools=help 切到别的分区
+    const mode = q.get("tools");
+    later(async () => {
+      if (mode === "settings") ToolsPage.tab = "settings";
+      else if (mode === "help") ToolsPage.tab = "help";
+      await ToolsPage.render();
+    }, 400);
+    // ?check=health / ?check=selfcheck 演一遍诊断结果
+    const ck = q.get("check");
+    if (ck) {
+      if (ck === "bad" && window.__MOCK_TOOLS__) window.__MOCK_TOOLS__.health = "bad";
+      later(async () => {
+        ToolsPage.tab = "diag";
+        // health 的「bad」分支由假后端按 __MOCK_TOOLS__ 决定，这里只负责触发
+        await ToolsPage.runCheck(ck === "selfcheck" ? "selfcheck" : "health");
+      }, 700);
+    }
+    // ?diag=1 演一遍「诊断包已导出」
+    if (q.get("diag") === "1") {
+      later(async () => {
+        ToolsPage.tab = "diag";
+        await ToolsPage.exportDiag();
+      }, 700);
+    }
+  }
+})();
+</script>
+<script src="src/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+# Tauri CLI 的产物目录（构建缓存不该入库）
+/target/
+/gen/

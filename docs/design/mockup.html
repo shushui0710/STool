@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>STool · 界面重构可视稿</title>
+<style>
+/* ==========================================================================
+   设计令牌：全局唯一的取色/尺寸来源。
+   对应方案 §3 —— 1 个主色 + 4 个语义色，背景三级、文本三级，8px 栅格。
+   ========================================================================== */
+:root {
+  /* 背景三级（靠亮度差分层，不用阴影） */
+  --bg-window: #f6f7f9;
+  --bg-card: #ffffff;
+  --bg-subtle: #eef0f4;
+  --bg-hover: #f2f4f7;
+
+  /* 描边（工具类应用用描边比阴影干净） */
+  --line: #e4e6ea;
+  --line-strong: #d3d7de;
+
+  /* 文本三级 */
+  --tx-1: #1c1f24;
+  --tx-2: #5c6470;
+  --tx-3: #8b939f;
+
+  /* 唯一主色 */
+  --accent: #3a66b2;
+  --accent-hover: #31589c;
+  --accent-soft: #e8eefa;
+
+  /* 语义色 */
+  --ok: #4f9d5d;
+  --warn: #c08a2e;
+  --danger: #cc5f5f;
+  --muted: #8b939f;
+
+  /* 值着色（仅等宽区使用） */
+  --v-str: #1e7846;
+  --v-num: #1e50be;
+  --v-bool: #aa6414;
+  --v-other: #6e6e6e;
+
+  --r-card: 10px;
+  --r-ctl: 7px;
+
+  --sans: "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Cascadia Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg-window);
+  color: var(--tx-1);
+  font: 400 13px/1.6 var(--sans);
+}
+
+.app { display: flex; height: 100%; }
+
+/* ---------- 左侧导航：任务式（不是模块名），每项带一句解释 ---------- */
+.nav {
+  width: 208px;
+  flex: 0 0 208px;
+  background: var(--bg-card);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  padding: 14px 10px;
+}
+.brand { display: flex; align-items: center; gap: 9px; padding: 2px 8px 14px; }
+.logo {
+  width: 26px; height: 26px; border-radius: 7px;
+  background: var(--accent); color: #fff;
+  display: grid; place-items: center; font-weight: 500; font-size: 14px;
+}
+.brand b { font-weight: 500; font-size: 14px; display: block; line-height: 1.2; }
+.brand small { color: var(--tx-3); font-size: 11px; }
+
+.nav nav { display: flex; flex-direction: column; gap: 1px; }
+.nav nav a {
+  display: flex; gap: 9px; align-items: flex-start;
+  padding: 7px 9px; border-radius: var(--r-ctl);
+  text-decoration: none; color: var(--tx-2); cursor: default;
+  border-left: 2px solid transparent;
+}
+.nav nav a i {
+  font-style: normal; color: var(--tx-3); font-size: 11px;
+  width: 12px; flex: 0 0 12px; padding-top: 1px;
+}
+.nav nav a b { display: block; font-weight: 400; font-size: 13px; color: var(--tx-1); line-height: 1.35; }
+.nav nav a em { display: block; font-style: normal; font-size: 11px; color: var(--tx-3); }
+.nav nav a:hover { background: var(--bg-hover); }
+.nav nav a.active { background: var(--accent-soft); border-left-color: var(--accent); }
+.nav nav a.active b { color: var(--accent); font-weight: 500; }
+.nav nav a.active i { color: var(--accent); }
+
+.nav .foot { margin-top: auto; padding: 10px 9px 2px; border-top: 1px solid var(--line); color: var(--tx-3); font-size: 11px; }
+
+/* ---------- 主区 ---------- */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+.topbar {
+  height: 46px; flex: 0 0 46px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 18px;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 4px 10px; border: 1px solid var(--line-strong);
+  border-radius: 999px; font-size: 12px; color: var(--tx-2);
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+.chip.empty .dot { background: var(--muted); }
+.topbar .spacer { margin-left: auto; }
+
+.scroll { flex: 1; overflow: auto; }
+.content { max-width: 900px; margin: 0 auto; padding: 22px 24px 40px; }
+
+/* ---------- 三段式：说明条 → 主行动区 → 结果区 ---------- */
+.say {
+  display: flex; gap: 9px; align-items: flex-start;
+  padding: 10px 13px; margin-bottom: 14px;
+  background: var(--accent-soft);
+  border: 1px solid #d3e0f4; border-radius: var(--r-card);
+  color: #2b4f8c; font-size: 12.5px;
+}
+.say .q { flex: 0 0 auto; font-weight: 500; }
+
+h1.page { margin: 0 0 4px; font-size: 19px; font-weight: 500; letter-spacing: .2px; }
+p.lead { margin: 0 0 14px; color: var(--tx-3); font-size: 12.5px; }
+h2.sec { margin: 0 0 2px; font-size: 15px; font-weight: 500; }
+p.sechint { margin: 0 0 10px; color: var(--tx-3); font-size: 12px; }
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 15px 16px;
+  margin-bottom: 12px;
+}
+.card.flush { padding: 0; overflow: hidden; }
+
+/* ---------- 控件 ---------- */
+button {
+  font: inherit; padding: 0 13px; height: 32px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-ctl);
+  background: var(--bg-card); color: var(--tx-1); cursor: default;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: var(--accent-hover); }
+button.big { height: 38px; padding: 0 20px; font-size: 13.5px; }
+button.ghost { border-color: transparent; background: transparent; color: var(--tx-2); }
+button.mini { height: 24px; padding: 0 9px; font-size: 12px; }
+
+input[type=text], select {
+  font: inherit; height: 32px; padding: 0 9px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-ctl);
+  background: var(--bg-card); color: var(--tx-1);
+}
+input:focus, select:focus { outline: 2px solid #cfe0f7; outline-offset: -1px; border-color: var(--accent); }
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row.tight { gap: 6px; }
+.grow { flex: 1; min-width: 0; }
+.lbl { color: var(--tx-3); font-size: 12px; white-space: nowrap; }
+code { font-family: var(--mono); font-size: 12px; }
+code.path { color: var(--tx-3); }
+
+/* ---------- 0 层：入口整屏只做一件事 ---------- */
+.entry { display: grid; place-items: center; min-height: calc(100vh - 46px); padding: 24px; }
+.drop {
+  width: 520px; padding: 40px 28px; text-align: center;
+  border: 1.5px dashed var(--line-strong); border-radius: 14px;
+  background: var(--bg-card);
+}
+.drop .ic { font-size: 30px; line-height: 1; margin-bottom: 12px; color: var(--accent); }
+.drop h2 { margin: 0 0 6px; font-size: 16px; font-weight: 500; }
+.drop p { margin: 0 0 18px; color: var(--tx-3); font-size: 12.5px; }
+.drop .or { margin-top: 12px; color: var(--tx-3); font-size: 12px; }
+
+/* ---------- 识别结果卡 ---------- */
+.found { display: flex; gap: 14px; align-items: flex-start; padding: 16px; }
+.found .ic {
+  width: 38px; height: 38px; flex: 0 0 38px; border-radius: 9px;
+  background: var(--accent-soft); color: var(--accent);
+  display: grid; place-items: center; font-size: 17px;
+}
+.found h2 { margin: 0 0 3px; font-size: 15px; font-weight: 500; }
+.found p { margin: 0; color: var(--tx-3); font-size: 12.5px; }
+.actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-top: 14px; }
+.actions a {
+  border: 1px solid var(--line); border-radius: var(--r-ctl);
+  padding: 11px 12px; text-decoration: none; color: var(--tx-1); background: var(--bg-card);
+}
+.actions a b { display: block; font-weight: 400; font-size: 13px; }
+.actions a span { font-size: 11.5px; color: var(--tx-3); }
+.actions a:hover { border-color: var(--accent); background: var(--accent-soft); }
+
+details.adv { border-top: 1px solid var(--line); }
+details.adv > summary {
+  cursor: default; padding: 10px 16px; color: var(--tx-2); font-size: 12.5px;
+  list-style: none;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before { content: "▸ "; color: var(--tx-3); }
+details.adv[open] > summary::before { content: "▾ "; }
+details.adv .inner { padding: 0 16px 14px; color: var(--tx-2); font-size: 12.5px; }
+
+/* ---------- 常用字段速改 ---------- */
+.quick { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.qcell { border: 1px solid var(--line); border-radius: var(--r-ctl); padding: 10px 11px; }
+.qcell .n { color: var(--tx-3); font-size: 11.5px; display: block; margin-bottom: 3px; }
+.qcell .v { font-family: var(--mono); font-size: 17px; color: var(--v-num); display: block; margin-bottom: 8px; }
+
+/* ---------- 结果列表 ---------- */
+.hits { max-height: 300px; overflow: auto; border-top: 1px solid var(--line); }
+.hit {
+  display: flex; align-items: center; gap: 10px;
+  height: 26px; padding: 0 16px; white-space: nowrap; overflow: hidden;
+}
+.hit:hover { background: var(--bg-hover); }
+.hit.sel { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.hit .hp { font-family: var(--mono); font-size: 12px; color: var(--tx-3); overflow: hidden; text-overflow: ellipsis; }
+.hit .hv { font-family: var(--mono); font-size: 12px; }
+.hit .ht { margin-left: auto; color: var(--tx-3); font-size: 11px; }
+.v-str { color: var(--v-str); } .v-num { color: var(--v-num); }
+.v-bool { color: var(--v-bool); } .v-other { color: var(--v-other); }
+
+.count { padding: 10px 16px 6px; color: var(--tx-3); font-size: 12px; }
+
+/* ---------- 底部状态 ---------- */
+.statusbar {
+  height: 30px; flex: 0 0 30px;
+  background: var(--bg-card); border-top: 1px solid var(--line);
+  display: flex; align-items: center; gap: 12px; padding: 0 18px;
+  color: var(--tx-3); font-size: 11.5px;
+}
+.statusbar .ok { color: var(--ok); }
+.statusbar .right { margin-left: auto; display: flex; gap: 12px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <aside class="nav">
+    <div class="brand">
+      <div class="logo">S</div>
+      <div><b>STool</b><small>v0.2.0</small></div>
+    </div>
+    <nav id="nav">
+      <a data-p="entry"><i>①</i><span><b>选游戏</b><em>要处理哪个游戏</em></span></a>
+      <a data-p="detected"><i>②</i><span><b>取出素材</b><em>把图片音乐拿出来</em></span></a>
+      <a data-p="detected"><i>③</i><span><b>看素材</b><em>直接浏览与试听</em></span></a>
+      <a data-p="detected"><i>④</i><span><b>翻译文字</b><em>提台词、翻译、塞回</em></span></a>
+      <a data-p="save"><i>⑤</i><span><b>改存档</b><em>改金币等级道具</em></span></a>
+      <a data-p="detected"><i>⑥</i><span><b>游戏里改数值</b><em>开着游戏也能改</em></span></a>
+      <a data-p="detected"><i>⑦</i><span><b>解锁全CG</b><em>一键开回想</em></span></a>
+      <a data-p="detected"><i>⑧</i><span><b>装 MOD</b><em>安装玩家补丁</em></span></a>
+      <a data-p="detected"><i>⑨</i><span><b>工具箱</b><em>设置与诊断</em></span></a>
+    </nav>
+    <div class="foot">改前自动备份 · 可一键还原</div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="chip empty" id="gamechip"><span class="dot"></span>还没选游戏</span>
+      <span class="spacer"></span>
+      <button class="ghost" style="height:26px">?</button>
+    </header>
+
+    <div class="scroll">
+
+      <!-- ============ ① 入口：整屏只做一件事 ============ -->
+      <section class="page" id="page-entry">
+        <div class="entry">
+          <div class="drop">
+            <div class="ic">▤</div>
+            <h2>把游戏文件夹拖到这里</h2>
+            <p>STool 会自己判断这是什么引擎做的，然后告诉你能做什么</p>
+            <button class="primary big">选择游戏文件夹…</button>
+            <div class="or">也可以直接把文件夹拖进窗口</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ ② 已识别：一句结论 + 可展开依据 + 四个直达动作 ============ -->
+      <section class="page" id="page-detected" hidden>
+        <div class="content">
+          <h1 class="page">好东西，这个游戏能改</h1>
+          <p class="lead">下面四个是最常做的事，点一下就开始。</p>
+
+          <div class="card flush">
+            <div class="found">
+              <div class="ic">✓</div>
+              <div class="grow">
+                <h2>RPG Maker MV 游戏</h2>
+                <p>D:\Games\MyGame　·　可以做：取素材、翻译文字、改存档、解锁全CG</p>
+              </div>
+            </div>
+            <details class="adv">
+              <summary>为什么这么判断（3 条依据）</summary>
+              <div class="inner">
+                找到 www/js/rpg_core.js　·　找到 data/System.json　·　找到 img/ 与 audio/ 目录
+              </div>
+            </details>
+          </div>
+
+          <div class="actions">
+            <a href="#save"><b>改存档</b><span>改金币等级道具</span></a>
+            <a href="#save"><b>解锁全CG</b><span>一键开回想</span></a>
+            <a href="#save"><b>取出素材</b><span>图片音乐导出</span></a>
+            <a href="#save"><b>游戏里改数值</b><span>开着游戏也能改</span></a>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ ⑤ 改存档：三段式 ============ -->
+      <section class="page" id="page-save" hidden>
+        <div class="content">
+          <h1 class="page">改存档</h1>
+          <p class="lead">改金币、等级、道具数量。改完记得点「保存回写」。</p>
+
+          <div class="say">
+            <span class="q">怎么用</span>
+            <span>下面「常用字段」里直接改最省事；找不到的字段就用搜索——键名和数值都能搜。保存时原文件会自动备份。</span>
+          </div>
+
+          <div class="card">
+            <div class="row">
+              <button>打开存档文件…</button>
+              <button>载入示例存档</button>
+              <span class="spacer grow"></span>
+              <button class="primary">保存回写（自动备份）</button>
+            </div>
+            <div class="row" style="margin-top:9px">
+              <span class="lbl">文件</span>
+              <code class="path">D:\Games\MyGame\save\file1.rpgsave　·　已加载</code>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 class="sec">常用字段</h2>
+            <p class="sechint">这几个是改得最多的，直接改就行，不用懂字段路径</p>
+            <div class="quick">
+              <div class="qcell">
+                <span class="n">金币</span><span class="v">1,000</span>
+                <div class="row tight">
+                  <input class="grow" type="text" value="99999" style="height:26px" />
+                  <button class="mini primary">应用</button>
+                </div>
+              </div>
+              <div class="qcell">
+                <span class="n">主角等级</span><span class="v">7</span>
+                <div class="row tight">
+                  <input class="grow" type="text" value="99" style="height:26px" />
+                  <button class="mini primary">应用</button>
+                </div>
+              </div>
+              <div class="qcell">
+                <span class="n">道具数量</span><span class="v">3</span>
+                <div class="row tight">
+                  <input class="grow" type="text" value="99" style="height:26px" />
+                  <button class="mini primary">应用</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card flush">
+            <div style="padding:15px 16px 0">
+              <h2 class="sec">搜索其他字段</h2>
+              <p class="sechint">键名或数值都行，回车即搜；点一行就选中，下面能改</p>
+              <div class="row">
+                <input class="grow" type="text" value="100" />
+                <span class="lbl">范围</span>
+                <select><option>键名+值</option><option>只搜键名</option><option>只搜值</option></select>
+                <button>搜索</button>
+              </div>
+            </div>
+
+            <div class="count">找到 28 处　·　点一行即可修改</div>
+            <div class="hits">
+              <div class="hit"><span class="hp">/system/_playtime</span><span class="hv v-num">45296</span><span class="ht">数值</span></div>
+              <div class="hit sel"><span class="hp">/system/_bgmOnSave/pitch</span><span class="hv v-num">100</span><span class="ht">数值</span></div>
+              <div class="hit"><span class="hp">/system/_bgmOnSave/volume</span><span class="hv v-num">90</span><span class="ht">数值</span></div>
+              <div class="hit"><span class="hp">/switches/1000</span><span class="hv v-bool">false</span><span class="ht">布尔</span></div>
+              <div class="hit"><span class="hp">/switches/1001</span><span class="hv v-bool">true</span><span class="ht">布尔</span></div>
+              <div class="hit"><span class="hp">/variables/1000</span><span class="hv v-num">0</span><span class="ht">数值</span></div>
+              <div class="hit"><span class="hp">/actors/_data/0/_name</span><span class="hv v-str">勇者</span><span class="ht">文本</span></div>
+              <div class="hit"><span class="hp">/party/_gold</span><span class="hv v-num">1000</span><span class="ht">数值</span></div>
+            </div>
+
+            <details class="adv">
+              <summary>进阶：查看原始存档结构</summary>
+              <div class="inner">给排错和精确定位用；日常改数值用上面的搜索就够了。</div>
+            </details>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <footer class="statusbar">
+      <span class="ok">●</span><span>已识别：RPG Maker MV</span>
+      <span>·</span><span>输出目录：D:\STool\out</span>
+      <span class="right"><span>v0.2.0</span><span>改前自动备份</span></span>
+    </footer>
+  </div>
+</div>
+
+<script>
+function show(p) {
+  for (const el of document.querySelectorAll('.page')) el.hidden = (el.id !== 'page-' + p);
+  for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('active', a.dataset.p === p);
+  const chip = document.getElementById('gamechip');
+  const has = p !== 'entry';
+  chip.classList.toggle('empty', !has);
+  chip.innerHTML = '<span class="dot"></span>' + (has ? 'MyGame · RPG Maker MV' : '还没选游戏');
+}
+function route() { show((location.hash || '#entry').slice(1)); }
+window.addEventListener('hashchange', route);
+route();
+</script>
+</body>
+</html>

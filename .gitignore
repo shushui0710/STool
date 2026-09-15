@@ -23,3 +23,7 @@ __pycache__/
 
 # 本机专用 MSVC 链接器配置（路径写死本机版本，不应入库）
 stool-rs/.cargo/config.toml
+
+# 无头浏览器截图用的 Chromium profile（一次性，几百个文件，不该入库）
+shots/.edgeprof*/
+shots/.ep_*/

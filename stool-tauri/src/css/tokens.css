@@ -1,0 +1,110 @@
+/* ---------------------------------------------------------------------------
+   STool 设计令牌 —— 全站唯一取色 / 取尺寸来源。
+
+   规则（见 docs/TAURI重构方案.md §3）：
+   - UI 上不得出现本表之外的颜色；
+   - 语义色口径对齐 egui 版 gui/util.rs 的 C_OK / C_WARN / C_DANGER / C_MUTED，
+     这样两版 A/B 对比才是同类项；
+   - 不靠阴影分层 —— 用 1px 描边；
+   - 间距走 8px 栅格（4 / 8 / 12 / 16 / 24 / 32）。
+--------------------------------------------------------------------------- */
+
+:root {
+  /* 背景三级：窗口底 / 卡片 / 悬浮 */
+  --bg-app: #f4f6f8;
+  --bg-card: #ffffff;
+  --bg-raise: #eceff4;
+  --bg-side: #eef1f5;
+  --bg-hover: #e6ebf2;
+  --bg-active: #dde6f4;
+
+  /* 文本三级 */
+  --text-1: #1e2430;
+  --text-2: #58616e;
+  --text-3: #8a93a1;
+
+  /* 描边 */
+  --line: #e3e7ed;
+  --line-2: #ccd4de;
+
+  /* 主色：全站唯一，只用于主按钮 / 选中态 / 焦点 */
+  --accent: #3a66b2;
+  --accent-hover: #32599e;
+  --accent-soft: #e9eff9;
+  --on-accent: #ffffff;
+
+  /* 语义色四档 */
+  --ok: #4f9450;
+  --warn: #b8862c;
+  --danger: #c85f5f;
+  --muted: #969696;
+  --ok-soft: #e7f2e7;
+  --warn-soft: #f8f0dd;
+  --danger-soft: #fae8e8;
+  --muted-soft: #eef0f2;
+
+  /* 值着色：只在等宽区用，帮助长列表里一眼分辨类型 */
+  --v-str: #2c7a5b;
+  --v-num: #2b6ba8;
+  --v-bool: #8f56ad;
+  --v-other: #8a93a1;
+
+  /* 形状 */
+  --r-card: 10px;
+  --r-ctl: 7px;
+
+  /* 间距：8px 栅格 */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+
+  /* 字体：中文统一雅黑；等宽只给路径与数值 */
+  --font: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+
+  /* 排版尺度：字重只用 400 / 500，不用 600/700（过粗显廉价） */
+  --fs-page: 19px;
+  --fs-sub: 15px;
+  --fs-body: 13px;
+  --fs-note: 12px;
+  --lh: 1.6;
+}
+
+/* 深色：只换令牌的值，不动任何一条布局规则 */
+:root[data-theme="dark"] {
+  --bg-app: #14171c;
+  --bg-card: #1c2027;
+  --bg-raise: #232830;
+  --bg-side: #171a20;
+  --bg-hover: #242932;
+  --bg-active: #2c3442;
+
+  --text-1: #e8ecf2;
+  --text-2: #a8b1bd;
+  --text-3: #79828f;
+
+  --line: #2a2f38;
+  --line-2: #3b4350;
+
+  --accent: #6f9ae0;
+  --accent-hover: #83a9e8;
+  --accent-soft: #1f2938;
+  --on-accent: #101418;
+
+  --ok: #6fb06f;
+  --warn: #d8b061;
+  --danger: #e08a8a;
+  --muted: #8a93a1;
+  --ok-soft: #1d2a1e;
+  --warn-soft: #2c2618;
+  --danger-soft: #2e1f1f;
+  --muted-soft: #23272e;
+
+  --v-str: #6cbd97;
+  --v-num: #6ea9e0;
+  --v-bool: #b98ad4;
+  --v-other: #79828f;
+}

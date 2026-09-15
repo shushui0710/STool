@@ -1,0 +1,39 @@
+[package]
+name = "stool-tauri"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "STool 的 Tauri 图形界面（Rust 内核 + WebView2）"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 关键：只取内核，不开 gui feature —— 不重复编译整套 eframe/egui。
+# （stool-rs/Cargo.toml 的 [features] default = ["gui"]）
+stool = { path = "../../stool-rs", default-features = false }
+
+# custom-protocol 必须开：
+# tauri/build.rs 里 `let dev = !custom_protocol;` —— 不开这个 feature，即使 release
+# 构建也会被判成 dev 模式，Tauri 会去找前端 dev 服务器，结果是一个**静默的白窗口**。
+# Tauri CLI 在生产构建时会自动加 `--features tauri/custom-protocol`；
+# 这里直接写死，让「裸 cargo build」也能跑。详见 docs/TAURI重构方案.md §6.2。
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 「看素材」要遍历目录 + 把图片/音频内联成 data URL。
+# 这两个 crate 内核已在用（见 Cargo.lock），所以是零新增下载。
+walkdir = "2"
+base64 = "0.22"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

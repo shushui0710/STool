@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STool</title>
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-mark">S</div>
+      <div class="brand-text">
+        <b>STool</b>
+        <span>游戏汉化工具箱</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav"></nav>
+
+    <div class="side-foot">
+      <button class="game-chip" id="gameChip" type="button" hidden>
+        <span class="game-chip-k">当前游戏</span>
+        <span class="game-chip-v" id="gameChipName"></span>
+      </button>
+      <button class="btn btn-ghost btn-sm btn-block" id="themeBtn" type="button">深色模式</button>
+      <div class="ver" id="ver"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-text">
+        <h1 class="page-title" id="pageTitle"></h1>
+        <p class="page-sub" id="pageSub"></p>
+      </div>
+      <div class="topbar-actions" id="topActions"></div>
+    </header>
+    <section class="content" id="content"></section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="js/bridge.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/pages/detect.js"></script>
+<script src="js/pages/extract.js"></script>
+<script src="js/pages/preview.js"></script>
+<script src="js/pages/text.js"></script>
+<script src="js/pages/save.js"></script>
+<script src="js/pages/runtime.js"></script>
+<script src="js/pages/unlock.js"></script>
+<script src="js/pages/mods.js"></script>
+<script src="js/pages/tools.js"></script>
+<script src="js/pages/soon.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
