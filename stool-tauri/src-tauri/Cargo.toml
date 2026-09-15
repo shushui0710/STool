@@ -9,9 +9,8 @@ description = "STool 的 Tauri 图形界面（Rust 内核 + WebView2）"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# 关键：只取内核，不开 gui feature —— 不重复编译整套 eframe/egui。
-# （stool-rs/Cargo.toml 的 [features] default = ["gui"]）
-stool = { path = "../../stool-rs", default-features = false }
+# 内核库。它现在只出「内核 + CLI」，不再自带 GUI，所以默认 feature 即可。
+stool = { path = "../../stool-rs" }
 
 # custom-protocol 必须开：
 # tauri/build.rs 里 `let dev = !custom_protocol;` —— 不开这个 feature，即使 release

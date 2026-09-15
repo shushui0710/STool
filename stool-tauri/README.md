@@ -1,14 +1,16 @@
-# stool-tauri —— STool 的 Tauri 图形界面
+# stool-tauri —— STool 的图形界面（唯一界面）
 
 Rust 内核（`../stool-rs`）+ Tauri v2 / WebView2 界面。重点：**好看**与**好用**。
 
-方案与验收标准见 `../docs/TAURI重构方案.md`。
+方案与验收标准见 `../docs/TAURI重构方案.md`，验收结论见 `../docs/TAURI验收报告.md`。
 
 ## 为什么要单独一个 crate
 
 内核（`features/` `formats/` `engines/` …）对 UI 框架**零依赖**，所以界面可以整体替换。
-本 crate 以 `default-features = false` 依赖 `stool`，**不开 `gui` feature** ——
-于是不重复编译整套 eframe/egui，两个界面并存但互不拖累（`stool.exe` 照旧可用）。
+
+**旧的 eframe/egui 版（`stool-rs/src/gui/`、`stool.exe`）已删除** —— 本 crate 就是本仓库
+唯一的图形界面，`stool-rs` 只留内核 + `stool-cli.exe`。因此这里直接依赖
+`stool = { path = "../../stool-rs" }`，不需要任何 feature 门控。
 
 ## 目录
 
@@ -38,6 +40,32 @@ cargo build --release
 > 不带 `custom-protocol` feature 时，**连 release 构建也会被判成 dev 模式**，
 > Tauri 会去找前端 dev 服务器，结果是一个**静默的白窗口**（没有任何报错）。
 > 本 crate 的 `Cargo.toml` 已把 `features = ["custom-protocol"]` 写死，所以裸 `cargo build` 也能跑。
+
+> **坑（杀软误报，一定会遇到）**：卡巴斯基等启发式引擎会把这个 exe 报成
+> `VHO:Trojan-PSW.Win32.Greedy.gen`（`VHO:` = 启发式判定，不是特征码命中；`.gen` = 泛型）。
+> 这不是感染，是本工具**自己功能**造成的：
+>
+> | 内核模块 | 用到的 API | 在启发式引擎眼里像什么 |
+> |---|---|---|
+> | `features/gallery.rs`（Unity 全CG解锁） | `RegOpenKeyExW` / `RegQueryValueExW` / **`RegSetValueExW`** | 翻注册表找凭据 |
+> | `settings.rs`（机翻 Key 加密） | **`CryptProtectData` / `CryptUnprotectData`** | DPAPI 解密密钥 |
+> | `memapi.rs` + `features/memscan.rs` / `guard.rs`（内存扫描 / 反修改诊断） | **`CreateToolhelp32Snapshot` / `Process32NextW` / `OpenProcess` / `ReadProcessMemory` / `VirtualProtectEx`** | 跨进程读内存 |
+>
+> 「读注册表 + **写**注册表 + DPAPI 加解密 + 枚举进程 + 跨进程读内存」正好是窃密器的典型调用面，
+> 再加上**本地编译、未签名、零信誉**，被 `Trojan-PSW`（密码窃取类）泛型规则命中是必然的。
+> 实测：`grep -ao` 在 `target/release/stool-tauri.exe` 里可逐个查到上面这些 API 名；
+> debug 测试二进制（`target/debug/deps/stool_tauri-*.exe`）不含内存那几个，但含注册表与 DPAPI 那几个。
+>
+> **副作用（比报毒更烦）**：卡巴斯基会**阻止执行**刚编出来的二进制，表现为
+> `cargo test` 报 `拒绝访问 (os error 5)` / `LNK1104: 无法打开文件 …`，
+> 而直接跑那个 exe 有时又能过 —— 别去改代码，是杀软在挡。
+>
+> **处置**（免费版也支持，见 KFA 21.3 官方文档「威胁和排除项 → 管理排除项」）：
+> 设置 → 安全 → 排除项和检测到对象时的操作 → **管理排除项** → 添加
+> ① 文件或文件夹填 `D:\STool\**`（或至少 `stool-rs\target` 与 `stool-tauri\src-tauri\target`）；
+> ② 对象类型填 `Trojan-PSW.Win32.Greedy.gen`（其余条件留 `*`）。
+> 加之前先**暂停保护**，否则还原后会被立刻再杀一次。
+> 想彻底不再报，可把该样本提交卡巴斯基病毒实验室（Virus Lab）申请撤销误报 —— 这是唯一能帮到别人的做法。
 
 ## 长任务与进度
 

@@ -3,7 +3,8 @@
 
    硬要求（docs/TAURI重构方案.md §3.5 第 5 条「无死胡同」）：
    空状态也必须给出**动作**，所以这里一定带「去选游戏 / 去改存档」两条出路。
-   另外如实说明：功能在内核里是好的，只是界面还没搬过来；原版 stool.exe 仍可用。
+   另外如实说明：功能在内核里是好的，只是界面还没接上；这时可以用命令行的
+   stool-cli.exe 完成同一件事。
 --------------------------------------------------------------------------- */
 
 const SOON_INFO = {
@@ -65,8 +66,8 @@ function makeSoonPage(id) {
           <div class="say">
             <span class="say-mark">?</span>
             <div class="say-body">
-              这一页还在搬家：Tauri 版按「选游戏 → 改存档 → …」的顺序一页一页接。<br>
-              功能在内核里是好的，只是界面还没搬过来。
+              这一页还在接：Tauri 版按「选游戏 → 改存档 → …」的顺序一页一页接。<br>
+              功能在内核里是好的，只是界面还没接上。
             </div>
           </div>
         </div>
@@ -89,7 +90,7 @@ function makeSoonPage(id) {
               <button class="btn btn-ghost" id="goSave">去「改存档」</button>
             </div>
             <div class="small dim mt3">
-              这页的功能现在仍然可以用原版 <span class="mono">stool.exe</span> 完成（两个版本装在一起，互不影响）。
+              这页的功能现在可以用命令行 <span class="mono">stool-cli.exe</span> 完成（图形界面正在逐页补齐）。
             </div>
           </div>
         </div>

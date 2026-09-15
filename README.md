@@ -19,7 +19,8 @@
 > - **批量检测**：给一个根目录，自动扫描下面所有游戏、识别引擎并生成 CSV 报告
 > - **游戏体检**：检查非 Unicode 区域设置、缺失的运行库 DLL、日文字体等常见"跑不起来"的原因
 >
-> 使用 Rust 语言编写：整个程序只有一个 exe 文件（约 6 MB），运行时内存占用很低。
+> 使用 Rust 语言编写：**图形界面是单个 exe**（`stool-tauri.exe`，约 13 MB，只依赖系统自带的
+> WebView2），另附一个命令行版 `stool-cli.exe`。运行时内存占用很低。
 > 程序内部按"引擎插件"的方式组织，以后想支持新引擎，加一个插件即可。
 >
 > 处理大封包时也做了优化：解包**多线程并行**、支持**断点续传**（中途取消/崩溃后重跑自动接着来）、
@@ -206,7 +207,7 @@ stool-cli xp3-patch <游戏目录> --from-extract <解包目录>     # 5. 只把
 
 ## 怎么用？
 
-直接双击 `stool.exe` 就会打开图形界面（支持中文显示，**不会弹出黑色控制台窗口**），按页面提示操作即可。
+直接双击 `stool-tauri.exe` 就会打开图形界面（支持中文显示，**不会弹出黑色控制台窗口**），按页面提示操作即可。
 
 喜欢命令行的话，使用目录下的 `stool-cli.exe`（专门为终端准备的版本）：
 
@@ -313,11 +314,21 @@ export RUSTC="$HOME/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.e
 export CARGO_INCREMENTAL=0
 
 # 3) 构建与验证
+#    内核 + 命令行
 cd stool-rs
-cargo build --release                       # 产物：target/release/stool.exe、stool-cli.exe
+cargo build --release                       # 产物：target/release/stool-cli.exe
 cargo test --tests                          # 跑全部测试
 cargo clippy --all-targets -- -D warnings    # 质量门禁：必须零警告
+
+#    图形界面（Tauri 版）
+cd ../stool-tauri/src-tauri
+cargo build --release                       # 产物：target/release/stool-tauri.exe
+cargo test --tests
+cargo clippy --all-targets -- -D warnings
 ```
+
+改完界面记得**重建**：`tauri-build` 默认不监视前端目录，只 `cargo build` 可能打包出旧界面
+（仓库已在 `build.rs` 补了 `rerun-if-changed=../src`，但前提是你真的重跑了构建）。
 
 两点说明：
 
@@ -330,7 +341,7 @@ cargo clippy --all-targets -- -D warnings    # 质量门禁：必须零警告
 ## 程序结构（给想参与开发的你）
 
 ```
-src/
+stool-rs/src/    # 内核库 + 命令行（不含任何界面代码）
 ├── formats/   # 各种游戏文件格式的"读 / 写"实现，每个格式一个独立模块，可以单独拿去复用
 │              #   safe.rs 越界安全读取（解析器永不 panic）/ source.rs 流式数据源（大封包不整包进内存）
 │              #   pfs.rs Artemis 封包（pf6/pf8，含 SHA-1 流混淆与写侧）
@@ -346,10 +357,17 @@ src/
 │              #   guard 反修改保护识别与对抗（回滚判定 / 改写判定 / 页保护 / 保护线索 / 方案）
 ├── memapi.rs  # 跨进程内存 API（OpenProcess/RPM/WPM/VirtualQueryEx/VirtualProtectEx + 模块枚举）；
 │              #   被 memscan（内存扫描）与 guard（反修改保护识别）共用，含页保护/类型名字映射
-├── cli.rs     # 命令行入口
-├── gui/       # 图形界面（mod.rs + pages/ 各页 + util / save_tree；自动加载中文字体，界面不乱码）
+├── cli.rs     # 命令行入口（子命令分发；--help）
+├── cli_main.rs# stool-cli.exe 的 main
 ├── hash.rs    # 无依赖 SHA-256 / SHA-1（校验一键下载的外部工具是否被篡改 + pf8 流混淆）
 └── settings.rs# 配置（~/.stool/config.json；机翻 API Key 用 Windows DPAPI 加密后落盘）
+
+stool-tauri/     # 图形界面（Tauri v2 + WebView2）—— 本仓库唯一的界面
+├── src/         # 前端：静态 HTML/CSS/JS，无打包器
+│   ├── css/tokens.css   # 全站唯一取色/取尺寸来源（改配色只改这里）
+│   └── js/pages/*.js    # 每页一个文件（选游戏 / 取出素材 / 看素材 / 翻译文字 / 改存档 /
+│                        #   游戏里改数值 / 解锁全CG / 装MOD / 工具箱）
+└── src-tauri/   # Rust 侧：命令层 cmd.rs（不重写业务逻辑，只转述内核）+ 全局状态 main.rs
 ```
 
 **想加一个新引擎？** 只需实现一个 `Engine` 接口（其中"如何识别该引擎"必须实现，

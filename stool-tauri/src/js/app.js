@@ -173,7 +173,7 @@ window.addEventListener("unhandledrejection", (e) => {
 
   log(`启动完成；__TAURI__=${window.__TAURI__ ? "ok" : "missing"}`);
 
-  // 起始页：URL hash 优先，其次 STOOL_PAGE（与 egui 版同一口径），最后「选游戏」
+  // 起始页：URL hash 优先，其次环境变量 STOOL_PAGE，最后「选游戏」
   const envPage = await Tauri.call("env_page");
   const id = location.hash.replace(/^#/, "") || (envPage.ok && envPage.data ? envPage.data : "detect");
   await setPage(id);

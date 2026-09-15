@@ -1,8 +1,8 @@
-//! STool 的 Tauri 图形界面（Rust 内核 + WebView2）。
+//! STool 的**唯一**图形界面（Rust 内核 + WebView2）。
 //!
-//! 与 egui 版**并存**：本 crate 以 `default-features = false` 依赖 `stool` 内核，
-//! 只取 `engines` / `features`，不重复编译 eframe/egui 那一层
-//! （见 `docs/TAURI重构方案.md` §6.1）。
+//! 它就是面向用户的 GUI：旧的 eframe/egui 版已删除，`stool-rs` 只留内核 + CLI。
+//! 本 crate 依赖 `stool` 内核，取 `engines` / `features` 等模块
+//! （见 `docs/TAURI重构方案.md`）。
 //!
 //! 构建提醒：不要用裸 `cargo build` 之外的方式绕开 `custom-protocol` feature，
 //! 否则会得到一个**静默的白窗口**（同文档 §6.2）。
