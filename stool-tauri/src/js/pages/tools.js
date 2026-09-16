@@ -277,14 +277,30 @@ const ToolsPage = {
       ${checkHtml}
     </div>`;
 
+    // 日志**按天累积**：今天每次开 STool 都往同一个文件追加。所以把「本次启动」
+    // 那一行标出来，用户一眼能分清哪段是自己这次干的、哪段是今天早些时候的 ——
+    // 否则很容易以为出现了「莫名其妙的记录」（2026-09 实际反馈）。
+    const bootIdx = (() => {
+      const ls = (this.log && this.log.lines) || [];
+      for (let i = ls.length - 1; i >= 0; i--) {
+        if (ls[i].includes("] [INFO] STool ") && ls[i].includes(" 启动（日志:")) return i;
+      }
+      return -1;
+    })();
+
     const logBody = `<div class="body">
       ${
         this.logLoading
           ? `<div class="row tight"><span class="spin"></span><span class="small dim">正在读日志…</span></div>`
           : this.log && this.log.lines.length
-          ? `<div class="small dim">显示最后 ${this.log.lines.length} 行（共 ${this.log.total} 行）</div>
+          ? `<div class="small dim">显示最后 ${this.log.lines.length} 行（共 ${this.log.total} 行）。
+               这份日志<strong>按天累积</strong>：今天每次打开 STool、每次操作都追加进来，
+               所以上面的时间可能早于你这次开窗口。</div>
              <div class="logbox mono small">${this.log.lines
-               .map((l) => esc(l))
+               .map(
+                 (l, i) =>
+                   (i === bootIdx ? `<span class="dim2">—— 本次启动之后 ——</span><br>` : "") + esc(l)
+               )
                .join("<br>")}</div>`
           : `<div class="small dim">${esc(
               this.log ? `没有日志（${shortPath(this.log.path)}）` : "还没有日志"

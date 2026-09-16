@@ -26,6 +26,7 @@ encoding_rs = "0.8"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",

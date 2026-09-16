@@ -11,18 +11,44 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+// 只在非 Windows 的 UTC 回退路径里用到（Windows 走 GetLocalTime）。
+#[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 串行化日志写入，避免多线程交错破坏行结构。
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// 日志目录：`<家目录>/.stool/logs`。
+///
+/// 两条覆盖规则：
+/// - 环境变量 `STOOL_LOG_DIR` 优先 —— 想把日志挪到别处不用改代码；
+/// - **单测构建下恒定落到进程专属临时目录**。否则 `cargo test` 里那些
+///   `boom` / `hello diag` / `读取失败 f3.bin` / `解包未完成…断点 200 条` /
+///   `机翻第 1/3 次失败：HTTP 503` 的**用例数据**会混进界面的「运行日志」，
+///   用户看着像自己干过这些操作（2026-09 实际踩到，用户报「莫名其妙的记录」）。
 pub fn log_dir() -> PathBuf {
-    let base = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(".stool").join("logs")
+    log_dir_of(
+        std::env::var_os("STOOL_LOG_DIR").map(PathBuf::from),
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from),
+    )
+}
+
+/// [`log_dir`] 的纯逻辑：把环境变量当参数喂进来，才能在单测里钉死覆盖规则。
+fn log_dir_of(override_dir: Option<PathBuf>, profile: Option<PathBuf>) -> PathBuf {
+    if let Some(d) = override_dir {
+        return d;
+    }
+    #[cfg(test)]
+    {
+        let _ = profile;
+        std::env::temp_dir().join(format!("stool-test-logs-{}", std::process::id()))
+    }
+    #[cfg(not(test))]
+    {
+        profile.unwrap_or_else(std::env::temp_dir).join(".stool").join("logs")
+    }
 }
 
 /// 当天日志文件路径。
@@ -112,14 +138,45 @@ fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
 }
 
 // ---------- 无依赖的日期/时间格式化 ----------
+//
+// ⚠️ **一律用本地时区**。这里曾经直接拿 `UNIX_EPOCH` 的秒数除以 86400 换算日期，
+// 等于记 **UTC** —— 在东八区比用户墙钟慢整 8 小时：用户 20:31 点的「刷新」，
+// 日志里写成 12:31，直觉上就是「时间对不上、操作也对不上」（2026-09 用户反馈）。
+// Windows 下改走 `GetLocalTime`（含夏令时与半时区），非 Windows 回退 UTC。
+
+/// 本地墙钟表示的「类 Unix 秒」= UTC 秒 + 时区偏移。
+/// 日志里所有时间口径都从这一个函数出 —— 别再各自 `SystemTime::now()`。
+#[cfg(windows)]
+fn local_secs() -> i64 {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: SYSTEMTIME 全是 POD 字段；GetLocalTime 只填这一个出参。
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    days_from_civil(st.wYear as i64, st.wMonth as u32, st.wDay as u32) * 86_400
+        + st.wHour as i64 * 3_600
+        + st.wMinute as i64 * 60
+        + st.wSecond as i64
+}
+
+/// 非 Windows 没有时区换算，退回 UTC（STool 目前只发 Windows 版）。
+#[cfg(not(windows))]
+fn local_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 fn now_stamp() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
+    stamp_from_secs(local_secs())
+}
+
+/// 把「类 Unix 秒」格式化成 `YYYY-MM-DD HH:MM:SS`。
+/// 纯函数（不读时钟）：跨日 / 跨月 / 闰年 / 负秒这些边界才能钉死在单测里。
+fn stamp_from_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -133,26 +190,19 @@ fn now_stamp() -> String {
 }
 
 pub fn today() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let (y, m, d) = civil_from_days(local_secs().div_euclid(86_400));
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// 当前时间的紧凑时间戳（用于导出文件名）：`YYYYMMDD-HHMMSS`。
 pub fn stamp_compact() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let rem = secs % 86_400;
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let secs = local_secs();
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
 }
 
-/// Howard Hinnant 的 days → (year, month, day) 算法（本地时区近似为 UTC）。
+/// Howard Hinnant 的 days → (year, month, day) 算法。
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -166,6 +216,19 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// [`civil_from_days`] 的逆函数：(year, month, day) → days。
+/// Windows 下把 `GetLocalTime` 的墙钟折成秒要用；非 Windows 只有单测用得到。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,12 +240,74 @@ mod tests {
     }
 
     #[test]
+    fn civil_days_round_trip() {
+        // 逆函数必须与正函数互为反函数（含 1970 之前、闰日 2024-02-29、跨世纪 2000-03-01）
+        for days in [-31_000i64, -1, 0, 1, 11_016, 19_723, 19_782, 29_999] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "回环失败：{days} → {y}-{m:02}-{d:02}");
+        }
+    }
+
+    #[test]
+    fn stamp_from_secs_boundaries() {
+        assert_eq!(stamp_from_secs(0), "1970-01-01 00:00:00");
+        assert_eq!(stamp_from_secs(1_700_000_000), "2023-11-14 22:13:20");
+        // 跨日：2024-03-01 的前一秒必须是 2024-02-29（闰年）
+        assert_eq!(stamp_from_secs(1_709_251_199), "2024-02-29 23:59:59");
+        assert_eq!(stamp_from_secs(1_709_251_200), "2024-03-01 00:00:00");
+        // 负秒不 panic、不借位错（`div_euclid` / `rem_euclid` 语义）
+        assert_eq!(stamp_from_secs(-1), "1969-12-31 23:59:59");
+    }
+
+    /// 独立再问一次 Windows 的本地墙钟（不复用 `local_secs` 的实现），
+    /// 对不上就说明 `local_secs()` 没真的用本地时间 —— 例如退回成 `utc_secs()`，
+    /// 在东八区会整整差 28800 秒；也能兜住 `SYSTEMTIME` 布局写错。
+    #[cfg(windows)]
+    #[test]
+    fn local_secs_matches_win32_local_clock() {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut st) };
+        let os_local = days_from_civil(st.wYear as i64, st.wMonth as u32, st.wDay as u32) * 86_400
+            + st.wHour as i64 * 3_600
+            + st.wMinute as i64 * 60
+            + st.wSecond as i64;
+        let diff = (os_local - local_secs()).abs();
+        assert!(diff <= 2, "local_secs 与 Win32 本地时钟相差 {diff} 秒（应 ≤2）");
+    }
+
+    #[test]
+    fn log_dir_honors_env_override() {
+        let tmp = std::env::temp_dir();
+        let ovr = tmp.join("stool-logs-override");
+        let prof = tmp.join("fake-profile");
+        assert_eq!(log_dir_of(Some(ovr.clone()), Some(prof)), ovr, "STOOL_LOG_DIR 应优先");
+    }
+
+    /// 回归：单测绝不能写到用户真实的日志目录 ——
+    /// 否则 `cargo test` 的用例数据会出现在界面的「运行日志」里。
+    #[test]
+    fn tests_never_write_to_real_log_dir() {
+        let tmp = std::env::temp_dir();
+        let prof = tmp.join("fake-profile");
+        let d = log_dir_of(None, Some(prof.clone()));
+        assert!(!d.starts_with(&prof), "单测日志跑进了真实目录: {}", d.display());
+        assert!(
+            d.to_string_lossy().contains("stool-test-logs-"),
+            "单测日志应在进程专属临时目录，实际: {}",
+            d.display()
+        );
+    }
+
+    #[test]
     fn log_writes_line() {
         log("TEST", "hello diag");
         let p = log_path();
         assert!(p.exists());
         let content = std::fs::read_to_string(&p).unwrap_or_default();
         assert!(content.contains("hello diag"));
+        assert!(p.starts_with(std::env::temp_dir()), "日志落到不该去的地方: {}", p.display());
     }
 
     #[test]
