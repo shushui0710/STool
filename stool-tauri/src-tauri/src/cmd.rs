@@ -2115,6 +2115,13 @@ pub async fn runtime_mvmz_refresh(state: tauri::State<'_, AppState>) -> Result<M
             let sess = guard.as_mut().ok_or_else(|| {
                 "还没连上游戏。\n改法：先点「启动并连接」（或先手动开着游戏再点「只连接」）。".to_string()
             })?;
+            // 先自纠目标：STool 是「启动游戏 → 立刻连接」，那一刻 NW.js 的后台页
+            // 常常先于游戏页就绪，旧逻辑会把会话钉在后台页上 —— 那样读出来永远是
+            // mv=false、界面永远「还没进入存档」，点「刷新」也就永远没反应。
+            // 这里重挑一次；换了目标就把名称表清掉重读。
+            if sess.game.retarget(MVMZ_PORT)? {
+                sess.names = serde_json::Value::Null;
+            }
             let raw = sess.game.read_state()?;
             // 顺带把名称表刷新一次（游戏可能刚换过语言 / 读了别的存档）
             if let Ok(n) = sess.game.read_names() {
@@ -2151,7 +2158,12 @@ fn mvmz_state_from_json(
             variables: Vec::new(),
             switches: Vec::new(),
             items: Vec::new(),
-            note: "连上了，但游戏核心还没加载：请先进入游戏标题、或读一个存档，然后点「刷新」。".to_string(),
+            // 三种可能都要交代清楚：仍停在标题画面 / 正在读盘 /（历史问题）连到的不是游戏画面。
+            // 「刷新」现在会自动重新找准游戏页，所以直接把它写进修法里 —— 用户最先试的就是它。
+            note: "已连上游戏，但还没读到存档数据 —— 可能还停在标题画面，或正在读盘。\n\
+                   改法：在游戏里点「开始游戏」或「继续游戏」进到游戏画面，再点「刷新」；\
+                   若你已经在游戏画面里，也点一下「刷新」，它会自动重新找准游戏页。"
+                .to_string(),
         });
     }
     let gold = raw.get("gold").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -2254,6 +2266,11 @@ pub async fn runtime_mvmz_set(
             let sess = guard.as_mut().ok_or_else(|| {
                 "还没连上游戏。\n改法：先点「启动并连接」（或先手动开着游戏再点「只连接」）。".to_string()
             })?;
+            // 同 refresh：写之前先把可能钉错的目标纠回来，否则会以
+            // 「游戏还没进入存档」为名把用户拦下，而其实游戏早就进画面了。
+            if sess.game.retarget(MVMZ_PORT)? {
+                sess.names = serde_json::Value::Null;
+            }
             match kind_c.as_str() {
                 "gold" => {
                     let n = v_c.as_i64().unwrap_or(0);
