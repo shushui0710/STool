@@ -26,6 +26,17 @@
 //!   映射直接写进 .rpy，游戏目录不落 JSON）。
 //!
 //! 未命中映射的文本一律保留原文。
+//!
+//! **只替换「给人看的文字」**（MV/MZ 侧口径，见 HOOK_JS 的 SKIP_KEYS / TEXT_PARAM）：
+//! - 资源名字段一律跳过：`title1Name`/`title2Name`/`faceName`/`characterName`/`battlerName`/
+//!   `battleback*Name`/`parallaxName`/`tilesetName`，以及音频描述符 `{name,volume,...}` 的 `name`；
+//! - 事件指令只替换文字参数（401/405 正文、102/402 选项、101 说话人、320/324/325 名字），
+//!   其余指令（显示图片 231/232、播放音频 241/245/249/250、脚本 355/655 等）原样不动。
+//!
+//! 原因是实测出来的坑：翻译表的「原文」常与游戏资源文件名同形（本仓验证用的那个游戏里
+//! 有 158 个撞名，如 `タイトル画面` → 标题画面、`スチル1` → 静态图像1）。早先的实现只按
+//! 「像不像路径」判断，而 `タイトル画面` 没扩展名、没过 `looksLikePath`，于是被整句替换，
+//! `$dataSystem.title1Name` 变成中文，游戏去找 `img/titles1/标题画面.png` 当场报错。
 //! 幂等与可还原：所有会改动的原文件（`plugins.js`、入口 HTML）首次注入前都做
 //! `*.stool.bak` 备份，卸载时优先按备份字节级还原。
 
@@ -455,7 +466,12 @@ pub fn uninstall_html(root: &Path) -> Result<String, String> {
 const HOOK_JS: &str = r#"/* STool 运行时汉化注入（MTool 式）—— 由 STool 自动生成，请勿手改
  * 读取顺序：<游戏目录>/stool_translate.json → translation.json
  * 格式：{ "原文": "译文" }（也允许分组嵌套，加载时自动拍平）
- * 规则：整句精确匹配；未命中映射的文本一律保留原文；不修改任何游戏文件。
+ * 规则：整句优先；整句没命中时再做「最长片段」贪心替换（与 MTool 同款，因为表里有上千条
+ *      片段键，如「は防御の構えを取った！」「のダメージを受けた！」）；都没命中就保留原文。
+ *      不修改任何游戏文件。
+ *      —— 只替换「给人看的文字」：数据库/地图里的普通字符串 + 事件指令的文字参数（白名单）。
+ *      —— 资源名字段（title1Name/faceName/*Name、音频描述符的 name）与路径/备注一律跳过，
+ *         否则引擎会按中文名去找图片音频（典型报错 Failed to load img/titles1/中文名.png）。
  */
 (function () {
     "use strict";
@@ -510,17 +526,110 @@ const HOOK_JS: &str = r#"/* STool 运行时汉化注入（MTool 式）—— 由
         console.warn("[STool] 未找到翻译 JSON，本次运行不做替换");
     }
 
-    function tr(s) {
-        if (!MAP || typeof s !== "string") return s;
-        var m = MAP[s];
-        return (typeof m === "string" && m.length > 0) ? m : s; // 未命中 → 保留原文
+    // ---- 替换规则：整句优先 → 未命中再做「最长片段」贪心替换 -------------------
+    // 为什么需要子串：MTool 的表里有上千条「片段键」（は防御の構えを取った！ / のダメージを受けた！ /
+    // おっぱいですよ」 …），是给「角色名/数字 + 模板」拼出来的句子用的。只做整句匹配的话，
+    // 「SHUは防御の構えを取った！」「\v[61]ダメージを受けた！」这类一句都命中不了（等于整段漏掉）。
+    var TRIE = null;       // 翻译表的前缀树。贪心取最长片段靠它，别退回「逐位×每种键长」的写法
+    var TRIE_END = "\u0000"; // 节点上存译文的键（正文不会含 NUL）
+    var MIN_FRAG = 2;      // 片段最短长度。1 字键会把整段文本改烂，永不参与子串替换
+    var CACHE = Object.create(null); // 输入 → 输出。drawText 每帧重复率高，缓存是性能关键
+    var CACHE_N = 0;
+    var CACHE_MAX = 8192;
+
+    function buildTrie() {
+        var root = {};
+        for (var k in MAP) {
+            if (k.length < MIN_FRAG) continue;
+            var v = MAP[k];
+            if (typeof v !== "string" || v.length === 0) continue;
+            var node = root;
+            for (var i = 0; i < k.length; i++) {
+                var c = k.charAt(i);
+                node = node[c] || (node[c] = {});
+            }
+            node[TRIE_END] = v;
+        }
+        TRIE = root;
     }
 
-    // 这些字段的字符串多半是文件路径/备注，替换会破坏资源加载，跳过
-    var SKIP_KEYS = { characterName: 1, faceName: 1, battlerName: 1, note: 1 };
+    // 从左到右，每个起点沿 Trie 走到走不动为止，取「命中的最长前缀」。
+    // 一趟走下来只按实际字符推进，不做任何子串分配 —— 早先用「按长度降序逐个 substr 试」
+    // 的写法，实测 2.2ms/串，一屏几百次 drawText 直接把游戏拖垮。
+    function subst(s) {
+        if (!TRIE) return s;
+        var out = "", i = 0, n = s.length;
+        while (i < n) {
+            var node = TRIE, best = null, bestLen = 0;
+            for (var j = i; j < n; j++) {
+                node = node[s.charAt(j)];
+                if (!node) break;
+                var v = node[TRIE_END];
+                if (typeof v === "string") { best = v; bestLen = j - i + 1; }
+            }
+            if (best !== null) { out += best; i += bestLen; }
+            else { out += s.charAt(i); i++; }
+        }
+        return out;
+    }
+
+    function tr(s) {
+        if (!MAP || typeof s !== "string" || s === "") return s;
+        var m = MAP[s];
+        if (typeof m === "string" && m.length > 0) return m; // 整句命中：最准，直接用
+        if (!TRIE) return s;
+        var c = CACHE[s];
+        if (typeof c === "string") return c;
+        var out = subst(s);
+        if (CACHE_N >= CACHE_MAX) { CACHE = Object.create(null); CACHE_N = 0; }
+        CACHE[s] = out;
+        CACHE_N++;
+        return out;
+    }
+
+    // 这些字段存的是「资源文件名」或「引擎/插件备注」——把译文写回去会让引擎按中文名去找
+    // 图片/音频，直接报 "Failed to load img/xxx/中文名.png"。翻译表里的原文常与资源名同形
+    // （本游戏实测 158 个：タイトル画面 / スチル1 / ガーデン・シティ_2 ...），所以按字段跳过。
+    var SKIP_KEYS = {
+        characterName: 1, faceName: 1, battlerName: 1, note: 1, meta: 1,
+        title1Name: 1, title2Name: 1,
+        battleback1Name: 1, battleback2Name: 1,
+        parallaxName: 1, tilesetName: 1, animationName: 1
+    };
     function looksLikePath(s) {
         return /[\/\\]/.test(s) ||
             /\.(png|ogg|m4a|wav|mp3|jpg|jpeg|webp|json|txt|rvdata2?|rpgmvp|rpgmvo|rpgmvm|exe)$/i.test(s);
+    }
+    // 音频描述符 {name, volume, pitch, pan}：这里的 name 是音频文件名（$dataSystem.titleBgm 等）
+    function isSoundDescriptor(o) {
+        return !Array.isArray(o) && typeof o.name === "string" && typeof o.volume === "number";
+    }
+
+    // 事件指令「参数位 → 给人看的文字」白名单。**没列到的一律不动**，这样
+    // 显示图片(231/232)、播放音频(241/245/249/250)、更换战斗背景(132)、更换角色图像(236)、
+    // 脚本(355/655)、注释(108/408) 这些携带资源名或代码的指令就不会被改坏。
+    var TEXT_PARAM = {
+        101: [4], // 显示文字：说话人姓名（[0] 是头像文件名，不能动）
+        102: [0], // 显示选项：选项文本数组
+        401: [0], // 显示文字：正文行
+        402: [0], // 当[选项]：分支标题要跟选项一起变
+        405: [0], // 显示滚动文字：正文行
+        320: [1], // 更改姓名
+        324: [1], // 更改称号
+        325: [1]  // 更改简介
+    };
+    function applyTextParams(cmd) {
+        var idx = TEXT_PARAM[cmd.code];
+        if (!idx) return;
+        var ps = cmd.parameters;
+        if (!Array.isArray(ps)) return;
+        for (var i = 0; i < idx.length; i++) {
+            var v = ps[idx[i]];
+            if (typeof v === "string") ps[idx[i]] = tr(v);
+            else if (Array.isArray(v)) {
+                for (var j = 0; j < v.length; j++) if (typeof v[j] === "string") v[j] = tr(v[j]);
+            }
+        }
     }
 
     function walk(v, depth, seen) {
@@ -533,12 +642,17 @@ const HOOK_JS: &str = r#"/* STool 运行时汉化注入（MTool 式）—— 由
                 if (e && typeof e === "object") walk(e, depth + 1, seen);
                 else if (typeof e === "string") v[a] = tr(e);
             }
+        } else if (typeof v.code === "number" && Array.isArray(v.parameters)) {
+            applyTextParams(v); // 事件指令：只碰白名单参数位
         } else {
+            var sound = isSoundDescriptor(v);
             for (var k in v) {
                 if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+                if (SKIP_KEYS[k]) continue;
+                if (sound && k === "name") continue; // 音频文件名
                 var val = v[k];
                 if (val && typeof val === "object") walk(val, depth + 1, seen);
-                else if (typeof val === "string" && !SKIP_KEYS[k] && !looksLikePath(val)) v[k] = tr(val);
+                else if (typeof val === "string" && !looksLikePath(val)) v[k] = tr(val);
             }
         }
         seen.pop();
@@ -576,26 +690,29 @@ const HOOK_JS: &str = r#"/* STool 运行时汉化注入（MTool 式）—— 由
     }
 
     // 动态文本（脚本临时拼出来的对话等）显示层兜底；MV/MZ 同签名，改 arguments[0] 即可
+    // 显示层兜底：动态拼出来的文本（含 \v[n] 之类转义码展开后的结果）只能在这里拦。
+    // Window_Base 覆盖常规窗口；Bitmap.drawText 再兜最底层一层 —— DTextPicture / Text2Frame
+    // 这类「把文字直接画进位图」的插件不经过 Window_Base，只挂 Window_Base 会整片漏掉。
+    function patchDrawText(obj, name) {
+        if (!obj || typeof obj[name] !== "function") return;
+        var orig = obj[name];
+        obj[name] = function () {
+            if (arguments.length > 0) arguments[0] = tr(arguments[0]);
+            return orig.apply(this, arguments);
+        };
+    }
+
     function installTextHooks() {
-        if (typeof Window_Base === "undefined") return;
-        if (Window_Base.prototype.drawText) {
-            var _dt = Window_Base.prototype.drawText;
-            Window_Base.prototype.drawText = function () {
-                if (arguments.length > 0) arguments[0] = tr(arguments[0]);
-                return _dt.apply(this, arguments);
-            };
+        if (typeof Window_Base !== "undefined") {
+            patchDrawText(Window_Base.prototype, "drawText");
+            patchDrawText(Window_Base.prototype, "drawTextEx");
         }
-        if (Window_Base.prototype.drawTextEx) {
-            var _dtx = Window_Base.prototype.drawTextEx;
-            Window_Base.prototype.drawTextEx = function () {
-                if (arguments.length > 0) arguments[0] = tr(arguments[0]);
-                return _dtx.apply(this, arguments);
-            };
-        }
+        if (typeof Bitmap !== "undefined") patchDrawText(Bitmap.prototype, "drawText");
     }
 
     loadMap();
     if (MAP) {
+        buildTrie(); // 片段替换用的前缀树，装钩子前必须先建好
         if (typeof DataManager !== "undefined" || typeof Scene_Boot !== "undefined") installDataHooks();
         installTextHooks();
     }
@@ -967,6 +1084,58 @@ mod tests {
         std::fs::write(&p, "{\"a\":\"\"}").unwrap();
         assert!(load_map(&p).is_err()); // 全是空译文 = 无有效条目
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归锁：MV/MZ 运行时 Hook 必须跳过资源名字段、事件指令只走文字参数白名单。
+    ///
+    /// 背景（实测 bug）：`$dataSystem.title1Name = "タイトル画面"` 被整句替换成 `标题画面`，
+    /// 游戏随即报 `Failed to load img/titles1/标题画面.png` 并卡在标题画面。
+    /// 根因是旧实现只按 `looksLikePath` 判断，而 `タイトル画面` 既无扩展名也无斜杠。
+    #[test]
+    fn test_mv_hook_protects_asset_names() {
+        for k in [
+            "title1Name", "title2Name", "faceName", "characterName", "battlerName",
+            "battleback1Name", "battleback2Name", "parallaxName", "tilesetName", "note",
+        ] {
+            assert!(HOOK_JS.contains(&format!("{k}: 1")), "SKIP_KEYS 缺少资源名字段 {k}");
+        }
+        // 文字指令进白名单
+        for code in ["101", "102", "401", "402", "405", "320", "324", "325"] {
+            assert!(HOOK_JS.contains(&format!("{code}: [")), "TEXT_PARAM 缺少文字指令 {code}");
+        }
+        // 带资源名/代码的指令绝不能进白名单
+        for code in ["231", "232", "241", "245", "249", "250", "132", "236", "355", "655"] {
+            assert!(!HOOK_JS.contains(&format!("{code}: [")), "TEXT_PARAM 不该包含 {code}");
+        }
+        // 音频描述符的 name = 文件名，要跳过
+        assert!(HOOK_JS.contains("sound && k === \"name\""));
+        assert!(HOOK_JS.contains("isSoundDescriptor"));
+        // 旧的「只按像不像路径判断」实现已移除
+        assert!(!HOOK_JS.contains("!SKIP_KEYS[k] && !looksLikePath(val)"));
+    }
+
+    /// 回归锁：MV/MZ Hook 的替换规则必须是「整句优先 → 最长片段贪心兜底」，并且显示层要挂到
+    /// `Bitmap.prototype.drawText`（DTextPicture / Text2Frame 这类插件把文字直接画进位图，
+    /// 只挂 `Window_Base` 会整片漏掉）。
+    ///
+    /// 纯 Rust 测不了 JS 行为，真正的行为验证在 `scripts/verify_inject_hook.cjs`（Node 里跑）。
+    #[test]
+    fn test_mv_hook_substring_fallback() {
+        assert!(HOOK_JS.contains("function subst("), "缺少片段替换实现");
+        assert!(HOOK_JS.contains("function buildTrie()"), "缺少前缀树构建");
+        assert!(HOOK_JS.contains("TRIE_END"), "前缀树缺少存放译文的节点键");
+        assert!(HOOK_JS.contains("MIN_FRAG = 2"), "1 字键必须排除在片段替换之外");
+        assert!(
+            HOOK_JS.contains("CACHE = Object.create(null)"),
+            "缓存必须用无原型对象，否则 __proto__/constructor 会撞键"
+        );
+        // 索引必须在装钩子之前建好，否则首帧起就静默不替换
+        let idx = HOOK_JS.find("buildTrie();").expect("未调用 buildTrie()");
+        let hooks = HOOK_JS.find("installDataHooks();").expect("未调用 installDataHooks()");
+        assert!(idx < hooks, "buildTrie() 必须在 installDataHooks() 之前调用");
+        // 显示层：Window_Base 三个 + Bitmap 一层
+        assert!(HOOK_JS.contains(r#"patchDrawText(Window_Base.prototype, "drawTextEx")"#));
+        assert!(HOOK_JS.contains(r#"patchDrawText(Bitmap.prototype, "drawText")"#));
     }
 
     #[test]
