@@ -47,6 +47,7 @@ const ModsPage = {
     this.err = "";
     this.msg = "";
     this.preview = null;
+    this.previewErr = "";
     this.busy = false;
 
     if (!Store.gameRoot) return this.renderNeedGame();
@@ -82,15 +83,21 @@ const ModsPage = {
   async runPreview() {
     if (!this.srcDir) {
       this.preview = null;
+      this.previewErr = "";
       return;
     }
     const r = await Tauri.call("mods_preview", { srcDir: this.srcDir });
     if (r.ok) {
       this.preview = r.data;
+      this.previewErr = "";
       log(`mods: 预演冲突 ${r.data.conflict_count} 处`);
     } else {
-      // 预演失败不弹错（可能只是目录选错了），清空即可，安装时会再报一次
+      // 预演失败不弹错（可能只是目录选错了），但**必须记下来** ——
+      // 以前只写日志、`preview` 留 null，渲染时就掉进「没有抢文件」那个分支，
+      // 于是「检查过、没冲突」这句会在根本没检查成功的情况下说出来（2026-09 修）。
+      // 安装时还会再查一次，所以这里只做提示，不阻塞。
       this.preview = null;
+      this.previewErr = r.err;
       log(`mods: 预演失败 ${r.err}`);
     }
   },
@@ -207,6 +214,12 @@ const ModsPage = {
           <strong>这个补丁和已装的 MOD 抢 ${pv.conflict_count} 个文件。</strong>
           直接装会被拦下。请二选一：先把冲突的 MOD 停用，或勾上下面的「允许冲突覆盖」强行覆盖。
           ${rows}
+        </div>`;
+      } else if (this.previewErr) {
+        // 预演**没跑成功**（目录不存在 / 里面没有文件 / 读不了）。
+        // 这里绝不能落到下面那句「✔ 检查过了，没有抢文件」—— 那是假保证。
+        previewHtml = `<div class="note warn mt2">
+          <strong>没能预演冲突。</strong>${esc(this.previewErr)}
         </div>`;
       } else {
         previewHtml = `<div class="note ok mt2">✔ 检查过了，和已有 MOD 没有抢文件。</div>`;
@@ -366,12 +379,20 @@ const ModsPage = {
   // -- 动作 -----------------------------------------------------------------
 
   async pickDir() {
+    // ⚠️ `Tauri.call` 恒定返回 `{ ok, data }` 这个**包装对象**（bridge.js），
+    // 不是裸返回值。曾经写成 `const d = await ...; if (!d) return; this.srcDir = d;`
+    // —— 包装对象永远为真，于是 `srcDir` 被塞进了整个对象：
+    //   · 输入框 `shortPath(srcDir)` 显示成 `[object Object]`；
+    //   · `mods_preview` 的 `srcDir: String` 反序列化失败 → 预演永远不工作（且只写日志）；
+    //   · `mods_install` 同理报错。
     const d = await Tauri.call("pick_folder", { title: "选择补丁文件夹" });
-    if (!d) return;
-    this.srcDir = d;
+    if (!d.ok) return toast(d.err, "err");
+    if (!d.data) return;
+    this.srcDir = d.data;
     this.name = this.name || "";
     this.previewing = true;
     this.preview = null;
+    this.previewErr = "";
     await this.render();
     await this.runPreview();
     this.previewing = false;

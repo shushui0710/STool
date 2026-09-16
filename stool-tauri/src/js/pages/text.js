@@ -469,7 +469,10 @@ const TextPage = {
 
   async openCsv() {
     if (!this.csvPath) return;
-    const r = await Tauri.call("shell_open", { path: this.csvPath });
+    // 注意：这里必须用 `open_file`。曾经写成 `shell_open` —— 那只是 Rust 侧的
+    // **私有辅助函数**（cmd.rs 里 `fn shell_open(p: &Path)`），不是注册过的命令，
+    // 所以点「打开表格去翻译」永远只会弹一句 “Command shell_open not found”。
+    const r = await Tauri.call("open_file", { path: this.csvPath });
     if (!r.ok) toast(r.err, "err");
   },
 

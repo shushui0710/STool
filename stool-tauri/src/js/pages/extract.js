@@ -118,8 +118,12 @@ const ExtractPage = {
       <div class="seg">${this.advancedHtml()}</div>
     `;
 
-    $("#ePick", this.root).addEventListener("click", () => this.pickOut());
-    $("#eGo", this.root).addEventListener("click", () => this.run("extract"));
+    // 每个都判空再绑 —— 这几行是「render 内联绑定」，一旦某个 id 不存在就抛异常，
+    // 后面所有绑定会被整块跳过（表现为「一堆按钮点了没反应」），所以别依赖「模板一定有」。
+    const pick = $("#ePick", this.root);
+    if (pick) pick.addEventListener("click", () => this.pickOut());
+    const go = $("#eGo", this.root);
+    if (go) go.addEventListener("click", () => this.run("extract"));
 
     const open = $("#eOpen", this.root);
     if (open) open.addEventListener("click", () => this.openFolder(this.result.out_dir));
