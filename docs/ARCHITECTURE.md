@@ -90,12 +90,31 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │   │                    IL2CPP 元数据字面量，精确）+ `scan_scene_strings`（场景二进制 ASCII
 │   │                    启发式兜底）；`looks_like_key` 白名单字符集过滤框架串、
 │   │                    `sort_candidates` 按相关性分层后再截断
-│   ├── inject.rs       运行时 JSON 注入汉化（SUPPORT_TABLE 声明范围与边界）
+│   ├── inject.rs       运行时 JSON 注入汉化（SUPPORT_TABLE 声明范围与边界）；
+│   │                   **只替换「给人看的文字」** —— 资源名字段（title1Name/faceName/*Name、
+│   │                   音频描述符的 name）与事件指令的非文字参数一律跳过，否则引擎会按
+│   │                   中文名去找图片音频（翻译表里的原文常与资源文件名同形，实测撞名 158 个）；
+│   │                   MV/MZ 的替换规则 = **整句优先 → 最长片段兜底**（表里有上千条片段键，
+│   │                   靠前缀树 Trie 取最长匹配，`MIN_FRAG=2` 挡住 1 字键）+ 结果缓存，
+│   │                   显示层挂 `Window_Base.drawText/drawTextEx` 与 `Bitmap.prototype.drawText`
 │   ├── translate.rs    机翻（OpenAI 兼容；术语表、断点续翻、`jobs` 批并发 + 429/5xx 指数退避）
 │   ├── tpack.rs        翻译包导出/导入
 │   ├── saves.rs        存档文档模型（多格式解析 + 指针寻址编辑）
 │   ├── mods.rs         MOD 安装/启停/卸载
-│   ├── runtime.rs      运行时修改（内存/脚本层）
+│   ├── runtime.rs      运行时修改（内存/脚本层）：MV/MZ 走 CDP 调试端口
+│   │                   （`Game.exe --remote-debugging-port`），自实现极简 HTTP + WebSocket，
+│   │                   **不引第三方 CDP 库**。四个必踩的坑见模块文档，结论是：
+│   │                   ① `/json` 里报的页面 URL 是 `chrome-extension://…`（那就是游戏页，
+│   │                      **别按 URL 过滤**，用「页面里有没有 `$gameParty`」判）；
+│   │                   ② HTTP 响应按 `Content-Length` / chunked 收，**不能靠对端关连接**判完
+│   │                      （Chromium 保持长连接 → 读超时 10060，响应其实已收全）；
+│   │                   ③ MV/MZ 把 `$gameParty`/`$dataSystem` 声明成 **`null`**，
+│   │                      「已声明」≠「已创建」→ 读写一律判 null，写前走 `ensure_ready()`；
+│   │                   ④ **「连上了」≠「连对页面了」**：同源下还有个没有 `$gameParty` 的
+│   │                      `background_page`，且常先于游戏页就绪。**只接受 `is_rpgm_page()`
+│   │                      为真的目标**（不许兜底），并留 `DebugGame::retarget()` 让
+│   │                      「刷新 / 写入」自纠 —— 否则会话钉在后台页上，界面永远
+│   │                      「还没进入存档」、点刷新永远没反应（2026-09 实际发生）。
 │   ├── xp3patch.rs     [新增] KiriKiri 运行时补丁包（P2-12）：`list` / `next_name` /
 │   │                   `build`（打 patchN.xp3，原封包不动）/ `remove`（只删自己建的）/
 │   │                   `build_changed`（与现有封包逐字节比对，**只打包改动文件** →
@@ -139,7 +158,14 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │                      机翻 API Key 用 **Windows DPAPI** 加密落盘（`enc:v1:<hex>`，
 │                      旧明文值仍可读，下次保存自动升级）；外部工具/Python 路径
 │                      **按跨机器成立的位置探测**（不写死本机绝对路径）
-└── diag.rs            诊断：panic 钩子 / 日志落盘 / guard / 时间格式化
+└── diag.rs            诊断：panic 钩子 / 日志落盘 / guard / 时间格式化。
+                       两条硬约定：**时间一律本地时区**（`local_secs()` 走 Windows
+                       `GetLocalTime`；曾用 UTC，在东八区慢 8 小时，用户报「时间对不上」）；
+                       **单测不得写真实日志目录**（`cfg(test)` 下落 `%TEMP%\stool-test-logs-<pid>\`，
+                       另可用 `STOOL_LOG_DIR` 覆盖 —— 否则 `cargo test` 的用例数据
+                       （boom / hello diag / 读取失败 f3.bin / 解包断点 / 机翻 503）
+                       会混进界面的「运行日志」，用户以为是自己的操作）。
+                       日志文件 `~/.stool/logs/stool-YYYY-MM-DD.log` 按天累积、多次会话追加。
 ```
 
 ---
