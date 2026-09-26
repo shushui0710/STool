@@ -255,27 +255,6 @@ pub fn list_media(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 解码图片为 RGBA8。返回 (像素, 宽, 高)。超大图拒绝解码以防卡顿。
-pub fn decode_image_rgba(data: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    let img = image::load_from_memory(data).map_err(|e| format!("图片解码失败: {e}"))?;
-    let (w, h) = (img.width(), img.height());
-    if w as u64 * h as u64 > 40_000_000 {
-        return Err(format!("图片过大（{w}×{h}），不预览"));
-    }
-    let rgba = img.to_rgba8().into_raw();
-    Ok((rgba, w, h))
-}
-
-/// 常见音频扩展名能否播放（不支持的格式提前告知，避免用户困惑）。
-pub fn audio_supported(path: &Path) -> Option<String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "ogg" | "oga" | "wav" | "mp3" | "flac" => None,
-        "m4a" | "aac" | "wma" => Some(format!("该格式（{ext}）暂不支持试听，可先用工具转成 ogg/mp3")),
-        _ => Some("未知音频格式".to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

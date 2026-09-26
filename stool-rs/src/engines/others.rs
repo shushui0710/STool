@@ -10,30 +10,28 @@ use super::{Ctx, Detection, Engine, Op, OpOutcome};
 use crate::formats::source::{self, Source};
 use crate::formats::{asar, marshal, nscript, pck, rgss, rpgmmv, xp3};
 
+/// 按扩展名递归列出文件。
+///
+/// 实现落在 [`crate::features::saves::list_files`] —— 同一份逻辑只留一处，
+/// 避免两处各写一遍后口径漂移。
 pub fn list_files_by_ext(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for e in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        let p = e.path();
-        if p.is_file() {
-            if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-                if exts.contains(&ext.to_lowercase().as_str()) {
-                    out.push(p.to_path_buf());
-                }
-            }
-        }
-    }
-    out.sort();
-    out
+    crate::features::saves::list_files(root, exts)
 }
 
-/// 供兄弟模块使用的别名。
-pub fn list_files_by_ext_pub(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
-    list_files_by_ext(root, exts)
+/// 取文件名（不含目录）为字符串；取不到时返回空串。
+pub fn file_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// 供兄弟模块使用的别名（`file_name` 本体是模块私有）。
-pub fn file_name_pub(p: &Path) -> String {
-    file_name(p)
+/// 一行描述「某目录下有哪些封包」，供各插件的 `describe` 复用。
+///
+/// 四处插件（RGSS / KiriKiri / Godot / Wolf）原本各抄一份同样的 `format!`，
+/// 改一次就得改四遍。统一到这里。
+pub fn describe_archives(dir: &Path, exts: &[&str]) -> String {
+    format!(
+        "封包: {:?}",
+        list_files_by_ext(dir, exts).iter().map(|p| file_name(p)).collect::<Vec<_>>()
+    )
 }
 
 // ---------------- RPG Maker MV / MZ ----------------
@@ -429,10 +427,6 @@ impl Engine for RpgMakerMvPlugin {
     }
 }
 
-fn file_name(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
 // ---------------- RPG Maker XP/VX/Ace (RGSS) ----------------
 
 pub struct RpgMakerRgssPlugin;
@@ -472,7 +466,7 @@ impl Engine for RpgMakerRgssPlugin {
         vec![Op::Extract, Op::Repack, Op::Decompile, Op::TextExtract, Op::Save]
     }
     fn describe(&self, root: &Path) -> String {
-        format!("封包: {:?}", list_files_by_ext(root, &["rgssad", "rgss2a", "rgss3a"]).iter().map(|p| file_name(p)).collect::<Vec<_>>())
+        describe_archives(root, &["rgssad", "rgss2a", "rgss3a"])
     }
     fn extract(&self, ctx: &Ctx) -> OpOutcome {
         let mut archives = Vec::new();
@@ -864,7 +858,7 @@ impl Engine for KirikiriPlugin {
         vec![Op::Extract, Op::Repack, Op::TextExtract]
     }
     fn describe(&self, root: &Path) -> String {
-        format!("封包: {:?}", list_files_by_ext(root, &["xp3"]).iter().map(|p| file_name(p)).collect::<Vec<_>>())
+        describe_archives(root, &["xp3"])
     }
     fn repack(&self, ctx: &Ctx, src_dir: &Path) -> OpOutcome {
         // 对每个 xp3：若 src_dir/<封包名>/ 存在则从该目录重建该封包
@@ -1044,27 +1038,6 @@ pub fn decode_sjis_or_utf8(bytes: &[u8]) -> String {
     cow.into_owned()
 }
 
-/// 极简 Shift-JIS 解码：半角片假名直接映射，汉字区做映射表（常用区段），未命中用 U+FFFD。
-pub fn sjis_to_string_lossy(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b < 0x80 {
-            out.push(b as char);
-            i += 1;
-        } else if (0xA1..=0xDF).contains(&b) {
-            // 半角片假名
-            out.push(char::from_u32(0xFF61 + (b - 0xA1) as u32).unwrap_or('\u{FFFD}'));
-            i += 1;
-        } else {
-            out.push('\u{FFFD}');
-            i += 1;
-        }
-    }
-    out
-}
-
 fn strip_tags(s: &str) -> String {
     let mut out = String::new();
     let mut depth = 0usize;
@@ -1099,6 +1072,13 @@ impl Engine for GodotPlugin {
         if pck {
             d.hit(70, format!("{} 个 .pck 封包（如 {}）", scan.ext_count("pck"), scan.first_ext_name("pck")));
         }
+        // 自解压导出的 exe：PCK 追加在 exe 尾部（根目录没有散落的 .pck）。
+        // 单这一条即可定位（魔数 GDPC 是 Godot 独有），故给足 70 分。
+        if !pck {
+            if let Some(exe) = super::scan::find_embedded_godot_pck(&scan.root) {
+                d.hit(70, format!("{exe} 尾部内嵌 PCK（Godot 自解压导出）"));
+            }
+        }
         // 明文工程（未被 pck 打包）时 project.godot 是 Godot 独有特征，单独过线；
         // 已有 .pck 时只作补充证据，避免重复计分虚高。
         if scan.has_file_named("project.godot") {
@@ -1112,22 +1092,37 @@ impl Engine for GodotPlugin {
         vec![Op::Extract, Op::Repack, Op::Decompile]
     }
     fn describe(&self, root: &Path) -> String {
-        format!("封包: {:?}", list_files_by_ext(root, &["pck"]).iter().map(|p| file_name(p)).collect::<Vec<_>>())
+        let pcks = list_files_by_ext(root, &["pck"]);
+        if !pcks.is_empty() {
+            return describe_archives(root, &["pck"]);
+        }
+        if let Some(exe) = super::scan::find_embedded_godot_pck(root) {
+            return format!("PCK 内嵌于 {exe} 尾部（Godot 自解压导出，可直接解包）");
+        }
+        String::new()
     }
     fn extract(&self, ctx: &Ctx) -> OpOutcome {
-        let pcks: Vec<PathBuf> = list_files_by_ext(ctx.root, &["pck"]).into_iter().take(10).collect();
-        if pcks.is_empty() {
-            return OpOutcome::fail("未找到 .pck");
+        // 两种来源：散落的 .pck 文件（base=0），以及 exe 尾部内嵌的 PCK（base=偏移）。
+        let mut sources: Vec<(PathBuf, u64)> =
+            list_files_by_ext(ctx.root, &["pck"]).into_iter().take(10).map(|p| (p, 0)).collect();
+        if sources.is_empty() {
+            if let Some((exe, base)) = super::scan::embedded_godot_pck_offset(ctx.root) {
+                sources.push((ctx.root.join(&exe), base));
+            }
+        }
+        if sources.is_empty() {
+            return OpOutcome::fail("未找到 .pck（也没有内嵌 PCK 的自解压 exe）");
         }
         let mut done = 0usize;
         let mut failed = 0usize;
         let mut resume = crate::engines::Resume::open(ctx.out_dir, "extract", ctx.root).configured(ctx);
-        for (i, pckf) in pcks.iter().enumerate() {
+        for (i, (pckf, base)) in sources.iter().enumerate() {
             if ctx.cancelled() {
                 resume.flush();
                 return OpOutcome::fail("已取消");
             }
-            let mut src = match Source::open(pckf, source::MAX_ARCHIVE) {
+            let open_src = |p: &Path, b: u64| Source::open_or_region(p, b, source::MAX_ARCHIVE);
+            let mut src = match open_src(pckf, *base) {
                 Ok(s) => s,
                 Err(e) => {
                     resume.flush();
@@ -1155,13 +1150,13 @@ impl Engine for GodotPlugin {
                 &sub,
                 crate::engines::worker_count(ctx),
                 ctx,
-                || Source::open(pckf, source::MAX_ARCHIVE),
+                || Source::open_or_region(pckf, *base, source::MAX_ARCHIVE),
                 |s, e| pck::read_entry(s, e),
                 &mut resume,
             );
             done += w + skipped_here;
             failed += f;
-            ctx.report(i as f32 / pcks.len() as f32, &pckf.display().to_string());
+            ctx.report(i as f32 / sources.len() as f32, &pckf.display().to_string());
         }
         let skipped = resume.finish(failed == 0);
         let msg = crate::engines::with_fail_note(format!("解包 {done} 个文件 → {}", ctx.out_dir.display()), failed);

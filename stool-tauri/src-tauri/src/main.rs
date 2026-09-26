@@ -82,6 +82,7 @@ fn main() {
             cmd::mtl_save,
             cmd::unlock_plan,
             cmd::unlock_run,
+            cmd::unlock_list_keys,
             cmd::unlock_backups,
             cmd::unlock_restore,
             cmd::runtime_processes,

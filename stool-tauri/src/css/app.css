@@ -113,18 +113,6 @@ button { font: inherit; color: inherit; }
 .nav-item-hint { display: block; font-size: 11px; color: var(--text-3); margin-top: 1px; }
 .nav-item.on .nav-item-hint { color: var(--text-2); }
 
-.nav-item.soon .nav-item-title::after {
-  content: "建设中";
-  font-size: 10px;
-  color: var(--text-3);
-  background: var(--bg-raise);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 0 4px;
-  margin-left: 6px;
-  vertical-align: 1px;
-}
-
 .side-foot { flex: none; padding-top: var(--s3); display: flex; flex-direction: column; gap: var(--s2); }
 
 .game-chip {
@@ -185,7 +173,6 @@ button { font: inherit; color: inherit; }
 }
 .say-mark { flex: none; color: var(--text-3); font-weight: 500; }
 .say-body { flex: 1 1 auto; }
-.say-more { margin-top: var(--s1); color: var(--text-3); }
 
 /* --- 卡片 ---------------------------------------------------------------- */
 
@@ -233,13 +220,6 @@ button { font: inherit; color: inherit; }
 .btn-sm { height: 27px; padding: 0 10px; font-size: var(--fs-note); font-weight: 400; }
 .btn-lg { height: 40px; padding: 0 22px; font-size: 15px; }
 .btn-block { width: 100%; justify-content: center; }
-
-.btn-link {
-  border: 0; background: none; padding: 0;
-  color: var(--accent); cursor: pointer;
-  font-size: var(--fs-note);
-}
-.btn-link:hover { text-decoration: underline; }
 
 /* --- 表单 ---------------------------------------------------------------- */
 
@@ -330,7 +310,7 @@ textarea.field {
 .dim { color: var(--text-3); }
 .dim2 { color: var(--text-2); }
 .small { font-size: var(--fs-note); }
-.strong { font-weight: 500; }
+strong { font-weight: 500; }
 .mt2 { margin-top: var(--s2); }
 .mt3 { margin-top: var(--s3); }
 .mt4 { margin-top: var(--s4); }
@@ -438,6 +418,29 @@ ul.bullets li { margin: 2px 0; }
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-2);
+}
+
+/* 注册表键行：点一下把键名填进「按名写值」框。
+   结构 = 键名（占满）+ 当前值 + 类型标签；整行可点，悬停给反馈。 */
+.keyrow {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s2) var(--s1);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  border-radius: var(--r-ctl);
+}
+.keyrow:last-child { border-bottom: 0; }
+.keyrow:hover { background: var(--bg-hover); }
+.keyrow:active { background: var(--bg-active); }
+.keyrow > .grow {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-1);
 }
 
 /* 卡片正文：统一内边距与排版，段/列表不要各自带外边距。 */
@@ -627,8 +630,6 @@ ul.bullets li { margin: 2px 0; }
   display: inline-block;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
-
-.hidden { display: none !important; }
 
 /* --- 看素材：左列表 + 右预览 --------------------------------------------- */
 

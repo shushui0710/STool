@@ -19,7 +19,7 @@ pub struct ArtemisPlugin;
 
 /// 列举所有 `.pfs` 封包（递归；`.pfs` 可能不在游戏根，如 `万華鏡1` 在子目录里）。
 fn list_pfs(root: &Path) -> Vec<PathBuf> {
-    super::others::list_files_by_ext_pub(root, &["pfs"])
+    super::others::list_files_by_ext(root, &["pfs"])
 }
 
 /// 分卷封包（`x.pfs.000`）：本工具不支持，但要能识别出来并如实说明。
@@ -87,7 +87,7 @@ impl Engine for ArtemisPlugin {
             return "未发现 .pfs 封包".into();
         }
         let names: Vec<String> =
-            pfs_list.iter().map(|p| super::others::file_name_pub(p)).collect();
+            pfs_list.iter().map(|p| super::others::file_name(p)).collect();
         format!("封包 {} 个: {}", names.len(), names.join("、"))
     }
     fn extract(&self, ctx: &Ctx) -> OpOutcome {
@@ -98,7 +98,7 @@ impl Engine for ArtemisPlugin {
                 return OpOutcome::fail(format!(
                     "只发现 Artemis **分卷**封包（{}），STool 暂不支持分卷拼接。\
                      替代做法：用 GARbro 打开第一个分卷（如 x.pfs.000）导出，或找有现成解包工具的版本。",
-                    super::others::file_name_pub(&split[0])
+                    super::others::file_name(&split[0])
                 ));
             }
             return OpOutcome::fail("未找到 .pfs 封包");
@@ -115,14 +115,14 @@ impl Engine for ArtemisPlugin {
             let mut src = match Source::open(arc, source::MAX_ARCHIVE) {
                 Ok(s) => s,
                 Err(e) => {
-                    errors.push(format!("{}: {e}", super::others::file_name_pub(arc)));
+                    errors.push(format!("{}: {e}", super::others::file_name(arc)));
                     continue;
                 }
             };
             let index = match pfs::parse_index(&mut src) {
                 Ok(ix) => ix,
                 Err(e) => {
-                    errors.push(format!("{}: {e}", super::others::file_name_pub(arc)));
+                    errors.push(format!("{}: {e}", super::others::file_name(arc)));
                     continue;
                 }
             };
@@ -231,20 +231,20 @@ impl Engine for ArtemisPlugin {
             }
             // 备份已存在则保留（绝不覆盖）；备份失败就停手，不做无备份改写。
             if let Err(e) = crate::settings::backup_or_abort(arc) {
-                return OpOutcome::fail(format!("{}: {e}", super::others::file_name_pub(arc)));
+                return OpOutcome::fail(format!("{}: {e}", super::others::file_name(arc)));
             }
             match pfs::write_archive(arc, &ordered, ver) {
                 Ok(()) => {
                     rebuilt += 1;
                     msgs.push(format!(
                         "{}（{} 文件，pf{}）",
-                        super::others::file_name_pub(arc),
+                        super::others::file_name(arc),
                         ordered.len(),
                         ver as char
                     ));
                 }
                 Err(e) => {
-                    return OpOutcome::fail(format!("{} 写出失败: {e}", super::others::file_name_pub(arc)))
+                    return OpOutcome::fail(format!("{} 写出失败: {e}", super::others::file_name(arc)))
                 }
             }
         }

@@ -161,16 +161,13 @@ const TextPage = {
   },
 
   renderNeedGame() {
-    this.root.innerHTML = `<div class="seg">${emptyHtml(
+    renderNeedGame(
+      this.root,
       "①",
       "还没选游戏",
       "得先让 STool 知道是哪个游戏、什么引擎，才知道能不能走「不改游戏文件」这条更省事的路。",
-      "去选游戏",
       "tGoDetect"
-    )}</div>`;
-    $("#tGoDetect", this.root).addEventListener("click", () => {
-      location.hash = "#detect";
-    });
+    );
   },
 
   // -- 通道 A ---------------------------------------------------------------
@@ -686,50 +683,19 @@ const TextPage = {
   // =========================================================================
 
   progHtml() {
-    return `
-      <div class="mt3" id="tProgBody">
-        <div class="row tight">
-          <span class="small dim2" data-msg style="flex:1 1 auto;min-width:0">正在准备…</span>
-          <span class="small mono" data-pct>0%</span>
-        </div>
-        <div class="bar mt2"><i style="width:0%"></i></div>
-        <div class="row mt2">
-          <button class="btn btn-ghost btn-sm" id="tCancel">取消</button>
-        </div>
-      </div>`;
+    return progressHtml("tProg", "tCancel");
   },
 
   paintProgress(p) {
     this.prog = p;
-    const host = $("#tProg", this.root);
-    if (!host || !host.firstElementChild) return;
-    const pct = Math.max(0, Math.min(100, Math.round((p.frac || 0) * 100)));
-    const bar = host.querySelector(".bar > i");
-    if (bar) bar.style.width = pct + "%";
-    const pv = host.querySelector("[data-pct]");
-    if (pv) pv.textContent = pct + "%";
-    const mv = host.querySelector("[data-msg]");
-    if (mv) mv.textContent = clip(p.msg || "…", 64);
+    paintProgress(this.root, "tProg", p);
   },
 
   async subscribe() {
-    if (this.unlisten) {
-      try {
-        this.unlisten();
-      } catch (_) {}
-      this.unlisten = null;
-    }
-    this.unlisten = await Tauri.on("op:progress", (p) => this.paintProgress(p));
+    await subscribeProgress(this, this.root, "tProg");
   },
 
   async cancel() {
-    await Tauri.call("cancel_task");
-    toast("已请求取消，会在当前文件写完后停下。");
+    await cancelTask();
   },
 };
-
-/** 拼接路径（前端只管显示，真正的拼接在内核）。 */
-function joinPath(dir, name) {
-  const d = String(dir || "").replace(/[\\/]+$/, "");
-  return d ? d + "\\" + name : name;
-}

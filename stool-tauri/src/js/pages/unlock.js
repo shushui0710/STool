@@ -27,12 +27,21 @@ const UnlockPage = {
   route: "", // "" = 自动
   saveDir: "",
   filter: "",
+  // 按名写指定值：`名称=值,名称=值`。与 filter 的区别 —— filter 只筛「猜出来的
+  // 候选」，这里是**点名写**，不猜。有些 Unity 作品根本没有画廊键（内容按进度
+  // 解锁），只能靠它改真实键。
+  set: "",
 
   running: false,
   prog: null,
   result: null, // OpResult
   backups: [], // 撤销用
   showBackups: false,
+  // 「有哪些键可改」：注册表现存的全部值（只读拉取）。用户点一行就把键名填进 `set` 框，
+  // 省得他对着一个空输入框猜键名 —— SheepClicker 那次就是卡在这里。
+  keys: [],
+  keysLoaded: false,
+  showKeys: false,
   unlisten: null,
 
   actions() {
@@ -46,6 +55,10 @@ const UnlockPage = {
     this.result = null;
     this.backups = [];
     this.showBackups = false;
+    // 键列表按游戏走，换游戏要重拉（否则会把上一个游戏的键名填给这一个）
+    this.keys = [];
+    this.keysLoaded = false;
+    this.showKeys = false;
     this.loading = true;
     this.err = "";
 
@@ -83,6 +96,32 @@ const UnlockPage = {
     }
     await this.render();
     if (this.plan && this.plan.bundled.length > 0) await this.loadBackups();
+    // 键列表只对「改注册表键位」这条路线有意义（Unity 系）——
+    // 别的引擎拉出来只会是空的，白跑一趟。点开进阶区时也允许按需再拉。
+    if (this.plan && this.isRegistryRoute()) await this.loadKeys();
+  },
+
+  /** 这份计划里有没有「改注册表键位」这条手段。 */
+  isRegistryRoute() {
+    const p = this.plan;
+    if (!p || !p.routes) return false;
+    return p.routes.some(
+      (r) => (r.key || "").toLowerCase().includes("registry") || (r.key || "").includes("reg")
+    );
+  },
+
+  /** 拉「有哪些键可改」（只读）。失败不算致命：退化成「用户自己填」。 */
+  async loadKeys() {
+    if (this.keysLoaded) return;
+    const r = await Tauri.call("unlock_list_keys");
+    if (!r.ok) {
+      log(`unlock: unlock_list_keys 失败 ${r.err}`);
+      return;
+    }
+    this.keys = r.data || [];
+    this.keysLoaded = true;
+    log(`unlock: 读到 ${this.keys.length} 个现存注册表键`);
+    await this.render();
   },
 
   async loadBackups() {
@@ -113,16 +152,13 @@ const UnlockPage = {
   },
 
   renderNeedGame() {
-    this.root.innerHTML = `<div class="seg">${emptyHtml(
+    renderNeedGame(
+      this.root,
       "⑦",
       "还没选游戏",
       "解锁路线是按引擎选的（有的改注册表、有的改存档），所以得先知道这是什么游戏。",
-      "去选游戏",
       "uGoDetect"
-    )}</div>`;
-    $("#uGoDetect", this.root).addEventListener("click", () => {
-      location.hash = "#detect";
-    });
+    );
   },
 
   introHtml() {
@@ -239,8 +275,13 @@ const UnlockPage = {
       bundleBlock = `
         <div class="note ok">
           发现 <strong>${p.bundled.length}</strong> 个「自带全CG存档」候选 ——
-          这是最省事的一条路：把它按同名复制进存档目录，不用碰游戏文件。
+          按同名复制进存档目录即可，不用碰游戏文件。
           <div class="mt2">${list(p.bundled, 6)}</div>
+          <div class="small dim2 mt2">
+            注意：有些分享包只给了<strong>设置文件</strong>（音量 / 跳过 / 已读记录），
+            而 CG 标记其实存在<strong>进度存档</strong>里。若复制后没解锁，
+            说明这个包不完整 —— 改用注册表方式，或找游戏内的全开开关。
+          </div>
         </div>`;
     } else {
       bundleBlock = `
@@ -334,11 +375,11 @@ const UnlockPage = {
       <div class="seg">${this.advancedHtml()}</div>`;
   },
 
-  /** 进阶：Unity 注册表路线的键名过滤。收起来，绝大多数人不用管。 */
+  /** 进阶：Unity 注册表路线的键名过滤 / 按名写值。收起来，绝大多数人不用管。 */
   advancedHtml() {
     const run = this.running;
     return foldHtml(
-      "进阶：Unity 注册表键名过滤",
+      "进阶：Unity 注册表 · 键名过滤与按名写值",
       `<div class="small dim2">
          只在走「改注册表键位」这条路（Unity 引擎）时才有用 ——
          用来把要改写的键名限定在含某段文字的范围内。
@@ -350,8 +391,79 @@ const UnlockPage = {
        </div>
        <div class="small dim mt2">
          拿不准就留空。填错顶多是「没找到要改的键」，不会改坏东西。
-       </div>`
+       </div>
+       <div class="small dim2 mt4">
+         按名写指定值 —— 只写你点名的键，<strong>不猜</strong>。
+         有些作品根本没有画廊键（内容按进度解锁），只能这样改它的真实键：
+         <span class="mono">GameState_Follower=9999,Skill_MaidenLevel=99</span>。
+         类型按该键原样走（原来是字符串就写字符串）。留空 = 不用。
+       </div>
+       <div class="row mt3">
+         <input class="field mono grow" id="uSet" value="${esc(this.set)}"
+                placeholder="留空 = 不用。例如 GameState_Follower=9999"
+                ${run ? "disabled" : ""}>
+       </div>
+       <div class="small dim mt2">
+         写前会自动整键备份、写后逐项读回核对；结果卡里会列出「原值 → 新值」。
+       </div>
+       ${this.keysBlockHtml()}`
     );
+  },
+
+  /**
+   * 「有哪些键可改」—— 把注册表现存值摆出来，点一下把键名填进按名写值框。
+   *
+   * 只填**键名 + `=`**，值留给用户自己决定：我们不知道他想要多少，替他填个数就是瞎猜。
+   */
+  keysBlockHtml() {
+    if (!this.isRegistryRoute()) return "";
+    if (!this.keysLoaded) {
+      return `<div class="row tight mt4"><span class="spin"></span>
+        <span class="small dim2">正在读取注册表里现有的键…</span></div>`;
+    }
+    if (this.keys.length === 0) {
+      return `<div class="note info mt4">
+          注册表里<strong>没读到任何键</strong>。<br>
+          可能原因：①这个游戏不是 Unity 系（不走注册表这条路）；
+          ②游戏<strong>从没成功启动过</strong> —— 多数 Unity 作品要跑一次才写入注册表。<br>
+          <span class="dim2">先启动一次游戏、退出，再回来重进这一页。</span>
+        </div>`;
+    }
+
+    const game = this.keys.filter((k) => !k.engine_own);
+    const own = this.keys.filter((k) => k.engine_own);
+
+    const row = (k) =>
+      `<div class="keyrow" data-key="${esc(k.name)}" title="点一下填进上面的输入框">
+         <span class="mono small grow">${esc(k.name)}</span>
+         <span class="mono small dim2">${esc(k.value)}</span>
+         <span class="tag">${esc(k.kind)}</span>
+       </div>`;
+
+    return `
+      <div class="mt4">
+        <div class="row tight">
+          <span class="small dim2 grow">
+            注册表里现有 <strong>${this.keys.length}</strong> 个键 —— 点一行就把键名填进上面的框，值自己补。
+          </span>
+          <button class="btn btn-ghost btn-sm" id="uToggleKeys">
+            ${this.showKeys ? "收起键列表" : "展开键列表"}
+          </button>
+        </div>
+        ${
+          this.showKeys
+            ? `<div class="mt2">
+                 <div class="small dim2 mt2">游戏内容键（要改的就是这些，共 ${game.length} 个）</div>
+                 ${game.map(row).join("")}
+                 <div class="small dim2 mt3">
+                   引擎自身的设置（<strong>别动</strong>，共 ${own.length} 个）——
+                   这些是分辨率 / 音量 / Unity 内部状态，改了不影响解锁，反而可能让游戏起不来。
+                 </div>
+                 ${own.map(row).join("")}
+               </div>`
+            : ""
+        }
+      </div>`;
   },
 
   resultHtml() {
@@ -419,27 +531,12 @@ const UnlockPage = {
   // -- 进度 -----------------------------------------------------------------
 
   progressHtml() {
-    return `
-      <div class="mt3" id="uProgBody">
-        <div class="row tight">
-          <span class="small dim2" data-msg style="flex:1 1 auto;min-width:0">正在准备…</span>
-          <span class="small mono" data-pct>0%</span>
-        </div>
-        <div class="bar mt2"><i style="width:0%"></i></div>
-      </div>`;
+    return progressHtml("uProg", "");
   },
 
   paintProgress(p) {
     this.prog = p;
-    const host = $("#uProg", this.root);
-    if (!host || !host.firstElementChild) return;
-    const pct = Math.max(0, Math.min(100, Math.round((p.frac || 0) * 100)));
-    const bar = host.querySelector(".bar > i");
-    if (bar) bar.style.width = pct + "%";
-    const pv = host.querySelector("[data-pct]");
-    if (pv) pv.textContent = pct + "%";
-    const mv = host.querySelector("[data-msg]");
-    if (mv) mv.textContent = clip(p.msg || "…", 64);
+    paintProgress(this.root, "uProg", p);
   },
 
   // -- 绑定 -----------------------------------------------------------------
@@ -468,6 +565,19 @@ const UnlockPage = {
     // 键名过滤在折叠区里：只记值、不重绘 —— 重绘会把折叠合上、把输入焦点弄丢。
     const filter = $("#uFilter", this.root);
     if (filter) filter.addEventListener("input", (e) => (this.filter = e.target.value));
+    const set = $("#uSet", this.root);
+    if (set) set.addEventListener("input", (e) => (this.set = e.target.value));
+
+    // 「有哪些键可改」：展开/收起 + 点行填键名。
+    // 收起状态一变就要重绘（列表本身要显隐），但**点行填值不能重绘** ——
+    // 重绘会把折叠合上、把已填的内容抖掉，所以那一处只改 input.value。
+    on("uToggleKeys", async () => {
+      this.showKeys = !this.showKeys;
+      await this.render();
+    });
+    this.root.querySelectorAll("[data-key]").forEach((el) =>
+      el.addEventListener("click", () => this.pickKey(el.dataset.key))
+    );
 
     on("uPickSave", () => this.pickSaveDir());
     on("uClearSave", async () => {
@@ -479,7 +589,7 @@ const UnlockPage = {
     if (openSaves) {
       openSaves.addEventListener("click", () => {
         const d = this.saveDir || (this.plan.save_dirs[0] || "");
-        if (d) this.openFolder(d);
+        if (d) openPath(d);
       });
     }
 
@@ -523,9 +633,33 @@ const UnlockPage = {
     await this.render();
   },
 
-  async openFolder(p) {
-    const r = await Tauri.call("open_folder", { path: p });
-    if (!r.ok) toast(r.err, "err");
+  /**
+   * 点一行键 → 把 `名称=` 追加进按名写值框（不覆盖已填的，方便连点几个）。
+   *
+   * 只填名字和 `=`：值该填多少是用户的事（我们不知道他要改到几），替他猜个数
+   * 就成了「瞎写注册表」。填完把焦点放到框尾，让他直接敲数字。
+   */
+  pickKey(name) {
+    if (!name) return;
+    const box = $("#uSet", this.root);
+    if (!box) return;
+    // 已经点过同一个键就不重复加
+    const existing = String(this.set || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (existing.some((s) => s.split("=")[0].trim() === name)) {
+      toast(`「${name}」已经在框里了 —— 补个值就行。`, "info");
+      box.focus();
+      return;
+    }
+    const cur = String(this.set || "").trim();
+    const next = cur ? `${cur.replace(/,\s*$/, "")},${name}=` : `${name}=`;
+    box.value = next;
+    this.set = next;
+    box.focus();
+    box.setSelectionRange(next.length, next.length);
+    toast(`已填「${name}=」—— 补上你要的值即可。`, "info");
   },
 
   async run() {
@@ -542,6 +676,7 @@ const UnlockPage = {
       route: this.route,
       saveDir: this.saveDir,
       filter: this.filter,
+      set: this.set,
     });
 
     this.running = false;
@@ -576,12 +711,6 @@ const UnlockPage = {
   },
 
   async subscribe() {
-    if (this.unlisten) {
-      try {
-        this.unlisten();
-      } catch (_) {}
-      this.unlisten = null;
-    }
-    this.unlisten = await Tauri.on("op:progress", (p) => this.paintProgress(p));
+    await subscribeProgress(this, this.root, "uProg");
   },
 };

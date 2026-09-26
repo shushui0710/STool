@@ -8,8 +8,9 @@
 > `shots/capture.ps1` / `crop.ps1` 及全部 egui 时期截图均已移除。现在内核只出
 > `stool-cli.exe`，界面只有 `stool-tauri.exe`。因此下文凡涉及「两版并存 / 共用 /
 > feature 门控」的表述，请按「迁出前的状态」理解；形态以 `docs/ARCHITECTURE.md` §1 为准。
-> 删除后重跑门禁：`stool-rs` **286 passed / 0 failed**、`stool-tauri` **51 passed / 0 failed**，
-> 两侧 clippy 均零警告。
+> 删除后重跑门禁：`stool-rs` **316 passed / 0 failed**（另有 1 项需联网/真注册表的用例忽略）、
+> `stool-tauri` **51 passed / 0 failed**，两侧 clippy 均零警告。
+> （内核测试数随后续重构继续增长，此处的 316 为本次全量审计时的实测值。）
 
 ---
 
@@ -300,15 +301,20 @@ $ stool-cli selfcheck verify/tail_test/unencrypted.xp3 -o <临时目录>
 
 **修法**：`build.rs` 里补 `println!("cargo:rerun-if-changed=../src");`。
 
-**判定新旧的办法**（别靠 grep）：比对 `<profile>/build/stool-tauri-*/out/tauri-codegen-assets/` 与 `src/js/` 的 mtime；或按下面这招硬证：
+**判定新旧的办法**（一条命令，2026-09-26 起）：把内嵌资产 **brotli 解压**后与 `src/` 逐字节比 sha256：
 
-```
-① 解开内嵌资源，查只有新版才有的中文串 → 命中
-② 用「压缩后前 48 字节」当指纹在 exe 里搜：
-     旧 mods.js（11:09）→ False   新 mods.js（11:17）→ True
+```bash
+"C:/Users/86136/.workbuddy/binaries/python/envs/default/Scripts/python.exe" \
+  D:/STool/scripts/check_embedded_frontend.py
+# 期望：每个前端文件都 ✔，末行「16 个前端文件与源码逐字节一致」，exit=0
 ```
 
-已记入方案 §9.5 坑⑯。
+**为什么这是权威判据**：`tauri-codegen-assets/<sha256>.js` 里的 sha256 是**压缩后**字节的哈希、
+内容是压缩字节 —— 所以 `sha256sum <源文件>` 对不上、`grep -a <中文串> exe` 也 0 命中；
+**但资产能解压**，解压后比 sha256 就是硬证据（本轮 16/16 全中，含 `unlock.js` 新增的 `uSet` 输入框）。
+
+已记入方案 §9.5 坑⑯。备用指纹法（不想装 brotli 时）：用「压缩后前 48 字节」在 exe 里搜，
+旧 `mods.js`（11:09）→ `False`、新 `mods.js`（11:17）→ `True`。
 
 ---
 
@@ -328,15 +334,21 @@ for f in $(find src/js -name '*.js'); do node --check "$f"; done
 cd D:/STool/stool-tauri/src-tauri && cargo build --release
 # 产物：target/release/stool-tauri.exe（约 13.4 MB）
 
-# 内嵌资源是否为最新（必须晚于 src/js/ 的 mtime）
+# 内嵌资源是否为最新 —— 权威判据（解压后逐字节比 sha256）
+"C:/Users/86136/.workbuddy/binaries/python/envs/default/Scripts/python.exe" \
+  D:/STool/scripts/check_embedded_frontend.py
+
+# 旁证：资产目录 mtime 必须晚于所有 src/，exe 再晚于资产目录
 stat -c '%y %n' D:/STool/stool-tauri/src/js/pages/tools.js \
                 D:/STool/stool-tauri/src-tauri/target/release/build/stool-tauri-*/out/tauri-codegen-assets/
 ```
 
-> **为什么只能比 mtime**：`tauri-codegen-assets/` 里的文件名是内容哈希、内容是**压缩后**的，
+> **为什么不能只比 mtime**：`tauri-codegen-assets/` 里的文件名是**压缩后**字节的内容哈希、内容是压缩字节，
 > 所以既对不上 `sha256sum <源文件>`、也 grep 不到任何中文串（实测：新旧文案各查一遍，命中数都是 0）。
-> 唯一可用的判据就是**目录 mtime 晚于所有前端源文件**。本轮实测：
-> 最新前端 `detect.js` 12:08:51 → 资产目录 12:09:14 → exe 12:11:56，链条成立。
+> mtime 只能证明「目录被重写过」，证明不了「内容就是当前源码」。
+> 2026-09-26 起统一走 `scripts/check_embedded_frontend.py`：自动找最新资产目录、
+> 自动遍历 `src/js/**`，解压后逐个比 sha256。本轮实测 16/16 一致
+> （最新前端 `unlock.js` 23:32 → 资产 00:10 → exe 00:18，且 `uSet` / `GameState_Follower=9999` 均在解压结果里命中）。
 
 ```bash
 # 真机端到端（会开一个窗口；不自己关，用 timeout 收）

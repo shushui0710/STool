@@ -35,6 +35,7 @@ function loadPage(rel, exportName) {
     noteHtml: (s) => `<note>${String(s)}</note>`,
     emptyHtml: () => "<empty/>",
     clip: (s) => String(s),
+    foldHtml: (title, body) => `<fold t="${String(title)}">${String(body)}</fold>`,
     log: () => {},
     toast: (m, k) => toasts.push([m, k]),
     $: () => null,
@@ -208,6 +209,127 @@ function ok(cond, msg) {
     }
     check("extract.js render 在 id 全缺失时不抛异常", () =>
       ok(threw === null, `抛了：${threw && threw.message}`));
+  }
+
+  // ---------- 5. unlock.js：按名写值必须透传到 unlock_run ----------
+  //
+  // 背景：2026-09 给「解锁全 CG」加了 `--opt:set=` 的界面入口（只写点名的键，不猜）。
+  // 这类「界面填了、命令没传」的漏接是**静默失效**：界面照常跑、报告照常出，
+  // 只是用户填的键一个都没写进去 —— 只有真跑一遍逻辑才看得出来。
+  {
+    const { page, calls, sandbox } = loadPage("pages/unlock.js", "UnlockPage");
+    sandbox.__reply = async (cmd) =>
+      cmd === "unlock_run" ? { ok: true, data: { success: true, files_done: 3 } } : { ok: true, data: null };
+    const inst = Object.assign(Object.create(page), {
+      root: {},
+      render: async () => {},
+      subscribe: async () => {},
+      loadBackups: async () => {},
+      running: false,
+      apply: false,
+      route: "unity",
+      saveDir: "",
+      filter: "",
+      set: "GameState_Follower=200,GameState_Money=999999",
+      result: null,
+      err: "",
+      prog: null,
+    });
+    const html = inst.advancedHtml();
+    check("unlock.js 进阶里有「按名写指定值」输入框（id=uSet）", () => {
+      ok(html.includes('id="uSet"'), "缺少 id=uSet 的输入框");
+      ok(html.includes("按名写指定值"), "缺少说明文案");
+    });
+    await inst.run();
+    const c = calls.find((x) => x[0] === "unlock_run");
+    check("unlock.js run 把 set 透传给 unlock_run", () => {
+      ok(!!c, "根本没调 unlock_run");
+      ok(
+        c[1].set === "GameState_Follower=200,GameState_Money=999999",
+        `set 被吞了或被改：${JSON.stringify(c[1].set)}`
+      );
+      ok(c[1].filter === "" && c[1].apply === false, "其它字段被串味了");
+    });
+  }
+
+  // ---------- 6. unlock.js：必须能把「有哪些键可改」列出来 ----------
+  //
+  // 背景：`--opt:set=` 要求用户报键名，可用户不知道有哪些键 —— 于是加了只读的
+  // 「键列表」。这里钉两件事：①列表真的画出来了、引擎自身的键被单独归一组；
+  // ②点一行真的把键名填进 #uSet（只填名+`=`，值留空）。后者最易漏 ——
+  // 事件绑了但 dataset 取错，点下去毫无反应。
+  {
+    const { page, calls, sandbox, toasts } = loadPage("pages/unlock.js", "UnlockPage");
+    sandbox.__reply = async (cmd) => (cmd === "unlock_list_keys" ? { ok: true, data: null } : { ok: true, data: null });
+    const inst = Object.assign(Object.create(page), {
+      root: {},
+      render: async () => {},
+      running: false,
+      showKeys: true,
+      keysLoaded: true,
+      keys: [
+        { name: "GameState_Money", value: '"6108"', kind: "二进制", ty: 3, family: "GameState", engine_own: false },
+        { name: "Skill_MaidenLevel", value: "3", kind: "DWORD", ty: 4, family: "Skill", engine_own: false },
+        { name: "unity.ready", value: "1", kind: "DWORD", ty: 4, family: "unity", engine_own: true },
+      ],
+      plan: { routes: [{ key: "registry_keys", label: "改注册表键位" }] },
+      set: "",
+    });
+
+    const html = inst.keysBlockHtml();
+    check("unlock.js 键列表画出来了，且引擎自身的键单独归一组", () => {
+      ok(html.includes("GameState_Money"), "缺游戏键 GameState_Money");
+      ok(html.includes('data-key="GameState_Money"'), "游戏键没带 data-key（点了没反应）");
+      ok(html.includes("引擎自身的设置"), "缺「引擎自身的设置」分组标题");
+      ok(html.indexOf("GameState_Money") < html.indexOf("引擎自身的设置"), "游戏键应排在引擎键之前");
+    });
+
+    check("unlock.js 非注册表路线时不显示键列表（别白跑一趟）", () => {
+      const p2 = Object.assign(Object.create(page), { plan: { routes: [{ key: "copy_save" }] } });
+      ok(p2.keysBlockHtml() === "", "非注册表路线却画了键列表");
+    });
+
+    // 点行填值：给它一个假 input，看名字有没有真的写进去（且只写名字）
+    const fakeBox = { value: "", focus() {}, setSelectionRange() {} };
+    sandbox.$ = (sel) => (sel === "#uSet" ? fakeBox : null);
+    inst.pickKey("GameState_Money");
+    check("unlock.js 点键名把「名称=」填进 #uSet，不替用户猜值", () => {
+      ok(fakeBox.value === "GameState_Money=", `填进去的是 ${JSON.stringify(fakeBox.value)}`);
+      ok(inst.set === "GameState_Money=", "实例上的 set 没同步");
+      ok(!/=\d/.test(fakeBox.value), "不该自动填值（替他猜数就是瞎写注册表）");
+    });
+    // 连点第二个键：接着追加，不覆盖
+    inst.pickKey("Skill_MaidenLevel");
+    check("unlock.js 连点多个键是追加、不覆盖", () => {
+      ok(
+        fakeBox.value === "GameState_Money=,Skill_MaidenLevel=",
+        `连点后变成 ${JSON.stringify(fakeBox.value)}`
+      );
+    });
+    // 重复点同一个键：不重复加
+    inst.pickKey("GameState_Money");
+    check("unlock.js 重复点同一个键不重复追加", () => {
+      ok(fakeBox.value === "GameState_Money=,Skill_MaidenLevel=", "重复追加了");
+      ok(toasts.some((t) => String(t[0]).includes("已经在框里")), "没提示「已经在框里」");
+    });
+
+    check("unlock.js 自带存档块说明了「可能只有设置文件」", () => {
+      // `C0771存档` 实录：包里只有 System.bin（音量/跳过），CG 标记在 data*.bin。
+      // 若界面只说「最省事的一条路」，用户跑完没解锁会以为工具坏了。
+      const { page } = loadPage("pages/unlock.js", "UnlockPage");
+      page.plan = {
+        engine: "unity",
+        route: "bundled",
+        bundled: ["C0771存档\\C0771存档\\存档\\System.bin"],
+        save_dirs: ["C:\\Users\\x\\AppData\\LocalLow\\X\\KKC4"],
+        routes: [],
+      };
+      const html = page.discoveryHtml();
+      ok(html.includes("设置文件"), "没提「设置文件」");
+      ok(html.includes("进度存档"), "没提「进度存档」");
+      ok(html.includes("注册表"), "没给替代出路");
+      ok(!html.includes("这是最省事的一条路"), "还在做过度承诺");
+    });
   }
 
   // ---------- 输出 ----------

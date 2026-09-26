@@ -493,9 +493,7 @@ const ToolsPage = {
   async openConfigDir() {
     const p = this.settings && this.settings.config_path;
     if (!p) return;
-    const dir = String(p).replace(/[\\/][^\\/]*$/, "");
-    const r = await Tauri.call("open_folder", { path: dir });
-    if (!r.ok) toast(r.err, "err");
+    await openPath(dirOf(p));
   },
 
   async downloadTool(key) {
@@ -543,9 +541,7 @@ const ToolsPage = {
 
   async openLogDir() {
     if (!this.log || !this.log.path) return;
-    const dir = String(this.log.path).replace(/[\\/][^\\/]*$/, "");
-    const r = await Tauri.call("open_folder", { path: dir });
-    if (!r.ok) toast(r.err, "err");
+    await openPath(dirOf(this.log.path));
   },
 
   async exportDiag() {
@@ -565,8 +561,6 @@ const ToolsPage = {
 
   async openDiagDir() {
     if (!this.diagPath) return;
-    const dir = String(this.diagPath).replace(/[\\/][^\\/]*$/, "");
-    const r = await Tauri.call("open_folder", { path: dir });
-    if (!r.ok) toast(r.err, "err");
+    await openPath(dirOf(this.diagPath));
   },
 };

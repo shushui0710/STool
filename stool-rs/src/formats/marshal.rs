@@ -2,8 +2,6 @@
 //!
 //! 支持：nil/true/false/fixnum/float/string/symbol/array/hash + 对象（取 ivars 值列表兜底）。
 
-use std::collections::HashMap;
-
 #[derive(Debug, Clone)]
 pub enum Rb {
     Nil,
@@ -295,7 +293,3 @@ pub fn to_json_string(data: &[u8]) -> Result<String, String> {
     let v = load(data)?;
     serde_json::to_string_pretty(&rb_to_json(&v)).map_err(|e| e.to_string())
 }
-
-// HashMap 引用避免 unused 警告（占位）
-#[allow(dead_code)]
-type _Unused = HashMap<String, String>;

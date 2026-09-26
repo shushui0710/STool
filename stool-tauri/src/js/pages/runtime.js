@@ -46,6 +46,8 @@ const RuntimePage = {
   scan: null, // ScanState
   scanBusy: false,
   scanMsg: "",
+  moreHits: [], // 命中列表被 500 条截断后，「继续加载」取回的后续页
+  hitsBusy: false,
   riskAck: false,
   freezeTimer: null,
   freezeValue: "",
@@ -169,15 +171,13 @@ const RuntimePage = {
   },
 
   renderNeedGame() {
-    this.root.innerHTML = `<div class="seg">${emptyHtml(
+    renderNeedGame(
+      this.root,
       "⑥",
       "还没选游戏",
       "改运行中的内存要先知道改哪个进程，所以得先告诉 STool 是哪个游戏。",
-      "去选游戏",
       "rtGoDetect"
-    )}</div>`;
-    const b = $("#rtGoDetect", this.root);
-    if (b) b.addEventListener("click", () => (location.hash = "#detect"));
+    );
   },
 
   introHtml() {
@@ -491,8 +491,22 @@ const RuntimePage = {
         </div>`
       )
       .join("");
+    // 后端只回前 HIT_DISPLAY_CAP 条（500）；被截断时给「继续加载」按偏移再取一页。
+    const shown = (this.moreHits || []).length;
+    const moreRows = (this.moreHits || [])
+      .map(
+        (h) => `<div class="bakrow">
+          <span class="mono small grow">${esc(h.addr)}</span>
+          <span class="mono small">${esc(h.value)}</span>
+          <button class="btn btn-ghost btn-sm" data-diag="${esc(h.addr)}">诊断</button>
+        </div>`
+      )
+      .join("");
     const trunc = st.truncated
-      ? `<div class="small dim2">只显示前 ${st.list.length} 条（共 ${st.hits} 条）—— 用「再次扫描」把范围缩小。</div>`
+      ? `<div class="small dim2">
+           只显示前 ${st.list.length + shown} 条（共 ${st.hits} 条）。
+           <button class="btn btn-ghost btn-sm" id="scMoreHits">继续加载</button>
+         </div>`
       : "";
 
     return `
@@ -533,7 +547,7 @@ const RuntimePage = {
       ${this.scanMsg ? `<div class="small mt3 ${this.scanMsgErr ? "text-danger" : "dim"}">${esc(this.scanMsg)}</div>` : ""}
 
       <div class="mt3">
-        ${st.first_done ? foldHtml(`命中列表（${st.hits} 条）`, rows + trunc, true) : `<div class="small dim2">还没扫描。选好进程、填上游戏里当前的数值，点「首次扫描」。</div>`}
+        ${st.first_done ? foldHtml(`命中列表（${st.hits} 条）`, rows + moreRows + trunc, true) : `<div class="small dim2">还没扫描。选好进程、填上游戏里当前的数值，点「首次扫描」。</div>`}
       </div>`;
   },
 
@@ -852,6 +866,7 @@ const RuntimePage = {
     on("scFreeze", () => this.toggleFreeze());
     on("scUndo", () => this.undo());
     on("scRefresh", () => this.refreshHits());
+    on("scMoreHits", () => this.loadMoreHits());
 
     this.root.querySelectorAll("[data-pid]").forEach((b) =>
       b.addEventListener("click", () => {
@@ -976,6 +991,7 @@ const RuntimePage = {
       toast("打开进程失败，原因见页面上提示。", "err");
     } else {
       this.scan = r.data;
+      this.moreHits = [];
       this.scanMsg = "";
       this.scanMsgErr = false;
       log(`runtime: 会话 pid=${r.data.pid} ty=${r.data.ty}`);
@@ -1003,6 +1019,7 @@ const RuntimePage = {
       this.scanMsgErr = true;
     } else {
       this.scan = r.data;
+      this.moreHits = [];
       this.scanMsg = `扫描完成：还剩 ${r.data.hits} 处。`;
       if (first) this.freezeValue = this.scanValue;
     }
@@ -1025,6 +1042,7 @@ const RuntimePage = {
       toast("写入失败，原因见页面上提示。", "err");
     } else {
       this.scan = r.data;
+      this.moreHits = [];
       this.scanMsg = force ? "强制写入完成。" : "写入完成 —— 回游戏看一眼。";
     }
     await this.render();
@@ -1040,6 +1058,7 @@ const RuntimePage = {
       this.scanMsgErr = true;
     } else {
       this.scan = r.data;
+      this.moreHits = [];
       this.scanMsg = "已撤销上一次写入（恢复为写入前的值）。";
       this.scanMsgErr = false;
     }
@@ -1051,7 +1070,33 @@ const RuntimePage = {
     await this.render();
     const r = await Tauri.call("runtime_state");
     this.scanBusy = false;
-    if (r.ok && r.data.active) this.scan = r.data;
+    if (r.ok && r.data.active) {
+      this.scan = r.data;
+      this.moreHits = [];
+    }
+    await this.render();
+  },
+
+  /**
+   * 「继续加载」：把命中列表往下翻。后端首次只给前 500 条（`HIT_DISPLAY_CAP`），
+   * 这里按偏移继续取，追加到 `moreHits`。
+   *
+   * 注意后端是「每次读都重取快照」——所以如果中途又扫了一次，偏移就会对不上，
+   * 因此每次扫描 / 写入 / 撤销都会清空 `moreHits`（也就是只能沿着同一份列表往下翻）。
+   */
+  async loadMoreHits() {
+    if (!this.scan || this.hitsBusy) return;
+    this.hitsBusy = true;
+    const b = $("#scMoreHits", this.root);
+    const done = b ? busy(b, "读取中…") : null;
+    const offset = this.scan.list.length + (this.moreHits || []).length;
+    const r = await Tauri.call("runtime_hits", { offset, limit: 500 });
+    if (done) done();
+    this.hitsBusy = false;
+    if (!r.ok) return toast(r.err, "err");
+    const got = r.data || [];
+    if (!got.length) return toast("后面没有了。");
+    this.moreHits = (this.moreHits || []).concat(got);
     await this.render();
   },
 
@@ -1063,6 +1108,7 @@ const RuntimePage = {
     const r = await Tauri.call("runtime_freeze", { on, value: v, periodMs: 200 });
     if (!r.ok) return toast(r.err, "err");
     this.scan = r.data;
+    this.moreHits = [];
     if (on) this.startFreezeTimer();
     else this.stopFreezeTimer();
     await this.render();
@@ -1149,6 +1195,7 @@ const RuntimePage = {
       });
       if (!r.ok) return toast(r.err, "err");
       this.scan = r.data;
+      this.moreHits = [];
       this.freezeValue = v;
       this.startFreezeTimer();
       await this.render();
@@ -1159,6 +1206,7 @@ const RuntimePage = {
       const r = await Tauri.call("runtime_write", { value: v, addr: addr || null, force: kind === "force_write" });
       if (!r.ok) return toast(r.err, "err");
       this.scan = r.data;
+      this.moreHits = [];
       await this.render();
       toast(kind === "force_write" ? "强制写入完成。" : `已写入数据源 ${addr}。`);
     }

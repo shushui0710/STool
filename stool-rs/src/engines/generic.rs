@@ -20,6 +20,15 @@ const KNOWN_EXT: &[(&str, &str)] = &[
     ("ald", "AliceSoft"), ("npk", "Nitroplus"), ("npa", "Nitroplus"),
     ("prt", "LiveMaker"), ("grp", "LiveMaker"), ("love", "LÖVE/Love2D"),
     ("lpk", "Purple"), ("ypf2", "YU-RIS"),
+    // —— 老引擎/变体补全（实机样本确定）——
+    ("pac", "SACT/System40（魔数 `PAC `）"),
+    ("dat", "老式引擎数据（SACT/System40 等，多为明文，可搜出文本）"),
+    ("sar", "NScripter/ONScripter 归档"), ("nbz", "NScripter 压缩包"),
+    ("afa", "AliceSoft"), ("ain", "AliceSoft 脚本"),
+    ("ybn", "YU-RIS 立绘"), ("yui", "YU-RIS 脚本"), ("yus", "YU-RIS 脚本"),
+    ("cst", "CatSystem2 脚本"), ("noa", "CatSystem2 资源"),
+    ("swf", "Flash/SWF"), ("qsps", "QSP 明文脚本"), ("qsp", "QSP 容器"),
+    ("aos", "Artemis 归档"), ("ws2", "Witch 系"),
 ];
 
 pub struct GenericPlugin;

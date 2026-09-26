@@ -208,16 +208,16 @@ impl SaveDoc {
         Ok(())
     }
 
-    /// 回写原文件（自动备份为 <原名>.stool.bak）。
+    /// 回写原文件（自动备份为 `<原名>.stool.bak`）。
+    ///
+    /// 注意备份语义：这里**每次都覆盖**备份（= 「上一次写之前」的状态），
+    /// 与 [`crate::settings::backup_once`]（已存在就不覆盖 = 「原件」）不同。
+    /// 路径拼接复用 [`crate::settings::backup_path_for`]，别在这里再拼一遍。
     pub fn save(&self) -> Result<String, String> {
         if !self.format.writable() {
             return Err("该格式为只读视图，无法回写".into());
         }
-        let bak = {
-            let mut s = self.path.as_os_str().to_os_string();
-            s.push(".stool.bak");
-            PathBuf::from(s)
-        };
+        let bak = crate::settings::backup_path_for(&self.path);
         fs::copy(&self.path, &bak).map_err(|e| format!("备份失败: {e}"))?;
         let compact = serde_json::to_string(&self.root).map_err(|e| e.to_string())?;
         match self.format {

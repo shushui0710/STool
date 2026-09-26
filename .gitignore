@@ -27,3 +27,7 @@ stool-rs/.cargo/config.toml
 # 无头浏览器截图用的 Chromium profile（一次性，几百个文件，不该入库）
 shots/.edgeprof*/
 shots/.ep_*/
+
+# 兼容性审计的中间对比快照（修复后用 `_audit_*2.csv` 复扫）——结论已并入报告，
+# 中间产物不入库，避免每次复扫都产生一批噪音文件。
+shots/_audit_*2.csv

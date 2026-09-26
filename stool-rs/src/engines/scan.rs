@@ -222,10 +222,6 @@ impl ScanCtx {
     }
 
     /// 任意一个扩展名命中即真。
-    pub fn has_any_ext(&self, exts: &[&str]) -> bool {
-        exts.iter().any(|e| self.has_ext(e))
-    }
-
     /// 这些扩展名的文件总数。
     pub fn ext_sum(&self, exts: &[&str]) -> usize {
         exts.iter().map(|e| self.ext_count(e)).sum()
@@ -247,6 +243,73 @@ impl ScanCtx {
             format!("已扫描 {} 个文件", self.files_seen)
         }
     }
+}
+
+/// 在根目录一级的 `.exe` 里找**尾部内嵌的 Godot PCK**（自解压导出）。
+///
+/// Godot 导出的自解压 exe 会把 `.pck` 直接**追加在 exe 文件末尾**，魔数 `GDPC`
+/// 出现在文件尾部（`GDPC` + u32 格式版本 …）。这类样本根目录**没有**散落的 `.pck`
+/// 文件，只按扩展名/文件名判据会完全漏掉 —— 而本工具其实原生支持 PCK 解包/回封。
+///
+/// 只读每个 exe 的**最后 64 字节**找 `GDPC`（Godot 的偏移表位于尾部，魔数必然在这段内）；
+/// 这是零风险的定位式读取，命中后由 `GodotPlugin` 决定怎么用。
+///
+/// 返回命中的 exe 文件名（小写）。空目录 / 无 exe / 读失败都安全返回 `None`。
+pub fn find_embedded_godot_pck(root: &Path) -> Option<String> {
+    embedded_godot_pck_offset(root).map(|(name, _)| name)
+}
+
+/// 定位 exe 尾部内嵌 PCK 的**起始绝对偏移**（供解包时把 PCK 内相对偏移换算成文件绝对偏移）。
+///
+/// Godot 自解压导出有两种写法：
+/// - **3.x / 4.x 尾部标记**：文件末尾是 `… [u64 pck_offset][b"GDPC"]`，魔数在**最后 4 字节**，
+///   真正的 PCK 数据（含 `GDPC` 头）位于 `pck_offset` 处（`pck_offset` 即相对该 exe 的绝对偏移）。
+/// - 个别工具会把 `GDPC` 头直接放尾部附近但非末尾，此时回退到"最后一个 GDPC 即 PCK 头"。
+///
+/// 返回 `(exe 文件名小写, pck 头的绝对偏移)`。
+pub fn embedded_godot_pck_offset(root: &Path) -> Option<(String, u64)> {
+    let rd = std::fs::read_dir(root).ok()?;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        if !name.ends_with(".exe") {
+            continue;
+        }
+        if let Some(off) = probe_exe_pck_offset(&e.path()) {
+            return Some((name, off));
+        }
+    }
+    None
+}
+
+/// 探测单个 exe：返回内嵌 PCK 头偏移。
+fn probe_exe_pck_offset(p: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(p).ok()?;
+    let len = meta.len();
+    if len < 12 {
+        return None;
+    }
+    // 尾部 12 字节：8 字节 pck_offset + 4 字节 GDPC
+    let tail = read_tail(p, len - 12, 12)?;
+    if &tail[8..12] == b"GDPC" {
+        let off = u64::from_le_bytes(tail[0..8].try_into().ok()?);
+        if off < len {
+            return Some(off);
+        }
+    }
+    // 回退：最后 64 字节里找 GDPC（非标准布局）；取**最后一次**出现（PCK 头在最靠后处）
+    let win = 64.min(len) as usize;
+    let tail = read_tail(p, len - win as u64, win)?;
+    tail.windows(4).rposition(|w| w == b"GDPC").map(|i| len - win as u64 + i as u64)
+}
+
+/// 读文件 `[start, start+len)` 这一段（不读整文件，自解压 exe 常 1GB+）。
+fn read_tail(p: &Path, start: u64, len: usize) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(p).ok()?;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -339,5 +402,32 @@ mod tests {
         assert!(!ScanCtx::build(&d2).has_numbered_volume());
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn test_find_embedded_godot_pck_trailer() {
+        // 模拟 Godot 自解压导出：exe 里塞任意数据，尾部是 [u64 offset][GDPC]。
+        let d = tmpdir("godot_embed");
+        let exe = d.join("Game.exe");
+        let mut body = vec![0xABu8; 4096];
+        // 尾部 12 字节：8 字节 pck_offset + "GDPC"
+        let pck_off: u64 = 1024;
+        body.extend_from_slice(&pck_off.to_le_bytes());
+        body.extend_from_slice(b"GDPC");
+        std::fs::write(&exe, &body).unwrap();
+        assert_eq!(super::find_embedded_godot_pck(&d).as_deref(), Some("game.exe"));
+
+        // 没有 GDPC 的普通 exe 不应命中
+        let d2 = tmpdir("godot_embed_none");
+        std::fs::write(d2.join("plain.exe"), vec![0u8; 4096]).unwrap();
+        assert!(super::find_embedded_godot_pck(&d2).is_none());
+
+        // 空目录 / 无 exe 安全返回 None
+        let d3 = tmpdir("godot_embed_empty");
+        assert!(super::find_embedded_godot_pck(&d3).is_none());
+
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+        let _ = std::fs::remove_dir_all(&d3);
     }
 }

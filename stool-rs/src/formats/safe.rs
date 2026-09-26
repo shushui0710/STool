@@ -44,21 +44,6 @@ pub fn i32_le(data: &[u8], off: usize) -> Option<i32> {
     Some(i32::from_le_bytes(arr::<4>(data, off)?))
 }
 
-#[inline]
-pub fn i64_le(data: &[u8], off: usize) -> Option<i64> {
-    Some(i64::from_le_bytes(arr::<8>(data, off)?))
-}
-
-#[inline]
-pub fn u32_be(data: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(arr::<4>(data, off)?))
-}
-
-#[inline]
-pub fn u16_be(data: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(arr::<2>(data, off)?))
-}
-
 // ── 带游标的便捷读取（用于顺序解析：读完自动前进） ──
 
 /// 一个只前进、永不 panic 的顺序读取游标。

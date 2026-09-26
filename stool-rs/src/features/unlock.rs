@@ -454,6 +454,25 @@ const BUNDLE_DIR_KEYWORDS: &[&str] = &[
     "セーブデータ",
 ];
 
+/// `<任意名>存档` 这种泛化命名（`C0771存档`、`某作存档`、`data 存档`…）。
+///
+/// 为什么单列一档：分享包里的存档目录常带**作者/编号前缀**（`C0771存档` 就是
+/// 「C0771」这个同人社团编号 + `存档`），`BUNDLE_DIR_KEYWORDS` 里的 `全cg`/`全开`
+/// 之类**一个都匹配不上** → 检测不到、反而被 `SAVE_DIR_KEYWORDS` 当成目标目录。
+///
+/// **只认「后缀」**：目录名以「存档」结尾才算，避免 `存档备份工具` 这种误伤。
+fn is_archive_dir_name(name_lower: &str) -> bool {
+    name_lower.ends_with("存档") && name_lower.chars().count() >= 2
+}
+
+/// 目录名**明确不能**当「自带存档来源」的（命中即否决上面的泛化规则）。
+///
+/// `存档` 两个字太泛，必须给几条硬否决，否则游戏的资产/日志目录会被卷进来：
+/// - `save`/`savedata` 之类**是游戏的运行期存档目录**，不是分享包里的存档包；
+/// - `backup`/`备份` 是备份，不是「装进去就全开」的存档；
+/// - 明显是素材/资源的目录。
+const NOT_BUNDLE_DIR: &[&str] = &["backup", "备份", "素材", "resource", "assets", "log", "cache"];
+
 /// 「自带全CG存档」文件名关键字。
 const BUNDLE_FILE_KEYWORDS: &[&str] = &[
     "全cg",
@@ -467,21 +486,191 @@ const BUNDLE_FILE_KEYWORDS: &[&str] = &[
     "回廊",
 ];
 
-/// 像存档文件的扩展名（小写，不含点）。
+/// 存档专属扩展名（大写小写都按小写比）。
+///
+/// 这些扩展名**基本只用于存档**，命中即可信。
 const SAVE_EXTS: &[&str] = &[
-    "dat", "sav", "save", "sav2", "dat2", "rpgsave", "rvdata2", "rvdata", "lsd", "json", "bin",
-    "sol", "cif", "gdb", "sd", "sgd",
+    "sav", "save", "sav2", "rpgsave", "rmmzsave", "rmzsave", "rvdata2", "rvdata", "lsd", "sol",
+    "cif", "gdb", "sgd",
+];
+
+/// 通用扩展名 —— 引擎自己也大量使用，**光看扩展名不足以判定是存档**。
+///
+/// `dat`/`bin`/`json` 这类必须**配合存档语义的文件名**（见 [`looks_like_save_name`]）才算。
+/// 起因：实测某游戏根目录里 `unins000.dat`、`settings.json`、`catalog.json`、
+/// `ScriptingAssemblies.json` 全都命中过旧的 `SAVE_EXTS` —— 一旦分享包把这些带进
+/// 存档目录，就会被当成存档复制过去。
+const GENERIC_EXTS: &[&str] = &["dat", "bin", "json", "sd", "save"];
+
+/// 文件名里出现这些词，才认为通用扩展名的文件「像存档」。
+const SAVE_NAME_HINTS: &[&str] = &[
+    "save", "savedata", "存档", "セーブ", "system", "global", "data", "config", "user",
 ];
 
 fn name_matches(name_lower: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|k| name_lower.contains(k))
 }
 
+/// **唯一判据**：这个目录名是不是「自带存档来源」。
+///
+/// `find_bundled_saves`（找来源）与 `find_save_dirs`（排目标）**必须共用它** ——
+/// 否则就会出现「同一个目录既当来源又当目标 → 复制到自身」那种自相矛盾。
+pub fn is_bundle_dir_name(name_lower: &str) -> bool {
+    if name_matches(name_lower, NOT_BUNDLE_DIR) {
+        return false;
+    }
+    name_matches(name_lower, BUNDLE_DIR_KEYWORDS) || is_archive_dir_name(name_lower)
+}
+
+/// 从「存档说明文件」里解析出目标存档目录。
+///
+/// 分享包常在存档目录里塞一个 `位置.txt` / `说明.txt` / `readme.txt`，里面写着
+/// 存档该放哪，例如：
+///
+/// ```text
+/// C:\Users\（用户名）\AppData\LocalLow\GIRL'S SOFTWARE\KKC4
+/// ```
+///
+/// 这条线索**比任何目录名启发式都准**（是打包者亲手写的），所以优先采信。
+/// 只认「像绝对路径」的行，并把 `（用户名）` / `<用户名>` 之类的占位换成当前用户。
+///
+/// 返回 `(目录PathBuf, 原始行)`；解析不出返回 `None`。
+pub fn parse_save_location(text: &str) -> Option<(PathBuf, String)> {
+    for raw in text.lines() {
+        let line = raw.trim().trim_matches(|c| c == '"' || c == '\u{feff}');
+        if line.len() < 4 {
+            continue;
+        }
+        // 盘符开头（C:\ / D:/）或 UNC（\\server\share）才认，别把句中文说明当路径。
+        let looks_abs = line
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+            && line.get(1..3).map(|s| s == ":\\" || s == ":/").unwrap_or(false);
+        if !looks_abs {
+            continue;
+        }
+        // 占位符 → 当前用户名（打包者不可能知道买家的用户名）。
+        let expanded = expand_user_placeholder(line);
+        return Some((PathBuf::from(expanded), line.to_string()));
+    }
+    None
+}
+
+/// 把 `（用户名）` / `<用户名>` / `%USERNAME%` / `{用户名}` 换成真实用户名。
+fn expand_user_placeholder(line: &str) -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        return line.to_string();
+    }
+    let mut s = line.to_string();
+    for pat in [
+        "（用户名）",
+        "(用户名)",
+        "<用户名>",
+        "{用户名}",
+        "%USERNAME%",
+        "（username）",
+        "(username)",
+        "<username>",
+    ] {
+        if s.contains(pat) {
+            s = s.replace(pat, &user);
+        }
+    }
+    s
+}
+
+/// 候选的「存档说明文件名」（小写精确匹配，避免把游戏文案当说明读）。
+const LOCATION_FILE_NAMES: &[&str] = &["位置.txt", "存档位置.txt", "说明.txt", "readme.txt", "路径.txt"];
+
+/// 在某个目录（及浅层子目录）里找 `位置.txt` 之类的说明文件，解析出目标存档目录。
+fn find_declared_save_dir(dir: &Path) -> Option<(PathBuf, String)> {
+    /// 读一个候选文件；名字不在白名单、或解析不出路径 → `None`。
+    fn read(p: &Path) -> Option<(PathBuf, String)> {
+        let name = p.file_name()?.to_string_lossy().to_lowercase();
+        // 说明文件常带 BOM / 是 GBK；这里优先 UTF-8，失败再按 GBK 试。
+        if !LOCATION_FILE_NAMES.iter().any(|n| name == n.to_lowercase()) {
+            return None;
+        }
+        let bytes = fs::read(p).ok()?;
+        let text = decode_text(&bytes)?;
+        parse_save_location(&text)
+    }
+    // 先看自己这一层（`C0771存档/C0771存档/存档/位置.txt` 的最内层就是）。
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                if let Some(hit) = read(p.as_path()) {
+                    return Some(hit);
+                }
+            }
+        }
+    }
+    // 再往浅层子目录里找（说明常和存档同放一个子目录）。
+    //
+    // 深度必须够：实录 `C0771存档/C0771存档/存档/位置.txt` 在 **depth=4**，
+    // 早先写死 `max_depth(3)` 就会「解析函数明明是对的、却永远看不到那个文件」。
+    // 这里与 `find_bundled_saves` 统一用 8，免得两边不一致又踩一次。
+    for e in WalkDir::new(dir).max_depth(8).follow_links(false).into_iter().flatten() {
+        if !e.file_type().is_file() {
+            continue;
+        }
+        if let Some(hit) = read(e.path()) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// 把一段文本按 UTF-8 → GBK 顺序解码（Windows 上的说明文件常是 GBK）。
+///
+/// ⚠️ 别拿 `decode()` 的 `ok` 标志当「解码失败」：`encoding_rs` 对**只要有一个字节
+/// 无法映射**就回 `ok=false`，可其余字节其实解得好好的。实测 `位置.txt` 里的
+/// `（用户名）` 是 GBK 的 `A3 A8 …`，UTF-8 解不了 → 走 GBK 分支 → `ok=false`
+/// → 若据此退回 `from_utf8_lossy`，汉字全变成 U+FFFD，
+/// `（用户名）` 就匹配不上、路径作废、目标目录凭空消失。
+///
+/// 正确做法：**GBK 解码结果照用**（它已经用替换字符标出了真正读不懂的位置）。
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    // 去 BOM
+    let b = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { &bytes[3..] } else { bytes };
+    if let Ok(s) = std::str::from_utf8(b) {
+        return Some(s.to_string());
+    }
+    // 不是合法 UTF-8 → 按 GBK 解。中文 Windows 上的 .txt 绝大多数就是这个。
+    let (cow, _, _) = encoding_rs::GBK.decode(b);
+    Some(cow.into_owned())
+}
+
+/// 这个文件看起来像存档吗？
+///
+/// 两级判定，避免通用扩展名误伤：
+/// - **存档专属扩展名**（`sav`/`rpgsave`/`rvdata2`…）→ 直接算；
+/// - **通用扩展名**（`dat`/`bin`/`json`…）→ 还要文件名含存档语义（`save`/`system`/`data`…）。
 fn looks_like_save_ext(p: &Path) -> bool {
-    p.extension()
-        .and_then(|x| x.to_str())
-        .map(|x| SAVE_EXTS.contains(&x.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if SAVE_EXTS.contains(&ext.as_str()) {
+        return true;
+    }
+    if GENERIC_EXTS.contains(&ext.as_str()) {
+        return looks_like_save_name(p);
+    }
+    false
+}
+
+/// 文件名（不含扩展名）里是否带存档语义。配合 [`GENERIC_EXTS`] 使用。
+fn looks_like_save_name(p: &Path) -> bool {
+    let name = p
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name_matches(&name, SAVE_NAME_HINTS)
 }
 
 /// 候选**目标**存档目录：策略声明优先，再补一份"名字像存档目录"的根级猜测。
@@ -490,6 +679,11 @@ fn looks_like_save_ext(p: &Path) -> bool {
 /// - **游戏根不算存档目录**（`"."` 提示被忽略）：把存档丢进游戏根往往放错位置，
 ///   需要显式 `--opt:save_dir=<游戏根>` 才会用它；
 /// - **排除「自带全CG存档」目录**：那是*来源*不是*目标*，否则会出现"复制到自身"。
+///   判据与 `find_bundled_saves` 共用 [`is_bundle_dir_name`] —— 两边各写一套
+///   就会出现「一个认来源、一个认目标」的自相矛盾（`C0771存档` 那次正是如此）。
+///
+/// 另外，如果游戏目录里能找到 `位置.txt` 这类说明，**优先采信它写的路径**
+/// （那是打包者亲手写的目标目录，比任何名字启发式都准）。
 ///
 /// 只返回**确实存在**的目录。
 pub fn find_save_dirs(root: &Path, spec: &UnlockSpec) -> Vec<PathBuf> {
@@ -510,26 +704,52 @@ pub fn find_save_dirs(root: &Path, spec: &UnlockSpec) -> Vec<PathBuf> {
             out.push(p);
         }
     };
+
+    // ---- ① 说明文件里写明的目标（最准，放最前）----
+    if let Some(d) = find_declared_save_dir(root) {
+        push(d.0);
+    }
+
+    // ---- ② 策略表声明的候选 + 名字像存档的目录 ----
+    //
+    // 递归找（不再只看根一层）：分享包与游戏本体都可能把存档目录埋在子目录里，
+    // 只扫一层会漏。深度给上限，避免在超大素材目录里空转。
+    let mut guess_dirs: Vec<PathBuf> = Vec::new();
+    let mut seen_dirs = 0usize;
+    for e in WalkDir::new(root).max_depth(4).follow_links(false).into_iter().flatten() {
+        seen_dirs += 1;
+        if seen_dirs > 20_000 {
+            break;
+        }
+        if !e.file_type().is_dir() || e.depth() == 0 {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        // 来源目录（自带存档包）不是目标，跳过一整棵子树。
+        if is_bundle_dir_name(&name) {
+            continue;
+        }
+        if name_matches(&name, SAVE_DIR_KEYWORDS) {
+            guess_dirs.push(e.path().to_path_buf());
+        }
+    }
+    // 策略表声明的相对目录：也要过一遍来源判据（策略表里可能有 `.` 之类）。
     for hint in spec.save_dirs {
         if *hint == "." || hint.is_empty() {
             continue;
         }
-        push(root.join(hint));
-    }
-    // 根级目录名猜测（补策略表未覆盖的命名）
-    if let Ok(rd) = fs::read_dir(root) {
-        for e in rd.flatten() {
-            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            if name_matches(&name, BUNDLE_DIR_KEYWORDS) {
-                continue; // 来源目录，不是目标
-            }
-            if name_matches(&name, SAVE_DIR_KEYWORDS) {
-                push(e.path());
-            }
+        let p = root.join(hint);
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if is_bundle_dir_name(&name) {
+            continue;
         }
+        push(p);
+    }
+    for p in guess_dirs {
+        push(p);
     }
     out
 }
@@ -537,43 +757,37 @@ pub fn find_save_dirs(root: &Path, spec: &UnlockSpec) -> Vec<PathBuf> {
 /// 在游戏目录里找「自带全CG存档」（网盘分享包常见）。
 ///
 /// 两类命中：
-/// 1. **目录**名含 `全CG/全开/100%/回想/回廊/セーブデータ` 等 → 该目录下的存档文件；
+/// 1. **目录**名判为自带存档来源（[`is_bundle_dir_name`]：含 `全CG/全开/100%/回想/回廊`
+///    或**泛化的 `<任意名>存档`**，如 `C0771存档`）→ **递归**收该目录下的存档文件；
 /// 2. **文件**名含 `全CG/全开/clear/gallery/complete` 等 **且** 扩展名像存档。
 ///
-/// 深度上限 3、文件数上限 2 万，避免在超大素材目录里空转。
+/// ## 为什么是「递归到底」而不是只看一层
+///
+/// 分享包的嵌套层数**没有上限**，实测就遇到过
+/// `C0771存档/C0771存档/存档/System.bin`（三层，每层都叫存档）。
+/// 老实现 `max_depth(3)` + 逐层名字匹配，**任何一层名字不匹配就整条链断掉** →
+/// 明明有存档却报「0 个」。现在改成：**目录名一旦判定为来源，就递归收底下所有
+/// 「像存档」的文件**，不再要求每层都命中关键字。
+///
+/// 深度仍给上限（8 层）与文件数上限（2 万），避免在超大素材目录里空转。
 pub fn find_bundled_saves(root: &Path) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     let mut seen = 0usize;
-    for e in WalkDir::new(root).max_depth(3).follow_links(false).into_iter().flatten() {
+    // 收集「判定为来源」的目录，稍后递归收文件。
+    let mut src_dirs: Vec<PathBuf> = Vec::new();
+
+    for e in WalkDir::new(root).max_depth(4).follow_links(false).into_iter().flatten() {
         seen += 1;
         if seen > 20_000 {
             break;
         }
         let name = e.file_name().to_string_lossy().to_lowercase();
         if e.file_type().is_dir() {
-            if !name_matches(&name, BUNDLE_DIR_KEYWORDS) {
-                continue;
+            if e.depth() == 0 {
+                continue; // 游戏根自身不算「自带存档目录」
             }
-            // 该目录下的文件：优先取"像存档"的；一个都没有时才整目录收
-            let Ok(rd) = fs::read_dir(e.path()) else { continue };
-            let mut preferred: Vec<PathBuf> = Vec::new();
-            let mut rest: Vec<PathBuf> = Vec::new();
-            for f in rd.flatten() {
-                if !f.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                let p = f.path();
-                if p.metadata().map(|m| m.len() > 64 * 1024 * 1024).unwrap_or(true) {
-                    continue;
-                }
-                if looks_like_save_ext(&p) {
-                    preferred.push(p);
-                } else {
-                    rest.push(p);
-                }
-            }
-            for p in if preferred.is_empty() { rest } else { preferred } {
-                out.insert(p);
+            if is_bundle_dir_name(&name) {
+                src_dirs.push(e.path().to_path_buf());
             }
         } else if e.file_type().is_file()
             && name_matches(&name, BUNDLE_FILE_KEYWORDS)
@@ -582,7 +796,48 @@ pub fn find_bundled_saves(root: &Path) -> Vec<PathBuf> {
             out.insert(e.path().to_path_buf());
         }
     }
+
+    // 递归收每个来源目录下的存档文件。
+    for d in src_dirs {
+        let mut preferred: Vec<PathBuf> = Vec::new();
+        let mut rest: Vec<PathBuf> = Vec::new();
+        for e in WalkDir::new(&d).max_depth(8).follow_links(false).into_iter().flatten() {
+            if !e.file_type().is_file() {
+                continue;
+            }
+            let p = e.path();
+            // 读不到 metadata = 文件可能已消失或权限不足，**不能当超大文件跳过**
+            // （那会让真正存在的存档凭空不见）；这里只跳过「确认超大」的。
+            let too_big = match p.metadata() {
+                Ok(m) => m.len() > 64 * 1024 * 1024,
+                Err(_) => false,
+            };
+            if too_big {
+                continue; // 超大文件绝不是存档（多半是视频/音频）
+            }
+            if looks_like_save_ext(p) {
+                preferred.push(p.to_path_buf());
+            } else if is_location_file(p) {
+                rest.push(p.to_path_buf()); // 说明文件垫底（用户可能想看一眼）
+            }
+        }
+        // 优先只收「像存档」的；一个都没有时才退回收说明文件 ——
+        // 免得把 `位置.txt` 当成要复制的存档。
+        for p in if preferred.is_empty() { rest } else { preferred } {
+            out.insert(p);
+        }
+    }
     out.into_iter().collect()
+}
+
+/// 是不是「存档说明文件」（`位置.txt` 之类）。
+fn is_location_file(p: &Path) -> bool {
+    p.file_name()
+        .map(|n| {
+            let n = n.to_string_lossy().to_lowercase();
+            LOCATION_FILE_NAMES.iter().any(|k| n == k.to_lowercase())
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +1002,58 @@ fn preview_msg(spec: &UnlockSpec, engine_id: &str, ctx: &Ctx, bundled: &[PathBuf
     m
 }
 
+/// 体检自带存档包的内容，回答一个关键问题：**复制过去到底能不能解锁**。
+///
+/// 起因：`くりくりクリニック` 的自带包 `C0771存档` 里**只有 `System.bin`**（音量 / 跳过 /
+/// 已读记录这类设置），CG 标记 `mNNN_NNFlag` 却在真正的进度存档 `data*.bin` 里。
+/// 用户按提示复制完发现「没解锁」，会以为是工具坏了 —— 所以这里**预览时就说清**。
+///
+/// 判据刻意保守（宁可不说，不可说错）：
+/// - 候选文件里出现 `Flag` 字样、或文件名含 `data`/`save`（进度存档的典型命名）→ 认为有进度数据，不提示；
+/// - 全部候选都是纯设置文件 → 给出「多半解不开 CG」的提示，并说明标记在哪。
+fn bundled_content_warning(candidates: &[PathBuf]) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // 进度存档的典型特征：文件名带 data/globals/save 这类词，或内含 `Flag` 字面量。
+    const PROGRESS_NAME_HINTS: &[&str] = &["data", "globals", "save", "progress", "game"];
+    let mut looks_progress = false;
+    let mut scanned = 0usize;
+    for c in candidates.iter().take(32) {
+        scanned += 1;
+        let name = c
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if PROGRESS_NAME_HINTS.iter().any(|h| name.contains(h)) {
+            looks_progress = true;
+            break;
+        }
+        // 读前 512 KiB 找 `Flag` 字面量（进度存档里普遍是 `<场景>_<序号>Flag` 这种键名）。
+        if let Ok(b) = fs::read(c) {
+            let head = &b[..b.len().min(512 * 1024)];
+            if head.windows(4).any(|w| w == b"Flag") {
+                looks_progress = true;
+                break;
+            }
+        }
+    }
+    if looks_progress || scanned == 0 {
+        return None;
+    }
+    Some(
+        concat!(
+            "\n\n⚠ 这个自带包里没看到「进度存档」的迹象（只有设置类文件）。\n",
+            "· CG / 回想标记通常存在进度存档里",
+            "（例如 Unity 常见 `data*.bin` 里的 `…Flag` 字段），\n",
+            " 而设置文件（音量 / 跳过 / 已读记录）里没有这些标记。\n",
+            "· 若复制后仍未解锁，请改用 `--opt:route=registry` 走注册表，",
+            "或用游戏内全开开关。"
+        )
+        .to_string(),
+    )
+}
+
 /// 「替换自带全CG存档」路线：预览或落地。
 fn bundled_route(ctx: &Ctx, spec: &UnlockSpec, candidates: &[PathBuf], apply: bool) -> OpOutcome {
     let targets = save_target_dirs(ctx, spec);
@@ -778,6 +1085,11 @@ fn bundled_route(ctx: &Ctx, spec: &UnlockSpec, candidates: &[PathBuf], apply: bo
             m.push_str(&format!("\n目标存档目录: {shown:?}"));
         }
         m.push_str("\n→ 确认后加 --opt:apply=1 复制；被覆盖的存档会先备份为 .stool.bak。");
+        // 内容体检：自带包里可能只有「设置文件」而没有「进度存档」，此时复制过去解不开 CG。
+        // 网盘分享包常见这种缺斤少两的情况，必须当场说清，不能让人以为跑完就好了。
+        if let Some(warn) = bundled_content_warning(candidates) {
+            m.push_str(&warn);
+        }
         return OpOutcome::okn(m, candidates.len());
     }
 
@@ -1066,6 +1378,213 @@ mod tests {
         });
         assert!(!r.success, "缺存档目录时不应报成功：{}", r.message);
         assert!(r.message.contains("save_dir"), "{}", r.message);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ---- くりくりクリニック 实录：泛化「xx存档」+ 三层嵌套 + 位置.txt ----
+
+    #[test]
+    fn generic_archive_dir_name_is_recognized() {
+        // 命中：`<任意名>存档`（分享包常带社团编号前缀）
+        assert!(is_bundle_dir_name("c0771存档"));
+        assert!(is_bundle_dir_name("存档"));
+        assert!(is_bundle_dir_name("某作存档"));
+        // 老关键字仍然命中
+        assert!(is_bundle_dir_name("全cg存档"));
+        assert!(is_bundle_dir_name("全开"));
+        // 否决：备份 / 素材 / 引擎自己的保存目录
+        assert!(!is_bundle_dir_name("存档备份"));
+        assert!(!is_bundle_dir_name("素材存档"));
+        assert!(!is_bundle_dir_name("savedata"));
+        assert!(!is_bundle_dir_name("resources"));
+        // 「存档」在中间不算（只认后缀）
+        assert!(!is_bundle_dir_name("存档工具"));
+    }
+
+    #[test]
+    fn nested_generic_archive_is_found_and_not_a_target() {
+        // 实录目录：C0771存档/C0771存档/存档/System.bin（三层，每层都叫「存档」）。
+        // 老实现要求每一层都命中关键字，且只看一层 → 报「0 个」并把来源当目标。
+        let d = tmpdir("kkc_nested");
+        let inner = d.join("C0771存档").join("C0771存档").join("存档");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("System.bin"), b"{}").unwrap();
+        fs::write(inner.join("位置.txt"), "C:\\Users\\（用户名）\\AppData\\LocalLow\\X\\KKC4").unwrap();
+
+        let found = find_bundled_saves(&d);
+        assert_eq!(found.len(), 1, "三层嵌套的自带存档没被找到：{found:?}");
+        assert!(found[0].ends_with("System.bin"), "{:?}", found[0]);
+
+        // 来源目录绝不能同时当目标（否则会「复制到自身」）
+        let spec = spec_for("unity").unwrap();
+        let dirs = find_save_dirs(&d, spec);
+        assert!(
+            !dirs.iter().any(|p| p.to_string_lossy().contains("C0771")),
+            "自带存档目录被误认成目标存档目录：{dirs:?}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn generic_ext_needs_save_semantics() {
+        // `json`/`bin`/`dat` 是引擎自己也在用的扩展名。只有文件名带存档语义才算候选，
+        // 否则 `catalog.json` / `uninst000.dat` 这种会被误收。
+        let d = tmpdir("kkc_generic_ext");
+        fs::create_dir_all(&d).unwrap();
+        let ok_sys = d.join("System.bin");
+        let ok_data = d.join("data35.bin");
+        let bad_catalog = d.join("catalog.json");
+        let bad_unins = d.join("unins000.dat");
+        let ok_sav = d.join("anything.sav");
+        for p in [&ok_sys, &ok_data, &bad_catalog, &bad_unins, &ok_sav] {
+            fs::write(p, b"{}").unwrap();
+        }
+
+        assert!(looks_like_save_ext(&ok_sys), "System.bin 应算存档");
+        assert!(looks_like_save_ext(&ok_data), "data35.bin 应算存档");
+        assert!(looks_like_save_ext(&ok_sav), ".sav 是存档专属扩展名");
+        assert!(
+            !looks_like_save_ext(&bad_catalog),
+            "catalog.json 没有存档语义，不该算存档"
+        );
+        assert!(
+            !looks_like_save_ext(&bad_unins),
+            "unins000.dat 没有存档语义，不该算存档"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn save_dir_is_found_when_nested() {
+        // 存档目录可能埋在子目录里（不只根一层）。旧实现只 `read_dir(root)` 一层，
+        // 嵌套的就找不到 → 「未找到存档目录」。
+        let d = tmpdir("kkc_nested_target");
+        let nested = d.join("game").join("data");
+        fs::create_dir_all(&nested).unwrap();
+        // 名字命中 SAVE_DIR_KEYWORDS，且不是「来源目录」
+        let target = nested.join("SaveData");
+        fs::create_dir_all(&target).unwrap();
+
+        let spec = spec_for("unity").unwrap();
+        let dirs = find_save_dirs(&d, spec);
+        assert!(
+            dirs.iter().any(|p| p.ends_with("SaveData")),
+            "嵌套的存档目录没被找到：{dirs:?}"
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn declared_location_file_wins_as_target() {
+        // 说明文件里写的路径 > 任何名字启发式。这里用一个「已存在的」真实目录
+        // 作为目标（位置文件指向它），验证它排在候选最前。
+        let d = tmpdir("kkc_locate");
+        let src = d.join("C0771存档").join("存档");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("System.bin"), b"{}").unwrap();
+        let target = d.join("SaveData");
+        fs::create_dir_all(&target).unwrap();
+
+        let txt = "C:\\Users\\（用户名）\\AppData\\LocalLow\\X\\KKC4\n还是中文说明行";
+        fs::write(src.join("位置.txt"), txt.as_bytes()).unwrap();
+
+        // 直接验证解析器（目标目录可能在本机不存在，find_save_dirs 只收存在的）
+        let (p, raw) = parse_save_location(
+            "C:\\Users\\（用户名）\\AppData\\LocalLow\\X\\KKC4\n说明：解压后覆盖",
+        )
+        .expect("应能解析出绝对路径行");
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        assert!(!p.to_string_lossy().contains("用户名"), "占位符没被替换：{p:?}");
+        if !user.is_empty() {
+            assert!(p.to_string_lossy().contains(&user), "没替换成当前用户名：{p:?}");
+        }
+        assert!(raw.contains("LocalLow"));
+        // 中文说明行不该被当成路径
+        assert!(parse_save_location("说明：解压后覆盖到存档目录").is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn gbk_location_file_decodes_and_expands_username() {
+        // 实录字节：`位置.txt` 是 GBK，`（用户名）` = A3 A8 D3 C3 BB A7 C3 FB A3 A9。
+        // 早先按 `decode()` 的 ok=false 退回 from_utf8_lossy → 汉字全变 U+FFFD
+        // → 占位符匹配不上 → 目标目录凭空消失。
+        let bytes: Vec<u8> = {
+            let mut v = b"C:\\Users\\".to_vec();
+            v.extend_from_slice(&[0xA3, 0xA8, 0xD3, 0xC3, 0xBB, 0xA7, 0xC3, 0xFB, 0xA3, 0xA9]); // （用户名）
+            v.extend_from_slice(b"\\AppData\\LocalLow\\GIRL'S SOFTWARE\\KKC4");
+            v
+        };
+        let text = decode_text(&bytes).expect("GBK 说明文件应能解码");
+        assert!(text.contains("（用户名）"), "GBK 汉字没解出来：{text:?}");
+        assert!(!text.contains('\u{fffd}'), "出现了替换字符：{text:?}");
+
+        let (p, _) = parse_save_location(&text).expect("应解析出绝对路径");
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        if !user.is_empty() {
+            assert!(p.to_string_lossy().contains(&user), "用户名没替换：{p:?}");
+        }
+        assert!(p.to_string_lossy().ends_with("KKC4"));
+    }
+
+    #[test]
+    fn settings_only_bundle_gets_warning() {
+        // 实录：`C0771存档` 只有 `System.bin`（16 个键全是音量/跳过/已读记录），
+        // 没有 `Flag`、名字里也没有 data/save → 必须提示「多半解不开 CG」。
+        let d = tmpdir("kkc_settings_only");
+        fs::create_dir_all(&d).unwrap();
+        let sys = d.join("System.bin");
+        fs::write(
+            &sys,
+            br#"{"messageSpeed":0.5,"bgmVolume":0.5,"passingScene":["M000_01_h"]}"#,
+        )
+        .unwrap();
+
+        let w = bundled_content_warning(&[sys]).expect("纯设置文件应当给出提示");
+        assert!(w.contains("进度存档"), "{w}");
+        assert!(w.contains("registry"), "提示里要给出替代出路：{w}");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn progress_save_bundle_gets_no_warning() {
+        // 带 `Flag` 字面量（或文件名含 data）的候选 = 真进度存档 → 不该干扰用户。
+        let d = tmpdir("kkc_progress");
+        fs::create_dir_all(&d).unwrap();
+        let with_flag = d.join("globals.bin");
+        fs::write(&with_flag, br#"{"m001_04Flag":true}"#).unwrap();
+        assert!(bundled_content_warning(&[with_flag]).is_none());
+
+        let by_name = d.join("data35.bin");
+        fs::write(&by_name, b"\x00\x01\x02").unwrap();
+        assert!(
+            bundled_content_warning(&[by_name]).is_none(),
+            "文件名含 data 就应视为进度存档"
+        );
+
+        assert!(bundled_content_warning(&[]).is_none(), "空列表不该报警");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn location_file_found_at_depth_four() {
+        // 实录：`位置.txt` 在 depth=4。早先 `max_depth(3)` 让它永远看不到 ——
+        // 解析函数单测全绿，真机上却「目标目录: 未找到」。
+        let d = tmpdir("kkc_depth4");
+        let inner = d.join("A存档").join("A存档").join("存档");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("System.bin"), b"{}").unwrap();
+        fs::write(inner.join("位置.txt"), "C:\\Users\\（用户名）\\AppData\\LocalLow\\X\\KKC4").unwrap();
+
+        let hit = find_declared_save_dir(&d);
+        assert!(hit.is_some(), "depth=4 的说明文件没被找到（又被深度限制挡住了？）");
+        let (_, raw) = hit.unwrap();
+        assert!(raw.contains("LocalLow"), "{raw}");
+
         let _ = fs::remove_dir_all(&d);
     }
 

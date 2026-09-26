@@ -10,7 +10,6 @@
 //! - 未翻条目判定：CSV 的 translation 列为空 / JSON 的值为空串。已有译文一律保留。
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::json;
@@ -477,13 +476,6 @@ fn write_flat(json_path: &Path, map: &serde_json::Map<String, serde_json::Value>
     let txt = serde_json::to_string_pretty(&serde_json::Value::Object(map.clone())).map_err(|e| e.to_string())?;
     crate::settings::ensure_parent(json_path);
     std::fs::write(json_path, txt).map_err(|e| format!("写入翻译 JSON 失败: {e}"))
-}
-
-// 防止未使用告警的小工具（保留扩展口）
-#[allow(dead_code)]
-fn _unused_read(r: &mut dyn Read) -> Result<(), String> {
-    let mut b = [0u8; 1];
-    r.read(&mut b).map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

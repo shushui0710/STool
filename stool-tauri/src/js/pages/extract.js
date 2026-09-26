@@ -126,13 +126,13 @@ const ExtractPage = {
     if (go) go.addEventListener("click", () => this.run("extract"));
 
     const open = $("#eOpen", this.root);
-    if (open) open.addEventListener("click", () => this.openFolder(this.result.out_dir));
+    if (open) open.addEventListener("click", () => openPath(this.result.out_dir));
     const again = $("#eAgain", this.root);
     if (again) again.addEventListener("click", () => this.run("extract"));
     const cancel = $("#eCancel", this.root);
-    if (cancel) cancel.addEventListener("click", () => this.cancel());
+    if (cancel) cancel.addEventListener("click", () => cancelTask());
     const openGame = $("#eOpenGame", this.root);
-    if (openGame) openGame.addEventListener("click", () => this.openFolder(Store.gameRoot));
+    if (openGame) openGame.addEventListener("click", () => openPath(Store.gameRoot));
 
     const rPick = $("#rPick", this.root);
     if (rPick) rPick.addEventListener("click", () => this.pickRepackSrc());
@@ -161,16 +161,13 @@ const ExtractPage = {
   },
 
   renderNeedGame() {
-    this.root.innerHTML = `<div class="seg">${emptyHtml(
+    renderNeedGame(
+      this.root,
       "①",
       "还没选游戏",
       "得先让 STool 知道游戏在哪，才能从里面取东西。",
-      "去选游戏",
       "eGoDetect"
-    )}</div>`;
-    $("#eGoDetect", this.root).addEventListener("click", () => {
-      location.hash = "#detect";
-    });
+    );
   },
 
   resultHtml() {
@@ -258,31 +255,12 @@ const ExtractPage = {
   // -- 进度 -----------------------------------------------------------------
 
   progressHtml() {
-    return `
-      <div class="mt3" id="eProgBody">
-        <div class="row tight">
-          <span class="small dim2" data-msg style="flex:1 1 auto;min-width:0">正在准备…</span>
-          <span class="small mono" data-pct>0%</span>
-        </div>
-        <div class="bar mt2"><i style="width:0%"></i></div>
-        <div class="row mt2">
-          <button class="btn btn-ghost btn-sm" id="eCancel">取消</button>
-        </div>
-      </div>`;
+    return progressHtml("eProg", "eCancel");
   },
 
-  /** 进度事件到了只更新几个节点，不重绘整页（重绘会闪、也会丢焦点）。 */
   paintProgress(p) {
     this.prog = p;
-    const host = $("#eProg", this.root);
-    if (!host || !host.firstElementChild) return;
-    const pct = Math.max(0, Math.min(100, Math.round((p.frac || 0) * 100)));
-    const bar = host.querySelector(".bar > i");
-    if (bar) bar.style.width = pct + "%";
-    const pv = host.querySelector("[data-pct]");
-    if (pv) pv.textContent = pct + "%";
-    const mv = host.querySelector("[data-msg]");
-    if (mv) mv.textContent = clip(p.msg || "…", 64);
+    paintProgress(this.root, "eProg", p);
   },
 
   // -- 动作 -----------------------------------------------------------------
@@ -303,16 +281,6 @@ const ExtractPage = {
     await this.render();
   },
 
-  async openFolder(p) {
-    const r = await Tauri.call("open_folder", { path: p });
-    if (!r.ok) toast(r.err, "err");
-  },
-
-  async cancel() {
-    await Tauri.call("cancel_task");
-    toast("已请求取消，会在当前文件写完后停下。");
-  },
-
   /** `kind` 为空 = 取出素材；"repack" = 重新打包。 */
   async run(kind) {
     if (this.running) return;
@@ -325,7 +293,7 @@ const ExtractPage = {
     await this.render();
 
     // 先订阅再调用：否则任务太快、头几个进度事件会丢。
-    await this.subscribe();
+    await subscribeProgress(this, this.root, "eProg");
 
     const cmd = kind === "repack" ? "repack_assets" : "extract_assets";
     const args = kind === "repack" ? { srcDir: this.repackSrc } : { outDir: this.outDir };
@@ -346,15 +314,5 @@ const ExtractPage = {
     await this.render();
     if (this.result) toast(kind === "repack" ? "重新打包完成。" : `完成：取出 ${this.result.files_done} 个文件。`);
     else if (this.err) toast("没成功，原因见页面上的提示。", "err");
-  },
-
-  async subscribe() {
-    if (this.unlisten) {
-      try {
-        this.unlisten();
-      } catch (_) {}
-      this.unlisten = null;
-    }
-    this.unlisten = await Tauri.on("op:progress", (p) => this.paintProgress(p));
   },
 };

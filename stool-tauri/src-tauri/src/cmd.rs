@@ -1570,6 +1570,9 @@ pub struct UnlockOpts {
     pub route: String,
     pub save_dir: String,
     pub filter: String,
+    /// `--opt:set=` 的等价物：按名写指定值（`名称=值,名称=值`）。
+    /// 与 `filter` 的区别：`filter` 只筛「猜出来的候选」，`set` 是**点名写**，不猜。
+    pub set: String,
 }
 
 /// 带选项的解锁执行实现（不碰 Tauri 类型，可单测）。
@@ -1629,6 +1632,11 @@ fn unlock_run_core(
         // 透传给 Unity 私有实现（注册表键名过滤）。
         opts.insert("filter".into(), opts_in.filter.trim().to_string());
     }
+    if !opts_in.set.trim().is_empty() {
+        // 透传给 Unity 私有实现（按名写指定值）。语法由内核校验并给「原因 + 改法」，
+        // 界面不自己解析 —— 免得两边口径漂移。
+        opts.insert("set".into(), opts_in.set.trim().to_string());
+    }
 
     // 解锁只写存档/注册表，不碰游戏目录里的封包 —— 与内核 scope 判定对齐。
     let scope = stool::features::precheck::scope_for_op(Op::Unlock, &opts);
@@ -1665,12 +1673,18 @@ pub async fn unlock_run(
     route: String,
     save_dir: String,
     filter: String,
+    set: Option<String>,
 ) -> Result<OpResult, String> {
     use tauri::Emitter;
     let (root, engine) = current_game(&state)?;
     let cancel = state.cancel.clone();
     cancel.store(false, Ordering::Relaxed);
-    let opts = UnlockOpts { route, save_dir, filter };
+    let opts = UnlockOpts {
+        route,
+        save_dir,
+        filter,
+        set: set.unwrap_or_default(),
+    };
     offload(move || {
         let emit = app.clone();
         let last = std::cell::Cell::new((0.0f32, Instant::now()));
@@ -1684,6 +1698,45 @@ pub async fn unlock_run(
             let _ = emit.emit("op:progress", Prog { frac, msg: msg.to_string() });
         };
         unlock_run_core(&root, &engine, apply, &opts, &cancel, &progress)
+    })
+    .await
+}
+
+/// 注册表里一个现存值（给界面列「有哪些键可改」用）。
+#[derive(Serialize, Debug)]
+pub struct RegKeyRowOut {
+    pub name: String,
+    pub value: String,
+    pub kind: String,
+    pub ty: u32,
+    pub family: String,
+    /// 引擎自身写的键（`unity.*` / `Screenmanager *` …）—— 界面单独归一组，别让人误改。
+    pub engine_own: bool,
+}
+
+/// 列出该游戏注册表里的**全部现存值**（键名 / 当前值 / 类型），只读。
+///
+/// 起因：`--opt:set=` 要求用户报出键名，可用户不知道有哪些键 —— 于是「列出可改键」。
+/// 与 `list_prefs_values` 同一口径（分组/排序都在内核，界面只负责画），
+/// 界面不再自己判一遍「哪个是引擎自身的」。
+#[tauri::command]
+pub async fn unlock_list_keys(state: tauri::State<'_, AppState>) -> Result<Vec<RegKeyRowOut>, String> {
+    let (root, _) = current_game(&state)?;
+    offload(move || {
+        let rows: Vec<RegKeyRowOut> = stool::features::gallery::list_prefs_values(Path::new(&root))
+            .into_iter()
+            .map(|r| RegKeyRowOut {
+                name: r.name,
+                value: r.value,
+                kind: r.kind,
+                ty: r.ty,
+                family: r.family,
+                engine_own: r.engine_own,
+            })
+            .collect();
+        // 空列表不是错误：不是 Unity 系作品、或游戏还没启动过一次（注册表里自然没键）。
+        // 返回空 Vec，由界面给出「没读到键」的说明文案 —— 命令层不编文案。
+        Ok(rows)
     })
     .await
 }

@@ -118,16 +118,13 @@ const ModsPage = {
   },
 
   renderNeedGame() {
-    this.root.innerHTML = `
-      <div class="seg">${emptyHtml(
-        "⑧",
-        "还没选游戏",
-        "MOD 要装进游戏目录，所以得先告诉我要装到哪个游戏。",
-        "去选游戏",
-        "mGoDetect"
-      )}</div>`;
-    const b = $("#mGoDetect", this.root);
-    if (b) b.addEventListener("click", () => setPage("detect"));
+    renderNeedGame(
+      this.root,
+      "⑧",
+      "还没选游戏",
+      "MOD 要装进游戏目录，所以得先告诉我要装到哪个游戏。",
+      "mGoDetect"
+    );
   },
 
   loadingHtml() {

@@ -37,6 +37,14 @@ use crate::formats::{dotnet, il2cpp};
 /// 独立成常量以便非 Windows 平台也能编译同一套判断逻辑。
 const REG_DWORD_TYPE: u32 = 4;
 
+/// 注册表 `REG_BINARY` 的类型值（Windows 的 `REG_BINARY` 常量 = 3）。
+///
+/// 别以为「二进制」就不能写：Unity 系作品常把**字符串**存成 `REG_BINARY` +
+/// ASCII + 结尾 NUL（实测样本：某作的 `GameState_Money` = 字节 `36 31 30 38 00`
+/// 即 `"6108\0"` —— 用字符串存钱正是为了绕过 32 位上限），所以这一档要按
+/// 「文本字节」对待，并跟着原值的结尾 NUL 走。
+const REG_BINARY_TYPE: u32 = 3;
+
 /// Unity PlayerPrefs 的 djb2 变体哈希（按 UTF-8 字节，32 位无符号溢出）。
 ///
 /// ```text
@@ -581,9 +589,9 @@ mod winreg {
     use super::{RegSnapshot, ValueSnap};
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR};
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
-        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW, RegOpenKeyExW,
+        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY,
+        REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -751,6 +759,19 @@ mod winreg {
             }
         }
 
+        /// 按指定类型写一个值（`--opt:set=` 用；不猜类型）。
+        pub fn set_raw(&self, name: &str, ty: u32, bytes: &[u8]) -> Result<(), String> {
+            let w = wide(name);
+            let rc: WIN32_ERROR = unsafe {
+                RegSetValueExW(self.h, w.as_ptr(), 0, ty, bytes.as_ptr(), bytes.len() as u32)
+            };
+            if rc == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!("写入 {name} 失败（错误码 {rc}）"))
+            }
+        }
+
         /// 按快照类型回写一个值（用于还原）。
         pub fn set_from_snap(&self, snap: &ValueSnap) -> Result<(), String> {
             let w = wide(&snap.name);
@@ -781,6 +802,21 @@ mod winreg {
                 Ok(())
             } else {
                 Err(format!("还原 {} 失败（错误码 {rc}）", snap.name))
+            }
+        }
+
+        /// 删除一个值（撤销本工具的写入用）。
+        ///
+        /// 值不存在（`ERROR_FILE_NOT_FOUND`）也算成功——删除是幂等的，
+        /// 重跑一次不该报错。
+        pub fn delete_value(&self, name: &str) -> Result<(), String> {
+            use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+            let w = wide(name);
+            let rc: WIN32_ERROR = unsafe { RegDeleteValueW(self.h, w.as_ptr()) };
+            if rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(format!("删除 {name} 失败（错误码 {rc}）"))
             }
         }
 
@@ -901,7 +937,13 @@ mod winreg {
         pub fn set_dword(&self, _n: &str, _v: u32) -> Result<(), String> {
             Err("注册表功能仅支持 Windows".into())
         }
+        pub fn set_raw(&self, _n: &str, _t: u32, _b: &[u8]) -> Result<(), String> {
+            Err("注册表功能仅支持 Windows".into())
+        }
         pub fn set_from_snap(&self, _s: &ValueSnap) -> Result<(), String> {
+            Err("注册表功能仅支持 Windows".into())
+        }
+        pub fn delete_value(&self, _n: &str) -> Result<(), String> {
             Err("注册表功能仅支持 Windows".into())
         }
         pub fn snapshot(&self, _c: &str, _p: &str, _t: &str) -> RegSnapshot {
@@ -934,6 +976,171 @@ fn now_stamp() -> String {
     format!("{secs}")
 }
 
+/// 是否拒绝「纯启发式候选」的批量写入。
+///
+/// 只在**四个条件同时成立**时才拒绝：真的要写入、精确来源解析不出来
+/// （`scan_usable == false`）、也没能用注册表里的现存键族收敛候选
+/// （`family_prefix.is_none()`）、且调用方没有显式强制。这几条凑齐说明整批候选
+/// 都是从场景/资源二进制里「捞」出来的字符串，写进去几乎不可能命中游戏真正会读的
+/// 键 —— 这正是某作被灌进 3000 条垃圾键的场景（见 `unlock` 里的闸门说明）。
+/// 调用方显式给 `--opt:force_heuristic=1` 时一律放行（知情选择）。
+fn heuristic_write_blocked(
+    apply: bool,
+    scan_usable: bool,
+    family_prefix: Option<&str>,
+    forced: bool,
+) -> bool {
+    apply && !scan_usable && family_prefix.is_none() && !forced
+}
+
+/// 把 `text` 编成 `REG_SZ` 的字节（UTF-16LE + 结尾 NUL）。
+fn utf16z(text: &str) -> Vec<u8> {
+    let mut b: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    b.extend_from_slice(&[0, 0]);
+    b
+}
+
+/// 注册表类型 → 给人看的名字。
+///
+/// 常见类型都给个名字：`--opt:set=` 拒绝改写时要把「它是啥」讲清楚，而不是只丢个数字，
+/// 不然用户没法判断该不该手工去改。
+fn kind_label(ty: u32) -> &'static str {
+    match ty {
+        REG_DWORD_TYPE => "DWORD",
+        1 => "字符串",
+        2 => "可扩展字符串",
+        REG_BINARY_TYPE => "二进制",
+        5 => "大端 DWORD",
+        6 => "符号链接",
+        7 => "多字符串",
+        8 => "资源列表",
+        9 => "完整资源描述",
+        10 => "资源需求列表",
+        11 => "QWORD",
+        _ => "未知类型",
+    }
+}
+
+/// 去掉尾部的 0 字节（`REG_SZ` 的结尾 NUL 不参与读回比较）。
+fn trim_nul(b: &[u8]) -> &[u8] {
+    let mut n = b.len();
+    while n > 0 && b[n - 1] == 0 {
+        n -= 1;
+    }
+    &b[..n]
+}
+
+/// 把一个注册表值渲染成短文本（报告用）。
+fn display_val(ty: u32, data: &[u8]) -> String {
+    if ty == REG_DWORD_TYPE {
+        return data
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            .unwrap_or_else(|| "<不足 4 字节>".into());
+    }
+    if ty == 1 {
+        // `REG_SZ` 按 UTF-16LE 解到第一个 NUL 为止。
+        let mut units: Vec<u16> = Vec::new();
+        for c in data.chunks(2) {
+            if c.len() < 2 {
+                break;
+            }
+            let u = u16::from_le_bytes([c[0], c[1]]);
+            if u == 0 {
+                break;
+            }
+            units.push(u);
+        }
+        return format!("{:?}", String::from_utf16_lossy(&units));
+    }
+    if ty == REG_BINARY_TYPE {
+        // 文本型二进制就显示文本（别把真二进制乱解成字符串）。
+        let body = trim_nul(data);
+        if !body.is_empty() && body.iter().all(|b| (0x20..0x7f).contains(b)) {
+            return format!("{:?}", String::from_utf8_lossy(body));
+        }
+    }
+    format!("<{} 字节>", data.len())
+}
+
+/// 解析 `--opt:set=` 的 `名称=值,名称=值` 串。
+///
+/// 名称允许空格（如 `Screenmanager Window Position X`），值允许 `0x` 十六进制与
+/// 负数。空项跳过；缺 `=` 或键名为空直接报错 —— **宁可不写也不猜**。
+fn parse_set_pairs(spec: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for item in spec.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = item.split_once('=') else {
+            return Err(format!(
+                "`--opt:set=` 里的 `{item}` 缺少 `=`（格式: 名称=值,名称=值）"
+            ));
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() {
+            return Err(format!("`--opt:set=` 里的 `{item}` 键名为空"));
+        }
+        out.push((k.to_string(), v.to_string()));
+    }
+    if out.is_empty() {
+        return Err("`--opt:set=` 没解析出任何键值对（格式: 名称=值,名称=值）".into());
+    }
+    Ok(out)
+}
+
+/// 把用户给的文本按目标类型转成注册表字节。
+///
+/// **已有值的类型优先**：DWORD 就按整数写、字符串就按字符串写、文本型二进制就按
+/// 原样字节写 —— 不擅自改类型。把游戏的字符串设置改成 DWORD 会破坏它，这与画廊写入
+/// 是同一条戒律。`existing_nul` 表示原值以 NUL 结尾（`REG_BINARY` 的文本约定），
+/// 跟带才能和游戏自己的写法一致。
+/// 键还不存在时：能解析成整数就当 DWORD，否则当字符串。
+fn coerce_value(
+    text: &str,
+    existing_ty: Option<u32>,
+    existing_nul: bool,
+) -> Result<(u32, Vec<u8>), String> {
+    let as_dword = || -> Result<u32, String> {
+        let t = text.trim();
+        let (neg, body) = match t.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, t),
+        };
+        let n = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            u32::from_str_radix(h, 16).map_err(|e| format!("`{text}` 不是合法的十六进制整数: {e}"))?
+        } else {
+            body.parse::<u32>()
+                .map_err(|e| format!("`{text}` 不是合法的整数: {e}"))?
+        };
+        Ok(if neg { (n as i32).wrapping_neg() as u32 } else { n })
+    };
+    match existing_ty {
+        Some(t) if t == REG_DWORD_TYPE => Ok((REG_DWORD_TYPE, as_dword()?.to_le_bytes().to_vec())),
+        Some(t) if t == REG_BINARY_TYPE => {
+            let mut b = text.as_bytes().to_vec();
+            if existing_nul {
+                b.push(0);
+            }
+            Ok((REG_BINARY_TYPE, b))
+        }
+        Some(1) => Ok((1, utf16z(text))),
+        Some(t) => Err(format!(
+            "该键现有类型是 {}（{}）—— 本工具只认 DWORD / 字符串 / 文本型二进制三种，\
+             为一个不熟悉的类型造字节等于瞎猜。为免破坏它，`--opt:set=` 拒绝改写，\
+             这一条只能手工改注册表。",
+            kind_label(t),
+            t
+        )),
+        None => Ok(match as_dword() {
+            Ok(v) => (REG_DWORD_TYPE, v.to_le_bytes().to_vec()),
+            Err(_) => (1, utf16z(text)),
+        }),
+    }
+}
+
 /// Unity 的 `Op::Unlock` 入口。
 ///
 /// 选项（`--opt:key=value`）：
@@ -941,6 +1148,12 @@ fn now_stamp() -> String {
 /// - `filter=<子串>`：只处理键名包含该子串的候选
 /// - `max=<n>`：候选上限（默认 3000）
 /// - `restore=<快照.json>`：从备份还原，忽略其它写入逻辑
+/// - `undo=1`：反向操作——把候选键对应的注册表值**删掉**（撤销本工具写过的痕迹）。
+///   同样默认只预览，要真删须再给 `apply=1`；`keep=<前缀,前缀>` 保护游戏真实键
+/// - `force_heuristic=1`：候选只有「场景/资源二进制启发式」这一个来源时，
+///   允许写入（默认拒绝，见函数体里的闸门说明）
+/// - `set=名称=值,名称=值`：**不做候选提取**，只按名字写你点名的键（类型按现存值
+///   决定）。适合「这款游戏没有画廊键、内容按进度解锁」的情形 —— 改真实进度键
 pub fn unlock(ctx: &Ctx) -> OpOutcome {
     // 还原分支
     if let Some(path) = ctx.opt("restore") {
@@ -1022,9 +1235,49 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
     candidates.truncate(max);
     ctx.report(0.7, "已提取候选键名");
 
+    // 撤销分支：删掉本工具此前可能写进去的候选键（只删候选，绝不动其它值）
+    if ctx.opt("undo") == Some("1") {
+        return undo_from(ctx, &key, &info, &candidates, &existing);
+    }
+
     if !hash_bad.is_empty() && ctx.opt("apply") == Some("1") {
         return OpOutcome::fail(format!(
             "拒绝写入：哈希自检未通过。{note}"
+        ));
+    }
+
+    // 按名写指定值分支（`--opt:set=名称=值,…`）。
+    //
+    // 与画廊解锁的本质区别：**完全不做候选提取**，只写调用方点名的键 —— 也就是说
+    // 它「不猜」。像 SheepClicker 这类没有画廊键、内容按进度解锁的作品，唯一能起
+    // 作用的入口就是它（改 `GameState_Follower` / `Skill_*Level` 这些真实键）。
+    // 必须放在启发式闸门**之前**：闸门管的是「猜出来的候选」，与点名写入无关。
+    if let Some(spec) = ctx.opt("set") {
+        return set_values(ctx, &key, &info, &existing, spec);
+    }
+
+    // 启发式候选的写入闸门。
+    //
+    // 「精确来源」（程序集字符串 / IL2CPP 元数据字面量）解析不出来、注册表里也没有
+    // 可参照的键族时，候选只能从场景/资源的二进制里「捞」字符串。这种候选里混着大量
+    // 与画廊无关的东西（shader 关键词、资源名、压缩数据碎片），而且**本工具无从判断
+    // 哪条才是游戏真正会读的键**。实测一个只有约 50 个真实键的 IL2CPP 作品被这样写了
+    // 一次：3000 条垃圾键进注册表（全部 = 1），游戏照样不开内容；第二次再跑就变成
+    // 「写入 0 个」，而报告里看不出任何异常。所以默认**拒绝**这种写入。
+    if heuristic_write_blocked(
+        ctx.opt("apply") == Some("1"),
+        scan.usable(),
+        family_prefix.as_deref(),
+        ctx.opt("force_heuristic") == Some("1"),
+    ) {
+        return OpOutcome::fail(format!(
+            "拒绝写入：候选来源不可靠（纯启发式，共 {} 条）。\n{asm_note}\n\
+             ⚠ 这些候选是从场景/资源二进制里抽取的字符串，无法与画廊建立可靠对应。\
+             直接写入会塞进大量与画廊无关的整数设置项，而且**改完你无法从报告里看出哪些写错了**。\n\
+             → 先收窄再看预览：`--opt:filter=<子串>`（例如 --opt:filter=cg）；\n\
+             → 若确认候选没问题，加 `--opt:force_heuristic=1` 强制写入（写前自动备份）；\n\
+             → 写错了用 `--opt:undo=1 --opt:apply=1` 删除本工具写过的候选键。",
+            candidates.len()
         ));
     }
 
@@ -1175,7 +1428,7 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
     }
 
     let mut msg = format!(
-        "✔ Unity 画廊解锁完成\n\
+        "Unity 画廊解锁完成\n\
          注册表位置: {location}\n\
          {note}\n\
          {asm_note}\n\
@@ -1198,6 +1451,18 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
     if verified < written {
         msg.push_str("\n⚠ 有写入项读回校验未通过，请用 `--opt:restore=<备份文件>` 回滚后反馈");
     }
+    // 「一条都没写」不等于「已经解锁」。候选全都在注册表里且都等于 1，最常见的原因
+    // 是**上一次本工具把这张候选表整批写进来了**（候选名多是二进制碎片，游戏根本
+    // 不会读），与游戏真实解锁状态无关。必须说清楚，别让人误以为已经成功。
+    if written == 0 && !candidates.is_empty() && unlocked == candidates.len() {
+        msg.push_str(&format!(
+            "\n⚠ 本次一条都没写：全部 {} 个候选在注册表里**都已经等于 1**。\
+             这通常说明这批候选是上一次运行本工具时被整批写进去的（候选名多为二进制里捞出的碎片，\
+             并非游戏真实键），**不代表游戏已经解锁**。\
+             建议用 `--opt:undo=1`（先只读预览，确认后加 `--opt:apply=1`）把本工具写过的候选键删干净，再重新评估。",
+            unlocked
+        ));
+    }
     msg.push_str("\n提示：启动游戏查看画廊是否全开；若仍有未开项，多为未收录的键名，可用 `--opt:filter=` 细化后重跑。");
 
     let ok = written > 0 && verified == written;
@@ -1205,6 +1470,269 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
         success: ok,
         message: msg,
         files_done: written,
+        logs: vec![],
+    }
+}
+
+/// 撤销本工具的写入：把「候选键」在注册表里对应的值删掉。
+///
+/// 只删**候选**对应的值（也就是 `unlock --apply` 可能写过的那一批），绝不碰注册表
+/// 里的其它值。默认只预览；`--opt:keep=<前缀,前缀>` 保护游戏真实键——命中保护前缀
+/// 的候选一律不删（本工具无法自己判断哪条候选是真键，所以这个保护交给调用方给）。
+fn undo_from(
+    ctx: &Ctx,
+    key: &winreg::PrefsKey,
+    info: &AppInfo,
+    candidates: &[String],
+    existing: &[(String, u32, Vec<u8>)],
+) -> OpOutcome {
+    let location = format!("HKCU\\Software\\{}\\{}", info.company, info.product);
+    let keep: Vec<String> = ctx
+        .opt("keep")
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let present: BTreeSet<&str> = existing.iter().map(|(n, _, _)| n.as_str()).collect();
+
+    let mut targets: Vec<String> = Vec::new();
+    let mut protected: Vec<String> = Vec::new();
+    let mut absent = 0usize;
+    for c in candidates {
+        let vname = prefs_value_name(c);
+        if !present.contains(vname.as_str()) {
+            absent += 1;
+            continue;
+        }
+        if keep.iter().any(|k| c.starts_with(k.as_str())) {
+            protected.push(c.clone());
+            continue;
+        }
+        targets.push(vname);
+    }
+
+    if ctx.opt("apply") != Some("1") {
+        let mut msg = format!(
+            "【只读预览】撤销 Unity 画廊解锁写入\n\
+             注册表位置: {location}\n\
+             待删除（候选里有、注册表里也有）: {} 个\n\
+             被 `--opt:keep` 保护未删: {} 个\n\
+             候选里注册表本来就没有的: {absent} 个",
+            targets.len(),
+            protected.len()
+        );
+        if keep.is_empty() {
+            msg.push_str(
+                "\n⚠ 未指定 `--opt:keep=` —— 候选里可能混有游戏**真实**按键（例如 GameState_ / Skill_ 族），\
+                 删掉会重置这些设置。强烈建议先给出游戏自己的键族前缀，例如：\
+                 --opt:keep=GameState_,Skill_,FollowerData_,AutoObject_,AutoDevice,Milestone_,Volume_,unity,Screenmanager,Unity",
+            );
+        }
+        if !targets.is_empty() {
+            let sample: Vec<&String> = targets.iter().take(15).collect();
+            msg.push_str(&format!("\n待删样例: {sample:?}"));
+        }
+        if !protected.is_empty() {
+            let sample: Vec<&String> = protected.iter().take(15).collect();
+            msg.push_str(&format!("\n受保护样例: {sample:?}"));
+        }
+        msg.push_str("\n\n→ 确认后加 `--opt:apply=1` 真正删除（删除前会自动整键备份）。");
+        return OpOutcome::okn(msg, targets.len());
+    }
+
+    if targets.is_empty() {
+        return OpOutcome::ok("没有需要删除的值（候选与注册表没有交集，或已全被 --opt:keep 保护）");
+    }
+
+    // 删除前把整键备份一份，万一误删还能回滚
+    let snap = key.snapshot(&info.company, &info.product, &now_stamp());
+    let bak_path = ctx
+        .out_dir
+        .join(format!("unity_playerprefs_undo_{}.json", snap.taken_at));
+    if let Some(parent) = bak_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(&bak_path, serde_json::to_string_pretty(&snap).unwrap_or_default()) {
+        return OpOutcome::fail(format!("备份注册表失败（已中止，未删除任何值）: {e}"));
+    }
+
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for (i, name) in targets.iter().enumerate() {
+        match key.delete_value(name) {
+            Ok(()) => done += 1,
+            Err(e) => {
+                failed += 1;
+                crate::diag::log("WARN", &format!("gallery undo: {e}"));
+            }
+        }
+        ctx.report((i + 1) as f32 / targets.len() as f32, name);
+    }
+
+    let mut msg = format!(
+        "已删除 {done} 个值（失败 {failed}）\n\
+         注册表位置: {location}\n\
+         受 `--opt:keep` 保护未删 {} 个；候选里本就不存在 {absent} 个\n\
+         删除前备份: {}",
+        protected.len(),
+        bak_path.display()
+    );
+    if failed > 0 {
+        msg.push_str("\n⚠ 有删除失败项（多为权限问题），可重跑一次——删除是幂等的。");
+    }
+    OpOutcome {
+        success: failed == 0,
+        message: msg,
+        files_done: done,
+        logs: vec![],
+    }
+}
+
+/// `--opt:set=` 的一行写入计划（先全部算好，任何一条不合法就整体中止）。
+struct SetPlan {
+    /// 用户写的裸键名
+    name: String,
+    /// 带 `_h<哈希>` 后缀的真实注册表值名
+    vname: String,
+    ty: u32,
+    bytes: Vec<u8>,
+    /// 原值（报告用）
+    old: String,
+    /// 新值（报告用）
+    shown: String,
+}
+
+/// 按名写指定值（`--opt:set=名称=值,…`）。
+///
+/// 只写调用方点名的键：**没有候选、没有启发式、没有猜测**。类型按现存值决定
+/// （见 `coerce_value`），写前整键快照、写后逐项读回校验；任何一条入参不合法都
+/// **整体中止**，不留「写了一半」的中间态。
+fn set_values(
+    ctx: &Ctx,
+    key: &winreg::PrefsKey,
+    info: &AppInfo,
+    existing: &[(String, u32, Vec<u8>)],
+    spec: &str,
+) -> OpOutcome {
+    let pairs = match parse_set_pairs(spec) {
+        Ok(p) => p,
+        Err(e) => return OpOutcome::fail(e),
+    };
+    let location = format!("HKCU\\Software\\{}\\{}", info.company, info.product);
+
+    let mut plan: Vec<SetPlan> = Vec::new();
+    for (name, text) in &pairs {
+        let vname = prefs_value_name(name);
+        let hit = existing.iter().find(|(n, _, _)| n == &vname);
+        let (old, ty, old_nul) = match hit {
+            Some((_, t, d)) => (display_val(*t, d), Some(*t), d.last() == Some(&0)),
+            None => ("（注册表里还没有这个键）".to_string(), None, false),
+        };
+        let (t, bytes) = match coerce_value(text, ty, old_nul) {
+            Ok(v) => v,
+            Err(e) => {
+                return OpOutcome::fail(format!(
+                    "{e}\n（一条都没写：入参有问题时不留半截状态）"
+                ))
+            }
+        };
+        let shown = if t == REG_DWORD_TYPE {
+            display_val(t, &bytes)
+        } else {
+            format!("{text:?}")
+        };
+        plan.push(SetPlan {
+            name: name.clone(),
+            vname,
+            ty: t,
+            bytes,
+            old,
+            shown,
+        });
+    }
+
+    if ctx.opt("apply") != Some("1") {
+        let mut msg = format!(
+            "【只读预览】按名写指定值（只写你点名的键，不做候选提取）\n\
+             注册表位置: {location}\n将写入 {} 个键：",
+            plan.len()
+        );
+        for p in &plan {
+            msg.push_str(&format!(
+                "\n  {} = {}  [{}]   原值 {}",
+                p.name,
+                p.shown,
+                kind_label(p.ty),
+                p.old
+            ));
+        }
+        msg.push_str(
+            "\n\n→ 确认后加 `--opt:apply=1` 真正写入（写前自动整键备份、写后逐项读回校验）。",
+        );
+        return OpOutcome::okn(msg, plan.len());
+    }
+
+    // 写前整键备份
+    let snap = key.snapshot(&info.company, &info.product, &now_stamp());
+    let bak_path = ctx
+        .out_dir
+        .join(format!("unity_playerprefs_set_{}.json", snap.taken_at));
+    if let Some(parent) = bak_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(&bak_path, serde_json::to_string_pretty(&snap).unwrap_or_default()) {
+        return OpOutcome::fail(format!("备份注册表失败（已中止，未写入任何值）: {e}"));
+    }
+
+    let mut done = 0usize;
+    let mut verified = 0usize;
+    let mut failed = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    for (i, p) in plan.iter().enumerate() {
+        match key.set_raw(&p.vname, p.ty, &p.bytes) {
+            Ok(()) => {
+                done += 1;
+                let ok = key
+                    .get(&p.vname)
+                    .map(|(rt, rd)| rt == p.ty && trim_nul(&rd) == trim_nul(&p.bytes))
+                    .unwrap_or(false);
+                if ok {
+                    verified += 1;
+                    lines.push(format!("  {}: {} → {}", p.name, p.old, p.shown));
+                } else {
+                    lines.push(format!("  {}: {} → {}  ⚠ 读回不一致", p.name, p.old, p.shown));
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                lines.push(format!("  {}: 写入失败 —— {e}", p.name));
+                crate::diag::log("WARN", &format!("gallery set: {e}"));
+            }
+        }
+        ctx.report((i + 1) as f32 / plan.len() as f32, &p.name);
+    }
+
+    let mut msg = format!(
+        "按名写指定值完成：写入 {done} 个（读回校验通过 {verified} 个），失败 {failed} 个\n\
+         注册表位置: {location}\n写前备份: {}\n{}",
+        bak_path.display(),
+        lines.join("\n")
+    );
+    if verified < done {
+        msg.push_str("\n⚠ 有写入项读回校验未通过——请用 `--opt:restore=<备份文件>` 回滚后反馈");
+    }
+    msg.push_str(
+        "\n提示：注册表是游戏**启动时**才读的，改完请先完全退出游戏再启动；\
+         若游戏有「设置」界面，进去看一眼再退出，让它把状态写回。",
+    );
+    OpOutcome {
+        success: failed == 0 && verified == done,
+        message: msg,
+        files_done: done,
         logs: vec![],
     }
 }
@@ -1268,16 +1796,79 @@ fn restore_from(ctx: &Ctx, path: &Path) -> OpOutcome {
 
 /// 供 GUI / CLI 复用：把当前已有的原始键名列出（不含哈希后缀）。
 pub fn known_keys(root: &Path) -> Vec<String> {
+    list_prefs_values(root).into_iter().map(|r| r.name).collect()
+}
+
+/// 注册表里一个现存值，按「给人看」的样子摆好（只读，不写）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegKeyRow {
+    /// 原始键名（已剥掉 `_h<hash>` 后缀）。点名写入就用它。
+    pub name: String,
+    /// 该键当前的文本形态（DWORD 是十进制、字符串带引号、二进制文本带引号）。
+    pub value: String,
+    /// 类型的中文名，如 `DWORD` / `字符串` / `二进制`。
+    pub kind: String,
+    /// 原始注册表类型码（`--opt:set=` 会据此保持类型）。
+    pub ty: u32,
+    /// 键名所属的「族前缀」（到第一个 `_` 或 `.` 为止），供 UI 分组。
+    pub family: String,
+    /// 是否是 Unity / 引擎自身写的键（`unity.*`、`unity_connect.*`、`Screenmanager *`
+    /// 等）。这些**不该动** —— 界面要单独标出来，别让用户误改。
+    pub engine_own: bool,
+}
+
+/// 键族前缀：`GameState_Follower` → `GameState`，`unity.ready` → `unity`。
+fn family_prefix(name: &str) -> String {
+    let cut = name.find(['_', '.']).unwrap_or(name.len());
+    name[..cut].to_string()
+}
+
+/// Unity / 引擎自身写的键名前缀（这些改坏了是环境问题，不是游戏进度）。
+const ENGINE_OWN_PREFIXES: &[&str] = &["unity", "unity_connect", "Screenmanager", "UnitySelectMonitor"];
+
+/// 是不是引擎自身的键。
+fn is_engine_own(name: &str) -> bool {
+    ENGINE_OWN_PREFIXES
+        .iter()
+        .any(|p| name == *p || name.starts_with(&format!("{p}.")) || name.starts_with(&format!("{p} ")))
+}
+
+/// 供 GUI / CLI 复用：把注册表里**全部现存值**连类型一起列出来，供用户照着点名改。
+///
+/// 起因：`--opt:set=` 只认「你告诉我键名」，可用户根本不知道有哪些键可改（SheepClicker
+/// 那次就是这样卡住的）。这个函数把「有哪些键、现在是什么值、什么类型」摆到台面上，
+/// **只读，绝不写**。
+pub fn list_prefs_values(root: &Path) -> Vec<RegKeyRow> {
     let Some(info) = read_app_info(root) else {
         return Vec::new();
     };
     let Ok(key) = winreg::PrefsKey::open(&info.company, &info.product) else {
         return Vec::new();
     };
-    key.enum_values()
+    let mut rows: Vec<RegKeyRow> = key
+        .enum_values()
         .into_iter()
-        .filter_map(|(n, _, _)| split_value_name(&n).map(|(raw, _)| raw.to_string()))
-        .collect()
+        .filter_map(|(n, ty, data)| {
+            let (raw, _) = split_value_name(&n)?;
+            Some(RegKeyRow {
+                name: raw.to_string(),
+                value: display_val(ty, &data),
+                kind: kind_label(ty).to_string(),
+                ty,
+                family: family_prefix(raw),
+                engine_own: is_engine_own(raw),
+            })
+        })
+        .collect();
+    // 引擎自身的键排到后面（用户要改的是游戏进度键），同类按名字定序，
+    // 保证多次调用顺序稳定（UI 里跳来跳去会让人烦）。
+    rows.sort_by(|a, b| {
+        a.engine_own
+            .cmp(&b.engine_own)
+            .then_with(|| a.family.cmp(&b.family))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1878,114 @@ pub fn known_keys(root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heuristic_gate_blocks_unreliable_candidates() {
+        // 要写入 + 精确来源不可用 + 没有现存键族可收敛 → 拒绝。
+        // 这就是 SheepClicker 被灌进 3000 条垃圾键的那个场景。
+        assert!(heuristic_write_blocked(true, false, None, false));
+        // 调用方显式知情选择 → 放行
+        assert!(!heuristic_write_blocked(true, false, None, true));
+        // 只读预览永远不拦（否则看不到候选，等于死胡同）
+        assert!(!heuristic_write_blocked(false, false, None, false));
+        // 精确来源可用（程序集 / IL2CPP 元数据字面量）→ 放行
+        assert!(!heuristic_write_blocked(true, true, None, false));
+        // 能用注册表里的现存键族收敛候选 → 放行
+        assert!(!heuristic_write_blocked(true, false, Some("CG"), false));
+    }
+
+    #[test]
+    fn reg_key_rows_group_and_flag_engine_own() {
+        // 族前缀：到第一个 `_` 或 `.` 为止，没有分隔符就是整名。
+        assert_eq!(family_prefix("GameState_Follower"), "GameState");
+        assert_eq!(family_prefix("unity.ready"), "unity");
+        assert_eq!(family_prefix("Volume_Master"), "Volume");
+        assert_eq!(family_prefix("Solo"), "Solo");
+        // 引擎自身的键要能认出来 —— 界面靠它把「别动这些」的那批分出来。
+        assert!(is_engine_own("unity.ready"));
+        assert!(is_engine_own("unity_connect.version"));
+        assert!(is_engine_own("Screenmanager Resolution Width"));
+        assert!(is_engine_own("UnitySelectMonitor"));
+        // 游戏进度键不能误判成引擎自身的
+        assert!(!is_engine_own("GameState_Money"));
+        assert!(!is_engine_own("Skill_MaidenLevel"));
+        assert!(!is_engine_own("Unityish_Thing"));
+    }
+
+    #[test]
+    fn set_spec_parsing_is_strict() {
+        let p = parse_set_pairs("GameState_Follower=9999,Skill_MaidenLevel=99").unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].0, "GameState_Follower");
+        assert_eq!(p[0].1, "9999");
+        // 名称可含空格（Unity 自己的 Screenmanager 键就长这样）
+        let p = parse_set_pairs("Screenmanager Window Position X = 10").unwrap();
+        assert_eq!(p[0].0, "Screenmanager Window Position X");
+        assert_eq!(p[0].1, "10");
+        // 空项跳过
+        assert_eq!(parse_set_pairs("a=1,,b=2").unwrap().len(), 2);
+        // 缺 `=` / 键名为空 / 全空 —— 宁可不写也不猜
+        assert!(parse_set_pairs("a").is_err());
+        assert!(parse_set_pairs("=1").is_err());
+        assert!(parse_set_pairs("").is_err());
+    }
+
+    #[test]
+    fn set_value_coercion_follows_existing_type() {
+        // 现存 DWORD → 按整数写（含 0x 与负数）
+        assert_eq!(
+            coerce_value("9999", Some(REG_DWORD_TYPE), false).unwrap().1,
+            9999u32.to_le_bytes()
+        );
+        assert_eq!(
+            coerce_value("0x10", Some(REG_DWORD_TYPE), false).unwrap().1,
+            16u32.to_le_bytes()
+        );
+        assert_eq!(
+            coerce_value("-1", Some(REG_DWORD_TYPE), false).unwrap().1,
+            u32::MAX.to_le_bytes()
+        );
+        // 现存字符串（REG_SZ）→ 保持字符串。`utf16z` 编的是 UTF-16LE，
+        // 所以用 `display_val` 解回来核对，别拿 ASCII 比。
+        let (t, b) = coerce_value("999999", Some(1), false).unwrap();
+        assert_eq!(t, 1);
+        assert_eq!(display_val(t, &b), "\"999999\"");
+        // 现存文本型二进制（本作 GameState_Money 就是这样）→ 原样字节，跟原值的结尾 NUL
+        let (t, b) = coerce_value("999999", Some(REG_BINARY_TYPE), true).unwrap();
+        assert_eq!(t, REG_BINARY_TYPE);
+        assert_eq!(trim_nul(&b), b"999999");
+        assert_eq!(b.last(), Some(&0));
+        assert_eq!(display_val(t, &b), "\"999999\"");
+        let (_, b) = coerce_value("999999", Some(REG_BINARY_TYPE), false).unwrap();
+        assert_eq!(b, b"999999");
+        // display_val 认得「ASCII + 结尾 NUL」这种文本型二进制
+        // （用真机实测的字节：GameState_Money = "6108" + NUL）
+        assert_eq!(display_val(REG_BINARY_TYPE, &[b'6', b'1', b'0', b'8', 0]), "\"6108\"");
+        // 真二进制（非可打印）只报字节数，不乱解成文本
+        assert_eq!(display_val(REG_BINARY_TYPE, &[0xff, 0x00, 0x01]), "<3 字节>");
+        // 不擅自改类型：认不出的类型（如 REG_DWORD_BIG_ENDIAN=5）拒绝改写
+        assert!(coerce_value("1", Some(5), false).is_err());
+        // 新键：能解析成整数就当 DWORD，否则当字符串
+        assert_eq!(coerce_value("7", None, false).unwrap().0, REG_DWORD_TYPE);
+        assert_eq!(coerce_value("hello", None, false).unwrap().0, 1);
+        // DWORD 目标给非整数 → 报错（不猜）
+        assert!(coerce_value("hello", Some(REG_DWORD_TYPE), false).is_err());
+    }
+
+    #[test]
+    fn refused_set_reports_readable_registry_type() {
+        // 拒绝改写时要把「它是什么类型」讲清楚，不能只丢一个数字 ——
+        // 否则用户没法判断该不该手工去改。
+        assert_eq!(kind_label(REG_DWORD_TYPE), "DWORD");
+        assert_eq!(kind_label(1), "字符串");
+        assert_eq!(kind_label(REG_BINARY_TYPE), "二进制");
+        assert_eq!(kind_label(11), "QWORD");
+        assert_eq!(kind_label(0x7fff_ffff), "未知类型");
+        let e = coerce_value("1", Some(11), false).unwrap_err();
+        assert!(e.contains("QWORD"), "{e}");
+        assert!(e.contains("（11）"), "{e}");
+        assert!(e.contains("拒绝改写"), "{e}");
+    }
 
     #[test]
     fn hash_matches_known_vector() {

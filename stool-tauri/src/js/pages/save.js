@@ -48,6 +48,11 @@ const SavePage = {
     this.root = host;
     log("save: mount 进入");
     if (this.info) {
+      // 重新进入本页时，以后端的「有没有未写回的改动」为准 ——
+      // 内核里 doc 一直在，前端的 this.dirty 却可能是上一轮的旧值（例如
+      // 中途切走再切回来），照旧值渲染会把按钮的可用状态显示错。
+      const d = await Tauri.call("save_dirty");
+      if (d.ok) this.dirty = !!d.data;
       this.renderEditor();
       return this;
     }
@@ -79,16 +84,13 @@ const SavePage = {
 
   async renderPicker() {
     if (!Store.gameRoot) {
-      this.root.innerHTML = `<div class="seg">${emptyHtml(
+      renderNeedGame(
+        this.root,
         "🎮",
         "还不知道要改哪个游戏的存档",
         "STool 得先知道游戏在哪，才能找到它的存档目录。",
-        "去选游戏",
         "sGoDetect"
-      )}</div>`;
-      $("#sGoDetect").addEventListener("click", () => {
-        location.hash = "#detect";
-      });
+      );
       return;
     }
 

@@ -463,7 +463,7 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **新增一种汉化注入** | `features/inject.rs` 的 `SUPPORT_TABLE` + 对应引擎的 `text_inject` |
 | **新增一个 CLI 子命令** | `cli.rs`：`missing_arg_usage`（若有必填参数）+ `main_args` 分支 + 未知命令提示 |
 | **新增一个界面页面** | `stool-tauri/src/js/pages/<name>.js`（`Page = {...}`：`title`/`sub`/`actions`/`mount`）+ `js/app.js` 的 `PAGE_META` 与 `NAV_GROUPS` + `index.html` / `preview.html` 各加一行 `<script>` |
-| **改界面风格 / 加一处分区** | `css/tokens.css`（取色取尺寸的唯一来源）+ `css/app.css` 的 `.card`/`.card-head`；语义色只用 `--ok/--warn/--danger/--muted`；空状态必须给出**能点**的出路（`soon.js` 是这条规则的兜底实现）。视觉验证见 §6.2 |
+| **改界面风格 / 加一处分区** | `css/tokens.css`（取色取尺寸的唯一来源）+ `css/app.css` 的 `.card`/`.card-head`；语义色只用 `--ok/--warn/--danger/--muted`；空状态必须给出**能点**的出路（`ui.js::emptyHtml` / `renderNeedGame` 是这条规则的实现）。视觉验证见 §6.2 |
 | **新增外部工具** | `settings.rs`（字段 + `external_tool` 分支）+ `features/tools_dl.rs` + 工具箱「设置」标签页 |
 | **新增配置项** | `settings.rs`（加 `#[serde(default)]` 字段；纯追加不用升版本） |
 | **新增一个机翻设置项** | `settings.rs`（`mtl_*` 字段 + `default_mtl_*()`）+ `stool-tauri/src-tauri/src/cmd.rs`（读写命令，**密钥只回 `mtl_key_set: bool`**）+ `js/pages/tools.js` 的表单 + CLI `text-mtl --*` |

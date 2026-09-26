@@ -80,6 +80,93 @@ function dirOf(p) {
   return i > 0 ? s.slice(0, i) : s;
 }
 
+/** 拼接路径（前端只管显示，真正的拼接在内核）。 */
+function joinPath(dir, name) {
+  const d = String(dir || "").replace(/[\\\/]+$/, "");
+  return d ? d + "\\" + String(name || "") : String(name || "");
+}
+
+/* ---------------------------------------------------------------------------
+   长任务进度条。抽包 / 提文本 / 解锁 三个页面用的是同一套（原本各抄一份），
+   只在「容器 id」和「要不要取消按钮」上有差别。
+--------------------------------------------------------------------------- */
+
+/**
+ * 进度条 HTML。
+ *
+ * @param hostId    容器 id（`paintProgress` 按它找节点）
+ * @param cancelId  取消按钮 id；不传则不给取消按钮（例如解锁那次不打算中断）
+ */
+function progressHtml(hostId, cancelId) {
+  const cancel = cancelId
+    ? `<div class="row mt2"><button class="btn btn-ghost btn-sm" id="${cancelId}">取消</button></div>`
+    : "";
+  return `
+    <div class="mt3" id="${hostId}">
+      <div class="row tight">
+        <span class="small dim2" data-msg style="flex:1 1 auto;min-width:0">正在准备…</span>
+        <span class="small mono" data-pct>0%</span>
+      </div>
+      <div class="bar mt2"><i style="width:0%"></i></div>
+      ${cancel}
+    </div>`;
+}
+
+/** 进度事件到了只更新几个节点，不重绘整页（重绘会闪、也会丢焦点）。 */
+function paintProgress(root, hostId, p) {
+  const host = $("#" + hostId, root);
+  if (!host || !host.firstElementChild) return;
+  const pct = Math.max(0, Math.min(100, Math.round((p.frac || 0) * 100)));
+  const bar = host.querySelector(".bar > i");
+  if (bar) bar.style.width = pct + "%";
+  const pv = host.querySelector("[data-pct]");
+  if (pv) pv.textContent = pct + "%";
+  const mv = host.querySelector("[data-msg]");
+  if (mv) mv.textContent = clip(p.msg || "…", 64);
+}
+
+/**
+ * 订阅后端 `op:progress` 事件。
+ *
+ * @param page  页面对象（`unlisten` 存在它身上，重进页面时能解绑 —— 不解绑会叠订阅）
+ * @param root  页面根节点
+ * @param hostId 进度条容器 id
+ */
+async function subscribeProgress(page, root, hostId) {
+  if (page.unlisten) {
+    try {
+      page.unlisten();
+    } catch (_) {}
+    page.unlisten = null;
+  }
+  page.unlisten = await Tauri.on("op:progress", (p) => paintProgress(root, hostId, p));
+}
+
+/** 请求取消当前长任务。后端会在当前文件写完后停下。 */
+async function cancelTask() {
+  await Tauri.call("cancel_task");
+  toast("已请求取消，会在当前文件写完后停下。");
+}
+
+/** 用系统默认程序打开一个路径（文件或文件夹），失败弹错。 */
+async function openPath(p) {
+  const r = await Tauri.call("open_folder", { path: p });
+  if (!r.ok) toast(r.err, "err");
+}
+
+/**
+ * 「还没选游戏」的整页空态 —— 8 个页面原本各写一份一样的样板。
+ *
+ * @param root 页面根节点
+ * @param icon/title/note 空态文案
+ * @param btnId 「去选游戏」按钮的 id（本函数会绑好跳转）
+ */
+function renderNeedGame(root, icon, title, note, btnId) {
+  root.innerHTML = emptyHtml(icon, title, note, "去选游戏", btnId);
+  const b = $("#" + btnId, root);
+  if (b) b.addEventListener("click", () => (location.hash = "#detect"));
+}
+
 /* ---------------------------------------------------------------------------
    备份与还原。存档页（写回存档 → 改坏存档）和解包页（重新打包 → 改坏封包）
    用的是同一套备份（`<原文件>.stool.bak`），所以渲染与还原也共用一份。

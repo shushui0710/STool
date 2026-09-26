@@ -49,6 +49,16 @@ pub enum Sig {
     ExeAnyContains(&'static [&'static str]),
     /// 存在"分卷"文件（扩展名为 3 位数字，如 `x.pfs.000`）
     NumberedVol,
+    /// 根目录一级存在名为 `dir` 的目录，且其**直接子文件**里该扩展名文件数 ≥ n。
+    ///
+    /// 用于 `GameData/*.pack`（BGI）、`Data/*.dat`（SACT）这类"目录 + 扩展名"联合判据 ——
+    /// 单看目录名或单看扩展名都太弱，两者同时命中才有辨识度。仅对**根一级**目标目录
+    /// 做一次 `read_dir`，不做递归，开销可控（目录不存在则零 IO 直接不命中）。
+    RootDirExtN(&'static str, &'static str, usize),
+    /// 根目录一级存在以 `name`（不区分大小写）为名的 exe，或名字含该子串的 exe。
+    /// 与 `ExeContains` 的区别：这里**同时**匹配"精确全名"（便于 `hoge.exe` 这类），
+    /// 证据文案给出实际命中的文件名。
+    RootExe(&'static str),
 }
 
 impl Sig {
@@ -116,8 +126,44 @@ impl Sig {
                 None
             }
             Sig::NumberedVol => s.has_numbered_volume().then(|| "分卷文件（*.000/001）".to_string()),
+            Sig::RootDirExtN(dir, ext, n) => {
+                let count = count_dir_ext(&s.root, dir, ext);
+                (count >= n).then(|| format!("{dir}/*.{ext}（{count} 个）"))
+            }
+            Sig::RootExe(name) => {
+                let lower = name.to_lowercase();
+                s.exe_names()
+                    .iter()
+                    .find(|e| e.as_str() == lower || e.contains(&lower))
+                    .cloned()
+            }
         }
     }
+}
+
+/// 统计根目录下 `dir` 这一层的**直接子文件**里扩展名为 `ext` 的文件数。
+///
+/// 只做一层 `read_dir`：目录不存在 / 不可读时返回 0（不报错，也不算命中）。
+/// 用于"目录 + 扩展名"联合判据（如 BGI 的 `GameData/*.pack`）。
+fn count_dir_ext(root: &Path, dir: &str, ext: &str) -> usize {
+    let target = root.join(dir);
+    if !target.is_dir() {
+        return 0;
+    }
+    let rd = match std::fs::read_dir(&target) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    rd.flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case(ext))
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 pub struct Rule {
@@ -209,9 +255,32 @@ pub static RECOGNIZERS: &[Rec] = &[
             R { pts: 60, sig: Sig::ExeAnyContains(&["bgi", "ethornell", "エンジン設定"]) },
             R { pts: 60, sig: Sig::FileNamed("bregexp.dll") },
             R { pts: 55, sig: Sig::FileNamed("bgi.gdb") },
-            R { pts: 40, sig: Sig::Ext("arc") },
+            // 汉化组常换掉主程序（强特征 DLL/exe 被删或改名），但 `GameData/*.pack` +
+            // `SaveData/` + `EngineSetting*`/`エンジン設定` 这套目录布局通常保留。
+            R { pts: 35, sig: Sig::RootDirExtN("gamedata", "pack", 2) },
             R { pts: 30, sig: Sig::Dir("gamedata") },
+            R { pts: 20, sig: Sig::Dir("savedata") },
+            R { pts: 35, sig: Sig::ExeAnyContains(&["enginesetting", "engine_gui", "engine_message"]) },
+            R { pts: 40, sig: Sig::Ext("arc") },
             R { pts: 15, sig: Sig::Dir("bgm") },
+        ],
+    },
+    Rec {
+        id: "sact",
+        name: "SACT / System40（Pal 系）",
+        priority: 34,
+        advice: "SACT / System40 系（多见于日系老作品，如《ディメンション凸ラバース》）。\
+                 资源封包 .pac（魔数 `PAC `）、数据 .dat、运行时 dll/PAL.dll；\
+                 脚本与文本多编译在 exe 内，本工具无内置解析器，建议用 GARbro 解包后回填；\
+                 存档为根目录 save*.dat / save%03d.dat，可直接替换或改数值。",
+        rules: &[
+            // `.pac`（扩展名）+ `PAC ` 魔数是最强辨识；本工具没做魔数表驱动，
+            // 用「根目录 .pac 数量 + .dat 数量 + system.dat」组合逼近。
+            R { pts: 45, sig: Sig::ExtN("pac", 2) },
+            R { pts: 20, sig: Sig::Ext("pac") },
+            R { pts: 25, sig: Sig::FileNamed("system.dat") },
+            R { pts: 25, sig: Sig::ExtN("dat", 20) },
+            R { pts: 20, sig: Sig::RootDir("dll") },
         ],
     },
     Rec {
@@ -546,5 +615,49 @@ mod tests {
         std::fs::create_dir_all(d.join("MyGame").join("Binaries")).unwrap();
         assert!(detect("unreal", &d).ok(), "Engine/ + Binaries/ 应判定");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_bgi_survives_main_exe_swap() {
+        // 汉化组换掉主程序后：没有 bregexp.dll / エンジン設定.exe，
+        // 只剩 GameData/*.pack + SaveData/ + EngineSetting 这套目录布局。
+        let d = dir("bgi_hanhua");
+        std::fs::create_dir_all(d.join("GameData")).unwrap();
+        std::fs::create_dir_all(d.join("SaveData")).unwrap();
+        for i in 0..10 {
+            std::fs::write(d.join("GameData").join(format!("data{i}.pack")), b"x").unwrap();
+        }
+        std::fs::write(d.join("EngineSetting.exe"), b"x").unwrap();
+        let det = detect("bgi_ethornell", &d);
+        assert!(det.ok(), "汉化 BGI 布局应过线，实得 {} 分（证据 {:?}）", det.score, det.evidence);
+        // 单独一个 GameData/（无 .pack 无 SaveData）仍应为疑似，避免误判
+        let d2 = dir("bgi_only_gamedata");
+        std::fs::create_dir_all(d2.join("GameData")).unwrap();
+        assert!(!detect("bgi_ethornell", &d2).ok(), "仅 GameData/ 不该过线");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn test_sact_recognizer() {
+        // 实测《ディメンション凸ラバース》: dll/ + 17 个 .pac + 203 个 .dat + system.dat
+        let d = dir("sact");
+        std::fs::create_dir_all(d.join("dll")).unwrap();
+        for i in 0..5 {
+            std::fs::write(d.join(format!("e{i}.pac")), b"PAC \0").unwrap();
+        }
+        for i in 0..30 {
+            std::fs::write(d.join(format!("d{i}.dat")), b"x").unwrap();
+        }
+        std::fs::write(d.join("system.dat"), b"x").unwrap();
+        let det = detect("sact", &d);
+        assert!(det.ok(), "SACT 布局应过线，实得 {} 分（证据 {:?}）", det.score, det.evidence);
+
+        // 只有零星 .dat 的文件目录不该被误判
+        let d2 = dir("sact_weak");
+        std::fs::write(d2.join("save.dat"), b"x").unwrap();
+        assert!(!detect("sact", &d2).ok(), "仅 1 个 .dat 不该判为 SACT");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 }

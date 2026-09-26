@@ -22,6 +22,9 @@ pub const MAX_ARCHIVE: u64 = 4 * 1024 * 1024 * 1024;
 pub enum Source {
     Mem(Vec<u8>),
     File { f: File, path: PathBuf, len: u64 },
+    /// 文件里的一段区域（内嵌封包）：`base` 为区域起点，`len` 为区域长度。
+    /// 所有偏移以区域起点为 0，`read_at` 会加上 `base` 落到真实文件位置。
+    Region { f: File, path: PathBuf, base: u64, len: u64 },
 }
 
 impl Source {
@@ -51,10 +54,45 @@ impl Source {
         }
     }
 
+    /// 统一入口：`base == 0` 时等价于 [`Source::open`]，否则按内嵌区域打开。
+    pub fn open_or_region(path: &Path, base: u64, max: u64) -> Result<Source, String> {
+        if base == 0 {
+            Self::open(path, max)
+        } else {
+            Self::open_region(path, base, max)
+        }
+    }
+
+    /// 打开「内嵌容器」的一段区域：把文件里 `[base, EOF)` 这段当作一个独立来源。
+    ///
+    /// 用于 `exe` 尾部内嵌的封包（如 Godot 自解压导出的 PCK）：包内所有偏移都是
+    /// **相对包起点**的，但底层文件从 0 开始 —— 这个包装让 `len()` 与所有 `read_at`
+    /// 自动加上 `base` 偏移，解析器无需感知"自己在 exe 里"。
+    ///
+    /// 内嵌区一般远大于内存阈值，故强制走 `File` 模式（避免把 1GB exe 读进内存）。
+    pub fn open_region(path: &Path, base: u64, max: u64) -> Result<Source, String> {
+        let meta = std::fs::metadata(path).map_err(|e| format!("读取失败 {}: {e}", path.display()))?;
+        let total = meta.len();
+        if base > total {
+            return Err(format!("内嵌起始偏移 {base} 超过文件长度 {total}"));
+        }
+        let region_len = total - base;
+        if region_len > max {
+            return Err(format!(
+                "内嵌封包过大（{}），超过解析上限 {}：请确认选对了文件",
+                human(region_len),
+                human(max)
+            ));
+        }
+        let f = File::open(path).map_err(|e| format!("打开失败 {}: {e}", path.display()))?;
+        Ok(Source::Region { f, path: path.to_path_buf(), base, len: region_len })
+    }
+
     pub fn len(&self) -> u64 {
         match self {
             Source::Mem(d) => d.len() as u64,
             Source::File { len, .. } => *len,
+            Source::Region { len, .. } => *len,
         }
     }
 
@@ -66,7 +104,7 @@ impl Source {
     pub fn mem(&self) -> Option<&[u8]> {
         match self {
             Source::Mem(d) => Some(d),
-            Source::File { .. } => None,
+            Source::File { .. } | Source::Region { .. } => None,
         }
     }
 
@@ -83,6 +121,12 @@ impl Source {
             Source::Mem(d) => Ok(d[off as usize..off as usize + n].to_vec()),
             Source::File { f, path, .. } => {
                 f.seek(SeekFrom::Start(off)).map_err(|e| format!("seek 失败 {}: {e}", path.display()))?;
+                let mut buf = vec![0u8; n];
+                f.read_exact(&mut buf).map_err(|e| format!("读取失败 {}: {e}", path.display()))?;
+                Ok(buf)
+            }
+            Source::Region { f, path, base, .. } => {
+                f.seek(SeekFrom::Start(*base + off)).map_err(|e| format!("seek 失败 {}: {e}", path.display()))?;
                 let mut buf = vec![0u8; n];
                 f.read_exact(&mut buf).map_err(|e| format!("读取失败 {}: {e}", path.display()))?;
                 Ok(buf)

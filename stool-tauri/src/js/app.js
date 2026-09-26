@@ -12,7 +12,7 @@ const NAV_GROUPS = [
   { title: "深入", ids: ["save", "runtime", "unlock", "mods"] },
 ];
 
-/** 每页的标题/副标题/导航提示。`impl` 为空 = 还没搬过来（走占位页）。 */
+/** 每页的标题/副标题/导航提示。 */
 const PAGE_META = {
   detect: { title: "选游戏", sub: "告诉 STool 你要处理哪个游戏。认出来之后，后面每一步都会自动带上它。", hint: "游戏在哪、是什么引擎", impl: DetectPage },
   extract: { title: "取出素材", sub: "把游戏里的图片、音乐、脚本拿出来，存成普通文件。", hint: "从打包文件里取出东西", impl: ExtractPage },
@@ -24,14 +24,6 @@ const PAGE_META = {
   mods: { title: "装MOD", sub: "安装、停用玩家做的补丁。原文件会自动备份，随时能还原。", hint: "装别人做的改动", impl: ModsPage },
   tools: { title: "工具箱", sub: "设置、诊断、帮助 —— 平时用不到，出问题才来。", hint: "出问题才用", impl: ToolsPage },
 };
-
-// 先把「哪些页真接了」记下来，再给其余的补占位实现 ——
-// 否则占位页会覆盖掉本来就写好的页面，导航也分不清真假。
-const REAL_PAGES = new Set(Object.keys(PAGE_META).filter((id) => PAGE_META[id].impl));
-
-for (const id of Object.keys(PAGE_META)) {
-  if (!PAGE_META[id].impl) PAGE_META[id].impl = makeSoonPage(id);
-}
 
 let currentId = "";
 let currentPage = null;
@@ -47,8 +39,7 @@ function renderNav() {
       ${ids
         .map((id) => {
           const m = PAGE_META[id];
-          const soon = !REAL_PAGES.has(id);
-          return `<button class="nav-item${soon ? " soon" : ""}" data-page="${id}">
+          return `<button class="nav-item" data-page="${id}">
             <span class="nav-item-title">${esc(m.title)}</span>
             <span class="nav-item-hint">${esc(m.hint || "")}</span>
           </button>`;

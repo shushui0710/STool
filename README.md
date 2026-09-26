@@ -241,6 +241,32 @@ stool-cli cg-candidates <游戏目录> --opt:filter=cg
 # 确认无误再真正写入（写前自动备份原值，可用 --opt:restore= 一键还原）
 stool-cli unlock <游戏目录> --opt:apply=1 --opt:route=registry
 
+# 候选不可靠时会被拒绝写（精确来源读不到 + 没有现存键族可收敛 = 纯启发式猜测）。
+# 要强行写必须自己说清楚：加 --opt:force_heuristic=1；写错了用下面这条撤掉。
+stool-cli unlock <游戏目录> --opt:undo=1                      # 先只读预览会删哪些
+stool-cli unlock <游戏目录> --opt:undo=1 --opt:apply=1 \
+  --opt:keep=GameState_,Skill_,Volume_,unity              # 保护真键前缀，再真删
+
+# 有些作品根本没有画廊键（内容按进度解锁）—— 那就点名写它的真实键，不猜：
+stool-cli unlock <游戏目录> --opt:set=GameState_Follower=9999,Skill_MaidenLevel=99
+stool-cli unlock <游戏目录> --opt:set=... --opt:apply=1      # 确认后落地
+#   类型跟着原值走：DWORD 按整数、字符串按 UTF-16、REG_BINARY 按原样文本字节
+#   （Unity 常把数字存成 "6108\0" 这种二进制文本）；认不出的类型**拒绝改写**，
+#   宁可不写也不毁存档。写完要**完全退出游戏再进** —— 注册表只在游戏启动时读一次。
+#   不知道有哪些键可改？界面「解锁全CG → 进阶」里能直接列出注册表现存的全部键
+#   （含当前值 / 类型，点一行就把键名填进输入框），别自己瞎猜键名。
+
+# 网盘分享包常自带一份「全CG存档」，工具会自动找出来并优先用它（不用碰游戏文件）：
+stool-cli unlock <游戏目录>                    # 只读预览：从哪来、落到哪去
+stool-cli unlock <游戏目录> --opt:apply=1      # 确认后复制（被覆盖的存档先备份）
+#   识别规则：目录名含「全cg/全开/回想/回廊/セーブデータ」等关键字，
+#   或就叫「<任意名>存档」（如 C0771存档 = 社团编号 + 存档）。
+#   打包者常套多层目录、并在里面放 位置.txt 写明目标路径 —— 工具会最深找 8 层，
+#   优先采信 位置.txt（含 （用户名） 这类占位符会自动替换成你的用户名）。
+#   ★ 但注意：有些分享包**只给了设置文件**（音量 / 跳过 / 已读记录），
+#   CG 标记其实存在进度存档里 —— 这种包复制过去解不开 CG。工具会在预览时提示，
+#   此时请改用上面的注册表方式。
+
 # 命令行直接搜索/修改存档（适合批量脚本化处理）
 stool-cli save-edit <存档文件> --search 关键词
 stool-cli save-edit <存档文件> --set /system/gold=99999 --set /items/1/count=99
@@ -396,9 +422,9 @@ stool-tauri/     # 图形界面（Tauri v2 + WebView2）—— 本仓库唯一�
 
 本项目的质量门禁：`cargo clippy --all-targets -- -D warnings`（零警告）+ `cargo test --tests`。
 
-当前 `cargo test --tests` 共 **278 项测试全部通过**（另有 1 项需联网/写真实注册表的用例默认忽略）：
+当前 `cargo test --tests` 共 **316 项测试全部通过**（另有 1 项需联网/写真实注册表的用例默认忽略）：
 
-- **243 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
+- **281 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
   MTool 式 JSON 注入、MOD 管理、解锁策略、预检/自检/体检/批量、吉里吉里运行时补丁包
   （含「只打包改动」比对）、断点续传、并行解包、机翻重试退避、SHA-256/SHA-1 官方向量、
   API Key 加解密、Unity 精确键名提取（.NET 元数据 / IL2CPP 元数据，含逐字节变异模糊）、

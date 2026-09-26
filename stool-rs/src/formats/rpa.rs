@@ -18,16 +18,6 @@ pub struct RpaIndex {
     pub entries: BTreeMap<String, Vec<Chunk>>,
 }
 
-pub fn is_rpa(path: &Path) -> bool {
-    fs::File::open(path)
-        .and_then(|mut f| {
-            let mut buf = [0u8; 8];
-            f.read_exact(&mut buf)?;
-            Ok(buf.starts_with(b"RPA-3.") || buf.starts_with(b"RPA-2.") || buf.starts_with(b"RPA-1."))
-        })
-        .unwrap_or(false)
-}
-
 pub fn read_index(archive: &Path) -> Result<RpaIndex, String> {
     let mut f = fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut header = Vec::new();

@@ -40,7 +40,7 @@ impl Engine for WolfPlugin {
         vec![Op::Extract, Op::TextExtract]
     }
     fn describe(&self, root: &Path) -> String {
-        format!("封包: {:?}", crate::engines::others::list_files_by_ext_pub(&root.join("Data"), &["wolf"]).iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect::<Vec<_>>())
+        crate::engines::others::describe_archives(&root.join("Data"), &["wolf"])
     }
     fn extract(&self, ctx: &Ctx) -> OpOutcome {
         let cfg = settings::load();

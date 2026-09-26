@@ -19,7 +19,6 @@ pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 pub const PAGE_GUARD: u32 = 0x100;
 pub const PAGE_NOCACHE: u32 = 0x200;
-pub const PAGE_WRITECOMBINE: u32 = 0x400;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -110,9 +109,6 @@ impl Region {
     }
     pub fn kind_name(&self) -> &'static str {
         kind_name(self.kind)
-    }
-    pub fn is_guard(&self) -> bool {
-        self.protect & PAGE_GUARD != 0
     }
     /// 是否适合做「数值扫描」的可写区（与 memscan::writable_regions 口径一致）。
     pub fn is_scannable_writable(&self, max_region: usize) -> bool {
@@ -213,24 +209,6 @@ impl Proc {
 
     pub fn read(&self, addr: usize, size: usize) -> Option<Vec<u8>> {
         read_raw(self.handle, addr, size)
-    }
-
-    /// 从 `addr` 起按需读取，允许跨区域（最多尝试 `tries` 次，每次补齐缺失部分）。
-    /// 用途：跨区域边界读一小段（比如 8 字节值刚好压在页尾）。
-    pub fn read_spanning(&self, addr: usize, size: usize) -> Option<Vec<u8>> {
-        if let Some(b) = self.read(addr, size) {
-            if b.len() >= size {
-                return Some(b);
-            }
-        }
-        if size <= 1 {
-            return self.read(addr, 1);
-        }
-        let head = size / 2;
-        let mut out = Vec::with_capacity(size);
-        out.extend(self.read(addr, head)?);
-        out.extend(self.read(addr + head, size - head)?);
-        (out.len() >= size).then_some(out)
     }
 
     pub fn write(&self, addr: usize, bytes: &[u8]) -> bool {

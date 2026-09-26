@@ -176,18 +176,8 @@ pub fn toggle_mod(game_root: &Path, name: &str, enabled: bool) -> Result<(), Str
         }
     }
     entry.enabled = enabled;
-    let name2 = name.to_string();
     save_registry(game_root, &mods)?;
-    let _ = name2;
     Ok(())
-}
-
-/// 导出当前生效的文件清单（供报告）。
-pub fn diff_summary(game_root: &Path) -> BTreeMap<String, usize> {
-    list_mods(game_root)
-        .into_iter()
-        .map(|m| (m.name, m.files.len()))
-        .collect()
 }
 
 /// 当前生效的冲突：被 ≥2 个**已启用** MOD 覆盖的文件（P2-10）。

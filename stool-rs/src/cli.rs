@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::engines::{Op, Registry};
 
@@ -1315,7 +1315,3 @@ pub fn main_args(args: Vec<String>) -> i32 {
         }
     }
 }
-
-// 静态引用避免 unused import 警告
-#[allow(dead_code)]
-fn _t(_: Arc<Mutex<()>>) {}
