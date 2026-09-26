@@ -31,3 +31,7 @@ shots/.ep_*/
 # 兼容性审计的中间对比快照（修复后用 `_audit_*2.csv` 复扫）——结论已并入报告，
 # 中间产物不入库，避免每次复扫都产生一批噪音文件。
 shots/_audit_*2.csv
+
+# Release 的正文草稿（`gh release create --notes-file` 的输入）——
+# 内容已随 release 发布到 GitHub，正文本身不必再存一份进仓库。
+shots/_release_notes_*.md

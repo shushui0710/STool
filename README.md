@@ -1,5 +1,13 @@
 # STool — 多引擎游戏一站式综合工具
 
+[![最新版本](https://img.shields.io/github/v/release/shushui0710/STool?label=最新版本&color=blue)](https://github.com/shushui0710/STool/releases/latest)
+[![下载](https://img.shields.io/github/downloads/shushui0710/STool/total?label=下载量)](https://github.com/shushui0710/STool/releases)
+[![CI](https://github.com/shushui0710/STool/actions/workflows/ci.yml/badge.svg)](https://github.com/shushui0710/STool/actions/workflows/ci.yml)
+[![许可](https://img.shields.io/github/license/shushui0710/STool?label=许可)](./LICENSE)
+
+**➡️ [点此下载最新版](https://github.com/shushui0710/STool/releases/latest)** —— 免安装，双击即用。
+`stool-tauri.exe` 是图形界面（推荐），`stool-cli.exe` 是命令行版。
+
 > 一个为 Ren'Py、RPG Maker、吉里吉里等主流视觉小说 / RPG 游戏引擎设计的"游戏工具箱"。
 > 它能帮你完成这些事情：
 >
@@ -323,6 +331,18 @@ stool-cli diag-export <游戏目录> -o 诊断包.zip
 **完整汉化工作流**：`text-extract` 提取 → `text-mtl` 机翻（或人工翻译 CSV）
 → `text-import` 回填；或写好 JSON 后 `text-mtl` 机翻 → `text-inject` 运行时注入。
 吉里吉里这类封包引擎还可以走「解包 → 汉化 → 打补丁」闭环（见上文"运行时修改"页方式三）。
+
+## 下载安装
+
+**不想自己编译的话，直接去 [Releases 页面](https://github.com/shushui0710/STool/releases/latest) 下载成品即可**（免安装绿色版）：
+
+| 文件 | 说明 |
+|---|---|
+| `stool-tauri.exe` | **图形界面（推荐，约 13 MB）**。单文件，放到任意目录双击即用，只依赖系统自带的 WebView2，不会弹黑窗 |
+| `stool-cli.exe` | 命令行版，适合终端 / 脚本 / 批量处理 |
+
+系统要求：**Windows x64**。每个 release 都附带了 SHA-256 校验值，下载后可用
+`Get-FileHash .\stool-tauri.exe -Algorithm SHA256` 核对。
 
 ## 从源码构建
 
