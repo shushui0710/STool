@@ -44,6 +44,104 @@ const NOTABLE_FILES: &[&str] = &[
     "system40.exe",         // AliceSoft System 运行时
 ];
 
+/// asar 条目名采样上限（超大包不必把整张条目表塞进内存；够检测用即可）。
+const ASAR_ENTRY_CAP: usize = 20_000;
+
+/// Electron `app.asar` 的**条目清单采样** —— 只读头部 JSON，不碰数据区。
+///
+/// 存在的理由：asar 打包的发行版把整个前端塞进了这个包，根目录只剩 Electron 运行时，
+/// 于是引擎特征（`tyrano/`、`data/scenario/*.ks`、`config.tjs`…）**全部不可见** ——
+/// 实测一个 Electron + TyranoScript 游戏因此被整包判成 `html_game`。
+/// 只看磁盘的检测在这里必然是盲的，所以把包内条目名也收进 `ScanCtx`。
+#[derive(Debug, Default, Clone)]
+pub struct AsarEntries {
+    path: PathBuf,
+    /// 条目路径（小写、`/` 分隔），最多 [`ASAR_ENTRY_CAP`] 条
+    names: Vec<String>,
+    /// 包内条目总数
+    pub total: usize,
+    /// 是否因条目过多被截断（截断时下面的查询仍够用：目录前缀与扩展名都集中在开头段）
+    pub truncated: bool,
+}
+
+impl AsarEntries {
+    /// 是否存在以 `prefix` 开头的条目，如 `"tyrano/"`、`"data/scenario/"`（大小写不敏感）。
+    pub fn has_prefix(&self, prefix: &str) -> bool {
+        let p = prefix.to_lowercase();
+        self.names.iter().any(|n| n.starts_with(&p))
+    }
+
+    /// 包内以该扩展名结尾的条目数（小写，不含点）。
+    pub fn ext_count(&self, ext: &str) -> usize {
+        let dot = format!(".{}", ext.to_lowercase());
+        self.names.iter().filter(|n| n.ends_with(&dot) && !n.ends_with('/')).count()
+    }
+
+    /// 包内是否存在该**文件名**（任意目录，大小写不敏感）。如 `"config.tjs"`。
+    pub fn has_name(&self, name: &str) -> bool {
+        let want = name.to_lowercase();
+        self.names
+            .iter()
+            .any(|n| n.rsplit('/').next().is_some_and(|f| f == want))
+    }
+
+    /// 该 asar 的路径（供 evidence 展示）。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// 候选 asar，按优先级：`resources/app.asar` → 根目录 → `resources/`（同名按名字排序）。
+///
+/// **唯一一份**：检测（本模块）与注入（`features::inject`）都用它，避免两处各写一套
+/// 优先级 —— 那会导致"检测认这个包、注入改那个包"。
+pub fn asar_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    let preferred = root.join("resources").join("app.asar");
+    if preferred.is_file() {
+        v.push(preferred);
+    }
+    for dir in [root.to_path_buf(), root.join("resources")] {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut more: Vec<PathBuf> = rd
+            .flatten()
+            .map(|d| d.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("asar"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        more.sort();
+        for m in more {
+            if !v.contains(&m) {
+                v.push(m);
+            }
+        }
+    }
+    v
+}
+
+/// 读出最优先的那个 asar 的条目清单（只读头部）。没有 asar / 读失败时返回 `None`。
+///
+/// 成本是**一次头部读取**（不解压、不读数据区）；调用方多为检测，也可直接用它做前置判断。
+pub fn probe_asar(root: &Path) -> Option<AsarEntries> {
+    for cand in asar_candidates(root) {
+        let mut src = match crate::formats::source::Source::open(&cand, crate::formats::source::MAX_ARCHIVE) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Ok((files, _)) = crate::formats::asar::parse_index(&mut src) else { continue };
+        let total = files.len();
+        let mut names: Vec<String> = files.keys().take(ASAR_ENTRY_CAP).map(|k| k.to_lowercase()).collect();
+        names.sort();
+        return Some(AsarEntries { path: cand, names, total, truncated: total > ASAR_ENTRY_CAP });
+    }
+    None
+}
+
 /// 一次扫描的结果，供所有引擎插件共享。
 #[derive(Debug, Default)]
 pub struct ScanCtx {
@@ -64,6 +162,8 @@ pub struct ScanCtx {
     exes: Vec<String>,
     /// 白名单特征文件（`NOTABLE_FILES`）在任意深度命中的名字集合（小写）
     notable_files: HashSet<String>,
+    /// 最优先那个 `app.asar` 的条目清单（有 asar 时才有；只读了头部）
+    asar: Option<AsarEntries>,
     /// 是否因文件数超限被截断（截断时扩展名计数可能偏低）
     pub truncated: bool,
     /// 实际遍历到的文件数
@@ -123,6 +223,12 @@ impl ScanCtx {
                 s.ext_first.entry(ext).or_insert_with(|| p.to_path_buf());
             }
         }
+        // asar 打包的发行版：磁盘上只剩 Electron 运行时，引擎特征**全在包内**。
+        // 这里补一次「只读头部」的条目采样（只有存在 .asar 时才做），
+        // 否则检测对包内完全失明 —— 实测 Electron + TyranoScript 会被整包判成 html_game。
+        if s.ext_count("asar") > 0 {
+            s.asar = probe_asar(root);
+        }
         s
     }
 
@@ -164,6 +270,13 @@ impl ScanCtx {
     pub fn has_file_named(&self, name: &str) -> bool {
         let n = name.to_lowercase();
         self.root_files.contains(&n) || self.notable_files.contains(&n)
+    }
+
+    /// 最优先那个 `app.asar` 的**条目清单**（没有 asar 时为 `None`）。
+    ///
+    /// 用它把「包内才看得见的引擎特征」接进检测 —— 见 [`AsarEntries`] 的说明。
+    pub fn asar(&self) -> Option<&AsarEntries> {
+        self.asar.as_ref()
     }
 
     // ---- 递归（任意深度）----
@@ -381,6 +494,39 @@ mod tests {
         assert_eq!(s.files_seen, 0);
         assert!(!s.has_ext("xp3"));
         assert!(s.exe_names().is_empty());
+    }
+
+    #[test]
+    fn test_probe_asar_entries() {
+        // asar 打包的游戏：磁盘上只剩 Electron 运行时，引擎特征全在包内 —— 必须能采到条目名，
+        // 否则检测对包内失明（实测会把 Electron + TyranoScript 整包判成 html_game）。
+        let d = tmpdir("asar_probe");
+        let src = d.join("app_src");
+        std::fs::create_dir_all(src.join("tyrano").join("plugins").join("kag")).unwrap();
+        std::fs::create_dir_all(src.join("data").join("scenario")).unwrap();
+        std::fs::write(src.join("index.html"), b"<html></html>").unwrap();
+        std::fs::write(src.join("tyrano").join("tyrano.js"), b"x").unwrap();
+        std::fs::write(src.join("data").join("scenario").join("a.ks"), b"x").unwrap();
+        std::fs::write(src.join("data").join("scenario").join("b.ks"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("resources")).unwrap();
+        crate::formats::asar::pack(&src, &d.join("resources").join("app.asar")).unwrap();
+
+        let s = ScanCtx::build(&d);
+        let a = s.asar().expect("有 .asar 时应采到条目清单");
+        assert!(a.has_prefix("tyrano/"), "应看见包内 tyrano/");
+        assert!(a.has_prefix("data/scenario/"), "应看见包内 data/scenario/");
+        assert_eq!(a.ext_count("ks"), 2);
+        assert!(a.has_name("tyrano.js"), "按文件名查应命中（任意深度）");
+        assert!(!a.has_name("nope.js"));
+        assert!(a.total >= 4, "条目总数至少 4 个，实为 {}", a.total);
+        assert!(!a.truncated);
+
+        // 没有 asar 的目录不该有清单（也不该多花一次 IO）
+        let d2 = tmpdir("asar_probe_none");
+        std::fs::write(d2.join("a.bin"), b"x").unwrap();
+        assert!(ScanCtx::build(&d2).asar().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 
     #[test]

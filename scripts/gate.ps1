@@ -4,7 +4,11 @@ $tb   = "C:\Users\86136\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
 $crt  = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.36.32532\x64\Microsoft.VC143.CRT"
 $msvc = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.37.32822"
 $hw   = "C:\Program Files (x86)\Windows Kits\10"
-$env:PATH = "$tb;$crt;C:\Users\86136\.cargo\bin;" + $env:PATH
+# node 必须在 PATH 上：inject.rs::hook_js_files_pass_node_syntax_check 用 `node --check`
+# 给三份 hook（assets/hooks/*.js）做真语法校验；找不到 node 它只会「跳过」而不报错，
+# 门禁就等于漏了这条。所以这里显式把 node 目录塞进 PATH。
+$node = "C:\Program Files\nodejs"
+$env:PATH = "$node;$tb;$crt;C:\Users\86136\.cargo\bin;" + $env:PATH
 $env:LIB = "$msvc\lib\x64;$msvc\ATLMFC\lib\x64;$hw\Lib\10.0.22621.0\um\x64;$hw\Lib\10.0.22621.0\ucrt\x64"
 $env:INCLUDE = "$msvc\include;$msvc\ATLMFC\include;$hw\Include\10.0.22621.0\ucrt;$hw\Include\10.0.22621.0\um;$hw\Include\10.0.22621.0\shared;$hw\Include\10.0.22621.0\winrt"
 $env:CARGO_INCREMENTAL = "0"
@@ -48,11 +52,29 @@ function Run-Cargo([string]$exe, [string[]]$cargoArgs, [string]$step) {
   return 99
 }
 
+# ---- hook 快检（先跑，fail-fast）----
+# ① 语法（~50ms）② TyranoScript v6 逐字正文管线回放（真渲染器 + 真 hook，见 scripts/verify_hook_tyrano.cjs）。
+# 都坏了立刻停，不必等 3 分钟的 clippy。Rust 侧还有语法兜底测试（cargo test 里）。
+"--- [hook-check] syntax + tyrano replay ---" | Out-File $log -Append
+$c0 = 0
+foreach ($s in @("check_hooks.cjs", "verify_hook_tyrano.cjs")) {
+  $nodeExe = Join-Path $node "node.exe"
+  & $nodeExe (Join-Path $PSScriptRoot $s) 2>&1 | Out-File $log -Append
+  $rc = $LASTEXITCODE
+  "[hook] $s exit=$rc" | Out-File $log -Append
+  if ($rc -ne 0) { $c0 = $rc }
+}
+if ($c0 -ne 0) {
+  "SUMMARY hook-check=$c0 CLIPPY/TEST SKIPPED" | Out-File $log -Append
+  "=== ALL DONE ===" | Out-File $log -Append
+  exit $c0
+}
+
 $c1 = Run-Cargo "$tb\cargo-clippy.exe" @("clippy","--all-targets","--","-D","warnings") "clippy"
 $c2 = Run-Cargo "$tb\cargo.exe"        @("test","--tests") "test"
 $c3 = -1
 if ($doBuild) {
   $c3 = Run-Cargo "$tb\cargo.exe" @("build","--release") "build-release"
 }
-"SUMMARY clippy=$c1 test=$c2 build=$c3" | Out-File $log -Append
+"SUMMARY hook-check=$c0 clippy=$c1 test=$c2 build=$c3" | Out-File $log -Append
 "=== ALL DONE ===" | Out-File $log -Append

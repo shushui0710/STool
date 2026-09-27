@@ -56,6 +56,8 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │   │                    Resume（解包断点续传台账，P2-4）+ write_out_resume、
 │   │                    Job<T> + parallel_extract + worker_count（解包并行化，P2-2）
 │   ├── scan.rs          ScanCtx：**一次** read_dir + **一次** walkdir，收齐检测所需索引
+│   │                     ＋ `.asar` 包头采样（`AsarEntries`/`probe_asar`）：包内特征（tyrano/、.ks…）
+│   │                     ＋ `asar_candidates`：检测与注入**共用**的候选 asar 优先级（单点）
 │   ├── recognize.rs     盲区引擎的**表驱动**识别器（Sig 判据 + Rec 规则 + 处置建议）
 │   ├── generic.rs       未知引擎兜底：GARbro 委派 + KNOWN_EXT 扩展名提示
 │   ├── renpy.rs         Ren'Py（解包/回填/反编译/注入/persistent 解锁）
@@ -179,6 +181,9 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
    │
    ▼
 ScanCtx::build(root)            ← 全树只扫一次（root 一级 read_dir + 递归 walkdir）
+   │                             ＋ 存在 .asar 时**再读一次包头部**（只读条目表，不解压）——
+   │                               Electron 打包的发行版把引擎特征全塞进包内，不读这一下
+   │                               检测对包内完全失明（实测：Electron+TyranoScript 被判成 html_game）
    │
    ▼
 Registry::detect_all(scan)      ← 10 原生插件 + 15 表驱动识别器 + 兜底，各自打分
@@ -198,6 +203,12 @@ engine.<op>(&Ctx)               ← Ctx{root, out_dir, options, progress, cancel
 
 **硬约定**：`Engine::detect_scan` 与各 `op` **不得**自行遍历整棵目录树；
 需要目录信息用 `ScanCtx`。这是"批量检测不卡"的前提。
+
+`ScanCtx` 对"一次扫描"的**唯一例外**是 `probe_asar`：只在存在 `.asar` 时多读一次
+**包头 JSON**（条目名清单，不碰数据区）。理由是包内特征本来完全不可见，
+而"看不见包内"是引擎误判的主要来源。注入侧 `resolve_html_target` 与检测侧
+`asar_candidates` **共用同一份候选优先级**（`engines::scan::asar_candidates`），
+避免出现「检测认这个包、注入改那个包」。
 
 ### 3.1.1 解包断点续传（`engines::Resume`，P2-4）
 
@@ -427,7 +438,7 @@ xp3/pck/asar/rgss 超 2GB 直接拒绝（避免无谓内存压力）。工作目
 | **加密封包不许静默产出** | `xp3::encrypted_count` | KiriKiri 各家加密方案（Cx/Hx…）按游戏定制密钥，STool 不内置解密；读出的是随机字节。检测到加密必须**报错并给替代路线**，绝不能把乱码当解包结果写盘（`others.rs` 解包、`selfcheck.rs` 均遵守） |
 | **运行时改动一律「文件级」** | `features::xp3patch` + `features::inject` | 项目边界是**不进目标进程**（见 §7）。KiriKiri 系靠 `patchN.xp3`（引擎搜索顺序 `Data 目录 → data.xp3 → patch.xp3 → patch2 → …`，后者覆盖前者）；JS/DOM 系靠新增脚本文件；**绝不用来覆盖游戏自带的补丁包**（`build` 拒绝非本工具创建的包，`remove` 靠 sidecar `<name>.stool.json` 认定归属） |
 | **路径穿越防护** | `engines::safe_out_path` | 过滤 `..` / 绝对路径，防 zip-slip 式越界写 |
-| **检测零额外 IO** | `ScanCtx` | 一次扫描供全部插件查表 |
+| **检测零额外 IO** | `ScanCtx` | 一次扫描供全部插件查表。**唯一例外**：存在 `.asar` 时多读一次包头（`probe_asar`，只读条目名）—— 包内特征不读就不可见 |
 | **panic 可诊断** | `diag::guard` + panic hook | GUI 无控制台，panic 必须落日志并能展示成错误 |
 | **配置损坏自愈** | `settings::load` | 解析失败要备份 + 告警，不静默丢设置 |
 | **写操作先预检** | `features::precheck` | 目录不可写 / 磁盘不足等**可预知**的失败要在开跑前拦下并给修法，别跑到一半才炸（几 GB 解包尤其致命） |

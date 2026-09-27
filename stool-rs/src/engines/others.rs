@@ -1419,7 +1419,9 @@ impl Engine for HtmlGamePlugin {
         }
         // TyranoBuilder 与 RPG Maker MV 根目录都带 index.html，但它们各有更专门的插件；
         // 这里排除掉，避免同一个目录同时被"确认"成三种 HTML 系引擎。
-        let owned_by_tyrano = scan.has_root_dir("tyrano");
+        // 注意「asar 内有 tyrano/」也算 Tyrano —— 否则 Electron 打包的 Tyrano 游戏会被这里吃掉。
+        let asar_has_tyrano = scan.asar().map(|a| a.has_prefix("tyrano/")).unwrap_or(false);
+        let owned_by_tyrano = scan.has_root_dir("tyrano") || asar_has_tyrano;
         let owned_by_mv = scan.has_file_named("actors.json");
         if scan.has_root_file("index.html") && !owned_by_tyrano && !owned_by_mv {
             d.hit(60, "index.html Web 入口");
@@ -1431,7 +1433,11 @@ impl Engine for HtmlGamePlugin {
             }
         }
         if owned_by_tyrano {
-            d.note("检测到 tyrano/ 目录，判定交由 TyranoBuilder 插件");
+            d.note(if asar_has_tyrano {
+                "asar 内含 tyrano/ 运行时，判定交由 TyranoBuilder 插件"
+            } else {
+                "检测到 tyrano/ 目录，判定交由 TyranoBuilder 插件"
+            });
         }
         d
     }
@@ -1570,7 +1576,30 @@ impl Engine for TyranoPlugin {
         if scan.has_file_named("config.tjs") {
             d.hit(10, "data/system/Config.tjs");
         }
-        if !scan.has_root_dir("tyrano") {
+        // asar 打包（Electron 发行版）：整个前端进了 `resources/app.asar`，根目录只剩 Electron
+        // 运行时 —— 上面每一条磁盘判据都命中不了。只看磁盘的检测会把这类游戏整包判成 html_game。
+        // 包内有 `tyrano/` 是**决定性**证据，给 75 分以稳定压过 html_game 的「有 asar = 70 分」
+        //（那 70 分是**打包**信号，不是**引擎**信号 —— 两者混用一个分数就是老误判的根源）。
+        let mut tyrano_in_asar = false;
+        if let Some(a) = scan.asar() {
+            let pack = a.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let pack = if pack.is_empty() { "app.asar".to_string() } else { pack };
+            if a.has_prefix("tyrano/") {
+                tyrano_in_asar = true;
+                d.hit(75, format!("{pack} 内含 tyrano/ 引擎运行时"));
+            }
+            let ks = a.ext_count("ks");
+            if ks > 0 {
+                d.hit(15, format!("{pack} 内 {ks} 个 .ks 剧本"));
+            }
+            if a.has_prefix("data/scenario/") {
+                d.hit(10, format!("{pack} 内 data/scenario/ 剧本目录"));
+            }
+            if a.has_name("config.tjs") {
+                d.hit(10, format!("{pack} 内 Config.tjs"));
+            }
+        }
+        if !scan.has_root_dir("tyrano") && !tyrano_in_asar {
             d.note("未发现 tyrano/ 目录，可能是 KiriKiri 或其他 .ks/.tjs 引擎，请人工核对");
         }
         d
@@ -1686,6 +1715,48 @@ mod detect_tests {
         // HTML 插件也应让位
         let html = det(&HtmlGamePlugin, &d);
         assert!(!html.ok(), "有 tyrano/ 时 HTML 插件不该抢，实得 {} 分", html.score);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Electron 打包的 TyranoScript：根目录只剩 Electron 运行时，`tyrano/`、`.ks` 全在
+    /// `resources/app.asar` 里。修复前只看磁盘 → 判成 `html_game`（这就是「每换一个游戏就爆新 bug」
+    /// 的结构性原因之一：检测对包内失明）。修复后包内证据要能胜过「有 asar」这个**打包**信号。
+    #[test]
+    fn test_tyrano_inside_asar_beats_html_game() {
+        let d = tmp("asar_tyrano_detect");
+        let src = d.join("app_src");
+        fs::create_dir_all(src.join("tyrano")).unwrap();
+        fs::create_dir_all(src.join("data").join("scenario")).unwrap();
+        fs::write(src.join("index.html"), b"<html><body>x</body></html>").unwrap();
+        fs::write(src.join("tyrano").join("tyrano.js"), b"x").unwrap();
+        fs::write(src.join("data").join("scenario").join("a.ks"), b"x").unwrap();
+        fs::create_dir_all(d.join("resources")).unwrap();
+        crate::formats::asar::pack(&src, &d.join("resources").join("app.asar")).unwrap();
+
+        let scan = ScanCtx::build(&d);
+        let a = scan.asar().expect("应从 app.asar 采到条目清单");
+        assert!(a.has_prefix("tyrano/"), "包内应有 tyrano/");
+        assert_eq!(a.ext_count("ks"), 1, "包内应有 1 个 .ks");
+
+        let results = crate::engines::Registry::new().detect_all(&d);
+        assert_eq!(
+            results[0].plugin_id,
+            "tyrano",
+            "asar 内的 Tyrano 应胜出，实得：{:?}",
+            results.iter().map(|r| (r.plugin_id.as_str(), r.score)).collect::<Vec<_>>()
+        );
+        assert!(
+            results[0].evidence.iter().any(|e| e.contains("app.asar")),
+            "证据里应点明 asar：{:?}",
+            results[0].evidence
+        );
+        // HTML 插件仍应"让位"（不再把自己的 asar 分当成引擎分）
+        let html = det(&HtmlGamePlugin, &d);
+        assert!(
+            html.notes.contains("asar 内含 tyrano/"),
+            "HTML 插件应说明让位原因，实得：{}",
+            html.notes
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

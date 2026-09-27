@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -181,11 +181,15 @@ pub fn pack(src_dir: &Path, out: &Path) -> Result<usize, String> {
     let header_str = serde_json::to_string(&header).map_err(|e| e.to_string())?;
     let json_len = header_str.len();
     let pad = (4 - json_len % 4) % 4;
-    let header_total = json_len + pad + 8; // [u32 JSON长度][JSON][补齐]
+    // Chromium pickle 布局：[u32=4][u32=头部pickle总长][u32=头部pickle载荷长][u32=JSON长][JSON][补齐]
+    // 第 3 个字段是**载荷长**（= 总长 - 4，即 [JSON长][JSON][补齐]），不是总长本身——
+    // 早先这里误写成总长（多 4 字节），Electron 读字符串时容错所以没暴露，但对不上真实格式。
+    let payload_len = json_len + pad + 4;
+    let header_total = payload_len + 4; // [u32 JSON长度][JSON][补齐]
     let mut f = fs::File::create(out).map_err(|e| e.to_string())?;
     f.write_all(&4u32.to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&(header_total as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&(header_total as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&(payload_len as u32).to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&(json_len as u32).to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(header_str.as_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&[0u8; 8][..pad]).map_err(|e| e.to_string())?;
@@ -195,4 +199,257 @@ pub fn pack(src_dir: &Path, out: &Path) -> Result<usize, String> {
         f.write_all(&content).map_err(|e| e.to_string())?;
     }
     Ok(files.len())
+}
+
+// ---------- 原位改写：往已有档案里打补丁 / 追加条目（不解包、不整包进内存） ----------
+
+/// 读取头部 JSON 原文（保留字段与结构，便于改写后回写），返回 (JSON, 数据区起点, 文件总长)。
+pub fn read_header_value(f: &mut fs::File) -> Result<(serde_json::Value, u64, u64), String> {
+    let file_len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).map_err(|e| e.to_string())?;
+    if u32::from_le_bytes(head[0..4].try_into().unwrap()) != 4 {
+        return Err("不是 asar 文件".into());
+    }
+    let header_total = u32::from_le_bytes(head[4..8].try_into().unwrap()) as u64;
+    let json_size = u32::from_le_bytes(head[12..16].try_into().unwrap()) as u64;
+    if 8 + header_total > file_len || 16 + json_size > file_len {
+        return Err("asar 头部越界".into());
+    }
+    let mut js = vec![0u8; json_size as usize];
+    f.read_exact(&mut js).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_slice(&js).map_err(|e| e.to_string())?;
+    Ok((v, 8 + header_total, file_len))
+}
+
+/// 取「根 files 下的嵌套节点」；`rel` 用 `/` 分隔、不带前导斜杠（与 `parse` 的 key 一致）。
+fn node_mut<'a>(mut cur: &'a mut serde_json::Value, rel: &str) -> Option<&'a mut serde_json::Value> {
+    for seg in rel.split('/') {
+        cur = cur.get_mut("files")?.get_mut(seg)?;
+    }
+    Some(cur)
+}
+
+/// 收集所有**占用数据区**的条目的 (offset, size, 相对路径)。
+fn collect_files(node: &serde_json::Value, prefix: &str, out: &mut Vec<(u64, u64, String)>) {
+    let Some(files) = node.get("files").and_then(|v| v.as_object()) else { return };
+    for (name, child) in files {
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        if child.get("files").and_then(|v| v.as_object()).is_some() {
+            collect_files(child, &rel, out);
+        } else {
+            if child.get("unpacked").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue; // 存放于 app.asar.unpacked，不占数据区
+            }
+            let Some(off) = child.get("offset").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let size = child.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            out.push((off, size, rel));
+        }
+    }
+}
+
+fn copy_n(f: &mut fs::File, out: &mut fs::File, mut n: u64, buf: &mut [u8]) -> Result<(), String> {
+    while n > 0 {
+        let want = n.min(buf.len() as u64) as usize;
+        f.read_exact(&mut buf[..want]).map_err(|e| e.to_string())?;
+        out.write_all(&buf[..want]).map_err(|e| e.to_string())?;
+        n -= want as u64;
+    }
+    Ok(())
+}
+
+/// 在已有 asar 上打补丁：`patches` 覆盖**已存在**条目（根级相对路径，如 `index.html`），
+/// `adds` 在数据区末尾**追加**新条目（根级相对路径，如 `stool_translate.js`）。
+///
+/// 原理：asar 的数据区是各条目按 offset 紧凑拼接的（无空洞），所以「某条目变大」等价于
+/// 「它之后的所有条目整体平移」。于是只改头部里的 offset/size，数据区原样流式复制，
+/// 不做解包、不整包进内存，写出的档案**除补丁外与原档案逐字节相同**。
+///
+/// 为安全起见，数据区不紧凑（有空洞或 size 合计对不上）时直接拒绝，避免改写错位。
+/// 返回 (原条目数, 新增条目数)。
+pub fn patch_archive(
+    src_path: &Path,
+    out_path: &Path,
+    patches: &[(String, Vec<u8>)],
+    adds: &[(String, Vec<u8>)],
+) -> Result<(usize, usize), String> {
+    let mut f = fs::File::open(src_path).map_err(|e| format!("打开 {} 失败: {e}", src_path.display()))?;
+    let (mut root, data_start, file_len) = read_header_value(&mut f)?;
+    let data_len = file_len - data_start;
+
+    // 1) 收集原有条目并校验数据区紧凑
+    let mut files: Vec<(u64, u64, String)> = Vec::new();
+    collect_files(&root, "", &mut files);
+    files.sort_by_key(|a| a.0);
+    let mut expect = 0u64;
+    for (off, size, rel) in &files {
+        if *off != expect {
+            return Err(format!(
+                "asar 数据区不紧凑（{rel} 偏移 {off}，期望 {expect}）—— 为安全起见不做原位改写"
+            ));
+        }
+        expect = off + size;
+    }
+    if expect != data_len {
+        return Err(format!("asar 数据区长度不符（条目合计 {expect}，实际 {data_len}）"));
+    }
+
+    // 2) 定位补丁目标，算出各自的 (旧偏移, 旧长度)
+    struct P { off: u64, old: u64, data: Vec<u8> }
+    let mut ps: Vec<P> = Vec::new();
+    for (rel, content) in patches {
+        let rec = files.iter().find(|t| &t.2 == rel).ok_or_else(|| format!("asar 内没有条目 {rel}"))?;
+        if ps.iter().any(|p| p.off == rec.0) {
+            return Err(format!("条目 {rel} 被重复指定补丁"));
+        }
+        ps.push(P { off: rec.0, old: rec.1, data: content.clone() });
+    }
+    ps.sort_by_key(|a| a.off);
+
+    // 3) 更新原有条目的 offset（补丁自身的起始位置不变，只改 size）
+    let shift_of = |off: u64| -> i64 {
+        ps.iter().filter(|p| p.off + p.old <= off).map(|p| p.data.len() as i64 - p.old as i64).sum()
+    };
+    for (off, _, rel) in &files {
+        let new_off = (*off as i64 + shift_of(*off)) as u64;
+        if let Some(n) = node_mut(&mut root, rel) {
+            if let Some(o) = n.get_mut("offset") {
+                *o = serde_json::Value::String(new_off.to_string());
+            }
+        }
+    }
+    for p in &ps {
+        let rel = &files.iter().find(|t| t.0 == p.off).ok_or("补丁目标丢失")?.2;
+        if let Some(n) = node_mut(&mut root, rel) {
+            if let Some(s) = n.get_mut("size") {
+                *s = serde_json::Value::from(p.data.len() as u64);
+            }
+        }
+    }
+
+    // 4) 追加新条目：紧跟在「平移后的数据区」之后
+    let total_delta: i64 = ps.iter().map(|p| p.data.len() as i64 - p.old as i64).sum();
+    let mut add_off = (data_len as i64 + total_delta) as u64;
+    for (rel, content) in adds {
+        if rel.contains('/') {
+            return Err(format!("新增条目只支持放在 asar 根目录（收到 {rel}）"));
+        }
+        let Some(obj) = root.get_mut("files").and_then(|v| v.as_object_mut()) else {
+            return Err("asar 头部缺少 files 对象".into());
+        };
+        obj.insert(
+            rel.clone(),
+            serde_json::json!({ "size": content.len() as u64, "offset": add_off.to_string() }),
+        );
+        add_off += content.len() as u64;
+    }
+
+    // 5) 写新档案：头部（原文结构 + 新 offset/size）+ 数据区流式复制（补丁位置替换）
+    let header_str = serde_json::to_string(&root).map_err(|e| e.to_string())?;
+    let json_len = header_str.len();
+    let pad = (4 - json_len % 4) % 4;
+    let payload_len = json_len + pad + 4;
+    let header_total = payload_len + 4;
+    let mut out = fs::File::create(out_path).map_err(|e| format!("创建 {} 失败: {e}", out_path.display()))?;
+    out.write_all(&4u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(&(header_total as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(&(payload_len as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(&(json_len as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(header_str.as_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(&[0u8; 8][..pad]).map_err(|e| e.to_string())?;
+
+    f.seek(SeekFrom::Start(data_start)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut cur = 0u64;
+    for p in &ps {
+        if p.off < cur {
+            return Err("补丁区间重叠".into());
+        }
+        copy_n(&mut f, &mut out, p.off - cur, &mut buf)?;
+        out.write_all(&p.data).map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Current(p.old as i64)).map_err(|e| e.to_string())?;
+        cur = p.off + p.old;
+    }
+    copy_n(&mut f, &mut out, data_len - cur, &mut buf)?;
+    for (_, content) in adds {
+        out.write_all(content).map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    Ok((files.len(), adds.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("stool_asar_test_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// pack → patch_archive → 逐条目读回：未打补丁的必须逐字节一致。
+    #[test]
+    fn test_patch_archive_roundtrip() {
+        let d = tmpdir("patch");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("data")).unwrap();
+        fs::write(src.join("a.txt"), b"AAAA").unwrap();
+        fs::write(src.join("data/b.bin"), vec![7u8; 300]).unwrap();
+        fs::write(src.join("index.html"), b"<html><body>hi</body></html>").unwrap();
+
+        let p1 = d.join("one.asar");
+        pack(&src, &p1).unwrap();
+
+        let patched_html = b"<html><body>hi<script src=\"stool_translate.js\"></script></body></html>".to_vec();
+        let js = b"/* hook */".to_vec();
+        let json = br#"{"a":"b"}"#.to_vec();
+        let p2 = d.join("two.asar");
+        let (n_old, n_add) = patch_archive(
+            &p1,
+            &p2,
+            &[("index.html".to_string(), patched_html.clone())],
+            &[
+                ("stool_translate.js".to_string(), js.clone()),
+                ("stool_translate.json".to_string(), json.clone()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(n_old, 3);
+        assert_eq!(n_add, 2);
+
+        // 新档案能被自家解析器读回来
+        let data = fs::read(&p2).unwrap();
+        let (files, data_start) = parse_bytes(&data).unwrap();
+        assert_eq!(files.len(), 5);
+        assert_eq!(read_file(&data, data_start, &files["index.html"]).unwrap(), patched_html);
+        assert_eq!(read_file(&data, data_start, &files["stool_translate.js"]).unwrap(), js);
+        assert_eq!(read_file(&data, data_start, &files["stool_translate.json"]).unwrap(), json);
+        // 未打补丁的条目必须原样
+        assert_eq!(read_file(&data, data_start, &files["a.txt"]).unwrap(), b"AAAA");
+        assert_eq!(read_file(&data, data_start, &files["data/b.bin"]).unwrap(), vec![7u8; 300]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// 头部第 3 个字段必须是「载荷长 = 总长 - 4」（真实 pickle 布局），不是总长。
+    #[test]
+    fn test_header_pickle_layout() {
+        let d = tmpdir("hdr");
+        let src = d.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("x.txt"), b"hello").unwrap();
+        let out = d.join("a.asar");
+        pack(&src, &out).unwrap();
+        let b = fs::read(&out).unwrap();
+        let ht = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let payload = u32::from_le_bytes(b[8..12].try_into().unwrap());
+        let json_len = u32::from_le_bytes(b[12..16].try_into().unwrap());
+        assert_eq!(payload, ht - 4, "第 3 字段应为载荷长");
+        assert!(payload >= json_len + 4, "载荷须容得下 JSON 长度字段与 JSON");
+        let _ = fs::remove_dir_all(&d);
+    }
 }

@@ -1,6 +1,7 @@
 /*
- * 校验 MV/MZ 运行时汉化 Hook 的行为（内嵌在 stool-rs/src/features/inject.rs 的 HOOK_JS 里，
- * Rust 单测只能做源码断言，测不到真实替换行为，所以这里把 JS 抠出来在 Node 里跑一遍）。
+ * 校验 MV/MZ 运行时汉化 Hook 的行为（源码在 stool-rs/assets/hooks/mv_mz.js，
+ * 由 inject.rs 用 include_str! 内嵌；Rust 单测只能做源码断言，测不到真实替换行为，
+ * 所以这里把 JS 在 Node 里真跑一遍）。
  *
  * 覆盖两类核心回归：
  *  1) 资源名不能被动 —— 翻译表的「原文」常与游戏资源文件名同形（那个验证游戏里有 158 个撞名，
@@ -20,16 +21,25 @@ const os = require("os");
 const path = require("path");
 const vm = require("vm");
 
-// --- 1. 从 Rust 源码里抠出 HOOK_JS ---
-// 可用 STOOL_HOOK_JS=<路径> 覆盖（指向另一个 inject.rs 或直接指向 .js），
-// 用来对着历史版本跑一遍、确认这份校验真的能抓到那个 bug（而不是空过）。
-const RUST_SRC = process.env.STOOL_HOOK_JS || path.resolve(__dirname, "..", "stool-rs", "src", "features", "inject.rs");
+// --- 1. 取出 HOOK_JS ---
+// HOOK 现在是**独立真文件** stool-rs/assets/hooks/mv_mz.js（由 inject.rs 的 include_str! 内嵌）。
+// 可用 STOOL_HOOK_JS=<路径> 覆盖：
+//   *.js  → 直接读（默认路径就是它）；
+//   *.rs  → 仍按老办法从 r#"..."# 里抠（用来对着历史 revision 的 inject.rs 跑一遍，
+//           确认这份校验真能抓到那个 bug，而不是空过）。
+const HOOK_JS_FILE = path.resolve(__dirname, "..", "stool-rs", "assets", "hooks", "mv_mz.js");
+const SRC = process.env.STOOL_HOOK_JS || HOOK_JS_FILE;
 
-const src = fs.readFileSync(RUST_SRC, "utf8");
-const m = src.match(/const HOOK_JS: &str = r#"([\s\S]*?)"#;/);
-const HOOK = m ? m[1] : src;
+let HOOK;
+if (/\.js$/i.test(SRC)) {
+  HOOK = fs.readFileSync(SRC, "utf8");
+} else {
+  const src = fs.readFileSync(SRC, "utf8");
+  const m = src.match(/const HOOK_JS: &str = r#"([\s\S]*?)"#;/);
+  HOOK = m ? m[1] : "";
+}
 if (!HOOK || HOOK.length < 1000) {
-  console.error("✗ 没能从 " + RUST_SRC + " 里取出 HOOK_JS");
+  console.error("✗ 没能从 " + SRC + " 里取出 HOOK（.js 直接读取；.rs 需含 const HOOK_JS: &str = r#\"…\"#;）");
   process.exit(2);
 }
 

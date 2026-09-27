@@ -49,7 +49,7 @@
 | Godot | 部分独立游戏 | ✔ | ✔ | ✔（借助 GDRE Tools 一键下载） | — | — | 封包回写为未加密 v1，Godot 3.x/未加密 4.x 可用；遇到加密封包会明确提示。**自解压导出的游戏**（PCK 嵌在 exe 尾部、目录里没有单独的 `.pck`）也能识别并直接解包 |
 | SACT / System40（Pal 系） | 部分日系老作品 | 借助 GARbro 工具 | — | — | — | — | 识别 `.pac`（魔数 `PAC `）+ `.dat` + `dll/PAL.dll` 这套布局；脚本与文本多编译在 exe 内，走 GARbro 解包后回填；存档为根目录 `save*.dat` |
 | NScripter / ONScripter | 老牌视觉小说引擎 | ✔（解密主脚本） | — | — | ✔（台词提取 + Shift-JIS 校验回填，自动备份） | — | 自动尝试多种解密方式，选效果最好的 |
-| HTML / Electron 网页游戏 | 网页技术做的游戏 | ✔ | ✔ | — | — | — | 资源解出来就是普通网页文件，直接改 |
+| HTML / Electron 网页游戏 | 网页技术做的游戏 | ✔ | ✔ | — | — | — | 资源解出来就是普通网页文件，直接改；**打包进 `app.asar` 的 Electron 游戏**也能就地注入汉化（只补丁入口 HTML，其余条目原样） |
 | Wolf RPG Editor（Wolf 引擎） | 日系 RPG | ✔（借助 WolfDec 工具） | — | — | ✔（从 Game.dat 等提取对话） | — | 需要在设置页填写 WolfDec 的路径 |
 | Unity（Mono / IL2CPP 都支持） | 3D / 手游向游戏 | ✔（借助 AssetRipper 工具） | — | — | — | ✔（可一键全 CG 解锁） | 全 CG 解锁**不需要反编译器、不需要 .NET 运行环境**：直接读 `Managed/Assembly-CSharp*.dll`（Mono 版）或 `il2cpp_data/Metadata/global-metadata.dat`（IL2CPP 版）里的字符串，把画廊的 PlayerPrefs 键名写进注册表——**不动游戏文件**，缺省只读预览、写入前自动备份原值、可一键还原。解包仍需在设置页填写 AssetRipper 的路径 |
 | 识别不出的游戏 | — | 借助 GARbro 工具兜底 | — | — | — | — | 同时给出文件后缀特征提示，方便人工判断 |
@@ -70,10 +70,15 @@
 约定与还原：
 
 - 翻译文件会被复制为游戏目录下的 `stool_translate.json`（游戏运行时读取；Ren'Py 例外：映射直接写进 .rpy）；
-- 注入只新增/登记汉化文件（MV/MZ 登记 `js/plugins.js` 并自动备份原件；Ren'Py 新增独立 .rpy）；
-- 点"移除注入"（或 `stool-cli text-uninject <游戏目录>`）即可还原（MV/MZ 字节级还原）；
+- 注入只新增/登记汉化文件（MV/MZ 登记 `js/plugins.js` 并自动备份原件；Ren'Py 新增独立 .rpy；
+  Electron 打包游戏则**就地补丁 `app.asar`**：只改入口 HTML + 追加汉化文件，其余条目原样、整包自动备份）；
+- 点"移除注入"（或 `stool-cli text-uninject <游戏目录>`）即可还原（MV/MZ 字节级还原；Electron 用整包备份还原）；
 - 支持的引擎：**RPG Maker MV / MZ**（NW.js 插件注入）、**Ren'Py**（`config.replace_text` 运行时替换）、
-  **HTML / Electron**（DOM 文本节点 MutationObserver 替换，Canvas 画面内的文本除外）；
+  **HTML / Electron**（DOM 文本节点 MutationObserver 替换，Canvas 画面内的文本除外）。
+  Electron 游戏入口 HTML 在磁盘上就直接改该文件，在 `app.asar` 包里就自动定位包内入口做就地补丁，
+  再经 preload 暴露的 `fs`（如 `studio_api.fs_default`）读取映射；若页面其实是 **TyranoScript v6**，
+  正文会被引擎逐字包成 `<span class="char">`（节点级匹配必然失效，表现为「角色名翻了、正文没翻」），
+  此时额外接管引擎的 `buildMessageHTML`，按整行替换后仍交回引擎逐字渲染（打字动画/换行/描边保留）；
   其余引擎（RGSS/Godot/NScripter/Unity/Wolf）文本封在私有封包或编译脚本里、无运行时注入点，
   会明确提示改用"翻译回填"；吉里吉里虽无内存注入点，但可改用**运行时补丁包**（见"运行时修改"页的方式三）。
 
@@ -443,10 +448,15 @@ stool-tauri/     # 图形界面（Tauri v2 + WebView2）—— 本仓库唯一�
 
 本项目的质量门禁：`cargo clippy --all-targets -- -D warnings`（零警告）+ `cargo test --tests`。
 
-当前 `cargo test --tests` 共 **319 项测试全部通过**（另有 1 项需联网/写真实注册表的用例默认忽略）：
+当前 `cargo test --tests` 共 **334 项测试全部通过**（另有 1 项需联网/写真实注册表的用例默认忽略）：
 
-- **284 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
-  MTool 式 JSON 注入、MOD 管理、解锁策略、预检/自检/体检/批量、吉里吉里运行时补丁包
+- **299 项单元测试**（内置在 `src/` 各模块）：各格式解析/回环、存档编辑、文本提取回填、
+  MTool 式 JSON 注入（含 Electron `app.asar` 入口页收敛、就地补丁与 TyranoScript v6 逐字正文接管；
+  hook 源码已是独立 `.js`，由 `include_str!` 内嵌，并有 `node --check` 语法校验）、
+  **引擎识别（含 asar 封包内探测：`app.asar` 内含 `tyrano/` 时由 TyranoBuilder 插件胜出，
+  不再被误判为 `html_game`）**、
+  MOD 管理、解锁策略、
+  预检/自检/体检/批量、吉里吉里运行时补丁包
   （含「只打包改动」比对）、断点续传、并行解包、机翻重试退避、SHA-256/SHA-1 官方向量、
   API Key 加解密、Unity 精确键名提取（.NET 元数据 / IL2CPP 元数据，含逐字节变异模糊）、
   反修改保护诊断（回滚判定 / 改写判定 / 立即数写入指令扫描 / 模块名单 / 反调试导入 /
@@ -456,13 +466,18 @@ stool-tauri/     # 图形界面（Tauri v2 + WebView2）—— 本仓库唯一�
 - **9 项模糊测试**（`tests/fuzz_parsers.rs`）：对解析器投喂畸形/截断/随机输入，
   验证**永不 panic**（越界一律安全返回）
 - **6 项流式等价性测试**（`tests/streaming.rs`）：同一封包分别用内存模式与强制文件模式解析，
-  要求逐字节一致
+  要求逐字节一致（含 `app.asar` 流式补丁产物与内存产物比对）
 - **4 项并行一致性测试**（`tests/parallel.rs`）：真实跑 `jobs=1` 与 `jobs=8`，
   产物逐文件逐字节相同
 - **交叉验证**：另有 Python 第三方解析器（各写一份、不共用代码，用来核对 Rust 实现的解读）
   - `scripts/peek_xp3.py` —— 按 GARbro/KiriKiri 规范独立核对 XP3 头部/条目/校验和
   - `scripts/peek_dotnet.py` —— 独立核对 .NET `#US` / `#Strings` 堆
   - `scripts/peek_il2cpp.py` —— 独立核对 `global-metadata.dat`（三区连续性、`dataIndex` 步进、UTF-8 可解率）
+- **hook 侧（Node）**：三份运行时 hook 已是独立 `.js`（`stool-rs/assets/hooks/`，由 `include_str!` 内嵌），
+  `scripts/check_hooks.cjs` 做语法校验（~50ms）；`scripts/verify_hook_tyrano.cjs` 用**从真实游戏逐字节抠出的**
+  `kag.tag.js::buildMessageHTML`（固件 `stool-rs/tests/fixtures/hooks/`，附来源与 sha256）当真渲染器，
+  回放「TyranoScript v6 逐字 `<span class="char">`」这条管线 —— 带**反向对照**（接管前必须仍是日文）
+  与透传断言，**不必开游戏**即可复现/预防「角色名翻了、正文没翻」这类 bug。
 
 关键格式的解密算法都对照了成熟的开源实现（GARbro、RPGMakerDecrypter、
 pieroxy/lz-string 官方源码）逐一核对过，确保对真实游戏文件有效。
@@ -481,6 +496,7 @@ pieroxy/lz-string 官方源码）逐一核对过，确保对真实游戏文件�
 | Artemis（.pfs / pf8） | 美少女万華鏡 呪われし伝説の少女、アマカノ3 | 检测判定 70 分确认；`root.pfs`（1.5 GB / 2703 条目）与 `Amakano3.pfs`（1.7 GB / 3361 条目）索引 100% 解析零越界，解包产物 PNG/OTF/OGV/`.ast` 全部有效；`selfcheck` 重打包逐条目无损 |
 | Unity Mono 全CG解锁（.NET 元数据） | Inari | 精确定位 `Managed/Assembly-CSharp.dll`（+ `-firstpass`）；读出 10085 条 `#US` 字面量、26460 条 `#Strings` 名字，识别出 164 个画廊类型/字段（如 `<<OpenGallery>g__GoGalleryScene\|2>d`）；与独立 Python 解析器计数完全一致 |
 | Unity IL2CPP 全CG解锁（global-metadata.dat） | Yakuzarogue、MiraisMidnightStream、sinSister 等 6 款 | 6/6 样本正确解析（v24/v29/v31），字面量 UTF-8 可解率 99.99%（16662/16663）；Yakuzarogue 直接扫出真实键 `cg_button_name1`…`cg_button_name7`，Mirais 扫出 `CG0`…`CG9` |
+| Electron + TyranoScript v6（`app.asar` 就地注入汉化） | NTRdemic〜僕はどんな誘惑にも屈せず彼女を救い出す〜 | 打包 1104 条目，数据区紧凑无空隙；注入后入口 `index.html` 由 5858→5900 字节（仅 +42 的 `<script>` 标签），**其余 1103 条目逐字节不变**；重复注入不再膨胀（同尺寸、数据区零空洞）。v6 正文是「逐字 `<span class="char">`」，节点级匹配失效（症状：**角色名翻成中文、正文整片日文**），改由接管 `buildMessageHTML` 修复；运行时逐句核对 7 屏全中文、日文 0 字，打字动画正常（`chars == visible`） |
 
 反修改保护诊断（`guard`）不依赖游戏文件，用**受控靶子进程**在真机上验证：
 `scripts/mock_mem_guard.py` 用 `VirtualAlloc` 独占一页放一个整数，按模式分别模拟

@@ -10,6 +10,14 @@
 //!   DOM 文本节点替换即可覆盖；Hook 额外挂了 jQuery `html/text` 兜底（Tyrano 是 jQuery 系）；
 //! - **HTML / Electron**：在入口 HTML 末尾追加 `<script src="stool_translate.js">`
 //!   （原文件备份），DOM 文本节点经 MutationObserver 运行时替换（Canvas 渲染的内容除外）。
+//!   发行版常把整个前端打进 `resources/app.asar`（游戏根目录只剩 Electron 运行时）—— 此时
+//!   会**直接改写 asar**：在其入口页尾部挂标签，并把 hook 与翻译 JSON 写进 asar 根
+//!   （原档案整文件备份，可一键还原）。asar 的数据区是各条目紧凑拼接的，所以改写只让入口页
+//!   之后的条目整体平移，其余字节原样保留（实现见 `formats::asar::patch_archive`）。
+//!   入口页的挑选是**收敛的**：优先 `index.html`，其次 asar 内的入口页，最后根目录里
+//!   「像入口」的 `.html`（排除许可证/说明类，且必须加载脚本）—— 找不到就报错，绝不随便挑一个
+//!   文件注入（曾经的兜底是「根目录第一个 .html」，在 Electron 包上会命中
+//!   `LICENSES.chromium.html`，表现就是「提示成功但界面毫无变化」）。
 //!
 //! 不在范围内（以及原因）：KiriKiri / Siglus / BGI / Majesty 等的脚本与文本封在私有封包里，
 //! 且 xp3/pak 解包后常为加密 `.ks/.tjs`，运行时没有稳定的替换注入点 —— 这类引擎请走
@@ -77,14 +85,14 @@ pub const SUPPORT_TABLE: &[InjectSupport] = &[
     InjectSupport {
         plugin_id: "tyrano",
         engine: "TyranoBuilder / TyranoScript",
-        mechanism: "在 index.html 追加 stool_translate.js；DOM 文本节点 + jQuery html/text 双层替换（KAG 渲染到 DOM，非 Canvas）",
-        limits: "只改入口 HTML（有备份）；Canvas/WebGL 里画的文字无法替换；已打包的 .ks 剧本请改用文本提取/回填",
+        mechanism: "在 index.html 追加 stool_translate.js；DOM 文本节点 + jQuery html/text + message 元素三级替换，并接管 v6 的 buildMessageHTML（逐字 span 正文的明文入口）；游戏被 Electron 打进 app.asar 时（磁盘上没有 tyrano/，特征只在包内），自动改写 asar 内的入口页并把注入文件写进包内（与 HTML/Electron 共用同一条 asar 管道，产物完全一致）",
+        limits: "只改入口 HTML，或 asar 内新增的两个文件（原文件/原档案自动备份、可一键还原）；Canvas/WebGL 里画的文字无法替换；已打包的 .ks 剧本请改用文本提取/回填",
     },
     InjectSupport {
         plugin_id: "html_game",
         engine: "HTML / Electron",
-        mechanism: "在入口 HTML 追加 stool_translate.js，MutationObserver 替换 DOM 文本节点",
-        limits: "只改入口 HTML（有备份）；Canvas 渲染的文字无法替换；Electron 需对 app 目录有写权限",
+        mechanism: "在入口 HTML 追加 stool_translate.js，MutationObserver 替换 DOM 文本节点；若页面是 TyranoScript v6，另接管 buildMessageHTML 处理逐字 span 正文；Electron（resources/app.asar）改写 asar 内的入口页并把 hook/JSON 写进 asar",
+        limits: "只改入口 HTML 与 asar 内新增的两个文件（原档案自动备份、可一键还原）；Canvas 渲染的文字无法替换；asar 只增不减，还原靠首次注入前的整文件备份",
     },
 ];
 
@@ -111,19 +119,137 @@ fn renpy_game_dir(root: &Path) -> Option<PathBuf> {
     g.is_dir().then_some(g)
 }
 
-/// HTML 游戏的入口 html（优先 index.html，其次根目录第一个 .html）。
-fn html_entry(root: &Path) -> Option<PathBuf> {
-    let idx = root.join("index.html");
-    if idx.exists() {
-        return Some(idx);
-    }
-    std::fs::read_dir(root)
+/// HTML 系注入的目标：磁盘上的入口 HTML，或 Electron `app.asar` 内的条目。
+#[derive(Debug)]
+enum HtmlTarget {
+    /// 磁盘上的入口 HTML 文件。脚本与 JSON 写在它同目录（即游戏根）。
+    File(PathBuf),
+    /// Electron asar 内的入口条目。`entry` 是 asar 根下的相对路径（如 `index.html`）；
+    /// 脚本与 JSON 都写进 asar 根 —— 页面本身从 asar 加载，相对路径才会落回 asar 里。
+    Asar { asar: PathBuf, entry: String },
+}
+
+/// 明显是**非入口**的 HTML 名（许可证 / 说明 / 变更记录一类）。
+///
+/// Electron 打包的游戏会在根目录放 `LICENSES.chromium.html`。早先的兜底是
+/// 「根目录第一个 .html」，于是脚本标签被注进了 Chromium 的许可证文件 —— 游戏永远不会加载它，
+/// 现象就是「提示注入成功，但界面毫无变化」。所以非入口名必须先排除。
+const NON_ENTRY_HTML: [&str; 12] = [
+    "license", "licenses", "licence", "licences", "copying", "notice",
+    "readme", "changelog", "changes", "history", "third_party", "third-party",
+];
+
+fn is_non_entry_html_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower
+        .strip_suffix(".html")
+        .or_else(|| lower.strip_suffix(".htm"))
+        .unwrap_or(&lower);
+    let norm: String = stem.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    NON_ENTRY_HTML.iter().any(|bad| {
+        let b: String = bad.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        norm == b || norm.starts_with(&b)
+    })
+}
+
+fn is_html_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.ends_with(".html") || l.ends_with(".htm")
+}
+
+/// 入口 HTML 的内容判据：**必须加载脚本**。
+///
+/// 单看 `<html>` / `<body>` 判别力不够（许可证页也有），但游戏入口 —— Tyrano / RPG Maker web /
+/// Construct / 自研前端 —— 无一例外都要 `<script>`，而 Chromium 的 `LICENSES.chromium.html`
+/// 一个都没有。用它当「像不像入口」的硬门槛，实测能干净挡住那个文件。
+fn looks_like_entry_html(content: &str) -> bool {
+    content.to_ascii_lowercase().contains("<script")
+}
+
+/// 根目录里「像入口」的 `.html`（排除许可证/说明类，且内容须加载脚本）。
+fn plain_html_entry(root: &Path) -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
         .flatten()
         .map(|d| d.path())
-        .find(|p| {
-            p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("html")).unwrap_or(false)
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).map(is_html_name).unwrap_or(false)
+                && !p.file_name().and_then(|n| n.to_str()).map(is_non_entry_html_name).unwrap_or(false)
         })
+        .collect();
+    cands.sort();
+    cands.into_iter().find(|p| {
+        std::fs::read_to_string(p).map(|c| looks_like_entry_html(&c)).unwrap_or(false)
+    })
+}
+
+/// 候选 asar（优先级实现只有一份：`engines::scan::asar_candidates`）。
+///
+/// 检测与注入必须共用**同一份**顺序 —— 各写一套必然出现「检测认这个包、注入改那个包」，
+/// 而症状是「提示注入成功、游戏毫无变化」。
+fn asar_candidates(root: &Path) -> Vec<PathBuf> {
+    crate::engines::scan::asar_candidates(root)
+}
+
+/// asar 内可用的根级入口 HTML 条目名（优先 `index.html`）。
+fn asar_entry_of(asar: &Path) -> Result<Option<String>, String> {
+    let mut src = crate::formats::source::Source::open(asar, crate::formats::source::MAX_ARCHIVE)?;
+    let (files, data_start) = crate::formats::asar::parse_index(&mut src)?;
+    if files.contains_key("index.html") {
+        return Ok(Some("index.html".to_string()));
+    }
+    let mut names: Vec<String> = files
+        .keys()
+        .filter(|k| !k.contains('/') && is_html_name(k) && !is_non_entry_html_name(k))
+        .cloned()
+        .collect();
+    names.sort();
+    for n in names {
+        let node = &files[&n];
+        if let Ok(bytes) = crate::formats::asar::read_entry(&mut src, data_start, node) {
+            if looks_like_entry_html(&String::from_utf8_lossy(&bytes)) {
+                return Ok(Some(n));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 定位该游戏的 HTML 注入目标。顺序：
+/// 1. 根目录 `index.html`（绝大多数明文 HTML 游戏）；
+/// 2. **Electron asar 内的入口页**（发行版把整个前端打进 asar，根目录只剩 Electron 运行时，
+///    此时唯一能让注入真正生效的位置就是 asar 里的入口页）；
+/// 3. 根目录里其它「像入口」的 `.html`；
+/// 4. 都不行则返回**带出路**的错误，而不是随便挑一个文件（旧行为正是栽在这里）。
+fn resolve_html_target(root: &Path) -> Result<HtmlTarget, String> {
+    let idx = root.join("index.html");
+    if idx.exists() {
+        return Ok(HtmlTarget::File(idx));
+    }
+
+    let mut asar_notes: Vec<String> = Vec::new();
+    for a in asar_candidates(root) {
+        match asar_entry_of(&a) {
+            Ok(Some(entry)) => return Ok(HtmlTarget::Asar { asar: a, entry }),
+            Ok(None) => asar_notes.push(format!("{} 内没有可用的根级入口 HTML", a.display())),
+            Err(e) => asar_notes.push(format!("{} 读取失败（{e}）", a.display())),
+        }
+    }
+
+    if let Some(f) = plain_html_entry(root) {
+        return Ok(HtmlTarget::File(f));
+    }
+
+    let mut msg = String::from(
+        "未找到入口 HTML：根目录没有 index.html，也没有「像入口」的 .html（已排除许可证/说明类文件）",
+    );
+    if !asar_notes.is_empty() {
+        msg.push_str("；asar 情况：");
+        msg.push_str(&asar_notes.join("；"));
+    }
+    msg.push_str("。若这是 Electron 打包的游戏，请确认 resources/app.asar 存在（本工具会直接改 asar 内的入口页，原档案自动备份）。");
+    Err(msg)
 }
 
 /// 加载并校验翻译 JSON，返回 (拍平后的映射, 总条目数, 空译文条目数)。
@@ -256,17 +382,36 @@ pub fn status(root: &Path, plugin_id: &str) -> Status {
                 }
             }
         }
-        "html_game" | "tyrano" => {
-            let hook = root.join(format!("{HOOK_NAME}.js"));
-            st.installed = hook.exists();
-            let f = root.join(JSON_IN_GAME);
-            if f.exists() {
-                st.json_path = f.display().to_string();
-                if let Ok((_, total, _)) = load_map(&f) {
-                    st.entries = total;
+        "html_game" | "tyrano" => match resolve_html_target(root) {
+            Ok(HtmlTarget::File(entry)) => {
+                let dir = entry.parent().unwrap_or(root);
+                st.installed = dir.join(format!("{HOOK_NAME}.js")).exists();
+                let f = dir.join(JSON_IN_GAME);
+                if f.exists() {
+                    st.json_path = f.display().to_string();
+                    if let Ok((_, total, _)) = load_map(&f) {
+                        st.entries = total;
+                    }
                 }
             }
-        }
+            Ok(HtmlTarget::Asar { asar, .. }) => {
+                st.installed = read_asar_named(&asar, &format!("{HOOK_NAME}.js"))
+                    .map(|v| v.is_some())
+                    .unwrap_or(false);
+                if let Ok(Some(bytes)) = read_asar_named(&asar, JSON_IN_GAME) {
+                    st.json_path = format!("{}\\{JSON_IN_GAME}", asar.display());
+                    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(&bytes) {
+                        let mut flat = serde_json::Map::new();
+                        let mut skipped = 0usize;
+                        flatten_into(&obj, &mut flat, &mut skipped, 0);
+                        st.entries = flat.len() + skipped;
+                    }
+                }
+            }
+            Err(_) => {
+                st.installed = root.join(format!("{HOOK_NAME}.js")).exists();
+            }
+        },
         _ => {}
     }
     st
@@ -394,9 +539,29 @@ pub fn install_html(root: &Path, json_path: &Path) -> Result<String, String> {
 /// 注入（TyranoBuilder）：机制与 HTML 系相同，但 Hook 额外挂了 jQuery `html/text` 兜底
 /// —— TyranoScript 的 KAG 消息是用 jQuery 写进 DOM 的（不是 Canvas），DOM 替换即可覆盖。
 pub fn install_tyrano(root: &Path, json_path: &Path) -> Result<String, String> {
-    if !root.join("tyrano").is_dir() {
+    let disk_tyrano = root.join("tyrano").is_dir();
+    if !disk_tyrano {
+        // 磁盘上没有 tyrano/ → 只可能是 Electron 把整个前端整包进了 asar
+        // （检测侧靠**包内**的 tyrano/ 认出来，见 `TyranoPlugin::detect_scan`）。
+        //
+        // 这种情况**刻意**走与 HTML 系完全相同的管道**和同一份 hook**：
+        //   · 管道本来共用（`install_html_like` 就支持 asar 目标）；
+        //   · hook 也共用 —— 那份 HTML hook 已含 Tyrano v6 的逐字正文接缝，而且是**在本机
+        //     真实 Electron + TyranoScript 游戏上端到端验证过**的那一份。
+        //     换 hook 只会引入未验证的差异（两份 hook 有 118 行不同：jQuery 包装、trim 兜底、
+        //     同步/异步 XHR），而症状会是「引擎标签修对了、游戏反而坏了」—— 正是最不该发生的事。
+        // 两份 hook 的其余差异是**待收敛的债务**：真正该做的是合成一份（DOM/逐字接缝/jQuery
+        // 三种管线合一），做完再统一；在那之前不动已验证的产物。
+        let asar_tyrano = crate::engines::scan::probe_asar(root)
+            .map(|a| a.has_prefix("tyrano/"))
+            .unwrap_or(false);
+        if asar_tyrano {
+            return install_html(root, json_path);
+        }
         return Err(format!(
-            "未找到 tyrano/ 目录（{}）—— 请把游戏目录选成 TyranoBuilder 游戏的根目录（应同时含 index.html 与 tyrano/）",
+            "未找到 tyrano/ 目录，也未在 Electron 封包（app.asar）里发现 TyranoScript 运行时（{}）—— \
+             请把游戏目录选成游戏根目录：明文版应同时含 index.html 与 tyrano/，\
+             Electron 版应在 resources/app.asar 里含 tyrano/",
             root.display()
         ));
     }
@@ -408,423 +573,183 @@ pub fn install_tyrano(root: &Path, json_path: &Path) -> Result<String, String> {
     )
 }
 
-/// HTML 系（HTML/Electron 与 TyranoBuilder）的共用注入流程。
-fn install_html_like(root: &Path, json_path: &Path, hook_js: &str, tail_hint: &str) -> Result<String, String> {
-    let entry = html_entry(root).ok_or("未找到入口 HTML（index.html）")?;
-    let (map, total, skipped) = load_map(json_path)?;
-
-    // 1) Hook 与翻译 JSON
-    let json_text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).map_err(|e| e.to_string())?;
-    std::fs::write(root.join(JSON_IN_GAME), json_text).map_err(|e| format!("写入翻译 JSON 失败: {e}"))?;
-    std::fs::write(root.join(format!("{HOOK_NAME}.js")), hook_js).map_err(|e| format!("写入 Hook 失败: {e}"))?;
-
-    // 2) 入口 HTML 挂脚本（幂等；首次备份）
-    let html = std::fs::read_to_string(&entry).map_err(|e| format!("读取 {} 失败: {e}", entry.display()))?;
+/// 往入口 HTML 末尾挂脚本标签。返回 (新内容, 是否真的改了)；已挂过则原样返回。
+fn with_hook_tag(html: &str) -> (String, bool) {
     if html.contains(&format!("{HOOK_NAME}.js")) {
-        return Ok(format!("注入已更新：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}"));
+        return (html.to_string(), false);
     }
-    // 首次注入前备份入口 HTML（已存在则保留，绝不覆盖）
-    crate::settings::backup_once(&entry).map_err(|e| format!("备份入口 HTML 失败: {e}"))?;
     let tag = format!("<script src=\"{HOOK_NAME}.js\"></script>");
     let patched = match html.to_ascii_lowercase().rfind("</body>") {
         Some(pos) => format!("{}{}{}", &html[..pos], tag, &html[pos..]),
         None => format!("{html}{tag}"),
     };
-    std::fs::write(&entry, patched).map_err(|e| format!("写入入口 HTML 失败: {e}"))?;
-    Ok(format!("注入完成：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}"))
+    (patched, true)
+}
+
+/// 按目标类型取「hook 与 JSON 所在目录」——磁盘目标在游戏根，asar 目标在 asar 内。
+fn read_asar_named(asar: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut src = crate::formats::source::Source::open(asar, crate::formats::source::MAX_ARCHIVE)?;
+    let (files, data_start) = crate::formats::asar::parse_index(&mut src)?;
+    match files.get(name) {
+        Some(node) => Ok(Some(crate::formats::asar::read_entry(&mut src, data_start, node)?)),
+        None => Ok(None),
+    }
+}
+
+/// 把 hook + 翻译 JSON 写进 asar，并改写 asar 内的入口页挂上脚本标签。
+///
+/// 用**原位改写**而不是「解包 → 重打包」：asar 数据区是紧凑拼接的，某条目变大只等于
+/// 它之后的条目整体平移，其余字节原样流式复制 —— 上百 MB 的封包既不落一整套临时文件，
+/// 也不会重新编码游戏资源。写出的档案除补丁外与原档案逐字节相同（有单测钉死）。
+fn install_into_asar(
+    asar: &Path,
+    entry: &str,
+    json_text: String,
+    hook_js: &str,
+    total: usize,
+    skipped: usize,
+    tail_hint: &str,
+) -> Result<String, String> {
+    let html = read_asar_named(asar, entry)?
+        .ok_or_else(|| format!("asar 内没有条目 {entry}"))?;
+    let html = String::from_utf8_lossy(&html).into_owned();
+    let (patched, changed) = with_hook_tag(&html);
+
+    let mut patches: Vec<(String, Vec<u8>)> = if changed {
+        vec![(entry.to_string(), patched.into_bytes())]
+    } else {
+        Vec::new()
+    };
+    // 两个汉化文件：**已存在就按「改写」处理，只有不存在才追加**。
+    //
+    // 为什么必须区分：asar 数据区是紧凑的，追加只能贴在末尾。若重复注入一律当"新增"，
+    // 会把整份 payload 再贴一遍 —— 实测第二次注入后文件多涨 415 KB，且旧副本变成没人引用
+    // 的孤儿字节（数据区出现空洞），**第三次注入就会因"数据区不连续"直接失败**。
+    // 改写路径同样只动头部 offset/size，数据区照旧流式抄，不留空洞。
+    let mut adds: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, bytes) in [
+        (format!("{HOOK_NAME}.js"), hook_js.as_bytes().to_vec()),
+        (JSON_IN_GAME.to_string(), json_text.into_bytes()),
+    ] {
+        if read_asar_named(asar, &name)?.is_some() {
+            patches.push((name, bytes));
+        } else {
+            adds.push((name, bytes));
+        }
+    }
+
+    let tmp = asar.with_extension("asar.stool_new");
+    let _ = std::fs::remove_file(&tmp);
+    crate::formats::asar::patch_archive(asar, &tmp, &patches, &adds).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("改写 asar 失败: {e}")
+    })?;
+
+    // 首次注入前整文件备份原 asar（已存在则保留，绝不覆盖），再把新档案顶上去。
+    if let Err(e) = crate::settings::backup_once(asar) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("备份原 asar 失败: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, asar) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换 asar 失败: {e}"));
+    }
+
+    let verb = if changed { "注入完成" } else { "注入已更新" };
+    Ok(format!(
+        "{verb}：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}\
+         \n已写入 Electron 封包：{} 内的 {entry} 挂上脚本，同封包内写入 {HOOK_NAME}.js 与 {JSON_IN_GAME}（已存在则原地改写）；\
+         原封包已备份为 {}.stool.bak（用「还原」可一键退回）。",
+        asar.display(),
+        asar.display()
+    ))
+}
+
+/// HTML 系（HTML/Electron 与 TyranoBuilder）的共用注入流程。
+fn install_html_like(root: &Path, json_path: &Path, hook_js: &str, tail_hint: &str) -> Result<String, String> {
+    let target = resolve_html_target(root)?;
+    let (map, total, skipped) = load_map(json_path)?;
+    let json_text =
+        serde_json::to_string_pretty(&serde_json::Value::Object(map)).map_err(|e| e.to_string())?;
+
+    match target {
+        // 明文 HTML：脚本与 JSON 写在入口页同目录（即游戏根）。
+        HtmlTarget::File(entry) => {
+            std::fs::write(root.join(JSON_IN_GAME), json_text).map_err(|e| format!("写入翻译 JSON 失败: {e}"))?;
+            std::fs::write(root.join(format!("{HOOK_NAME}.js")), hook_js)
+                .map_err(|e| format!("写入 Hook 失败: {e}"))?;
+
+            let html = std::fs::read_to_string(&entry).map_err(|e| format!("读取 {} 失败: {e}", entry.display()))?;
+            let (patched, changed) = with_hook_tag(&html);
+            if !changed {
+                return Ok(format!("注入已更新：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}"));
+            }
+            // 首次注入前备份入口 HTML（已存在则保留，绝不覆盖）
+            crate::settings::backup_once(&entry).map_err(|e| format!("备份入口 HTML 失败: {e}"))?;
+            std::fs::write(&entry, patched).map_err(|e| format!("写入入口 HTML 失败: {e}"))?;
+            Ok(format!("注入完成：{total} 条翻译（{skipped} 条空译文跳过）。{tail_hint}"))
+        }
+        // Electron：入口页与脚本都必须落在 asar 内 —— 页面是从 asar 加载的，
+        // 脚本和 JSON 放游戏根它一个也读不到。
+        HtmlTarget::Asar { asar, entry } => {
+            install_into_asar(&asar, &entry, json_text, hook_js, total, skipped, tail_hint)
+        }
+    }
 }
 
 /// 卸载：还原入口 HTML，删除 Hook 与翻译 JSON。
 pub fn uninstall_html(root: &Path) -> Result<String, String> {
-    let entry = html_entry(root).ok_or("未找到入口 HTML")?;
-    let bak = crate::settings::backup_path_for(&entry);
-    let mut msgs: Vec<String> = Vec::new();
-    if bak.exists() {
-        let orig = std::fs::read_to_string(&bak).map_err(|e| format!("读取备份失败: {e}"))?;
-        std::fs::write(&entry, orig).map_err(|e| format!("还原入口 HTML 失败: {e}"))?;
-        std::fs::remove_file(&bak).map_err(|e| format!("删除备份失败: {e}"))?;
-        msgs.push("已从备份还原入口 HTML".into());
-    } else if let Ok(html) = std::fs::read_to_string(&entry) {
-        let tag = format!("<script src=\"{HOOK_NAME}.js\"></script>");
-        let cleaned = html.replace(&tag, "");
-        std::fs::write(&entry, cleaned).map_err(|e| format!("写入入口 HTML 失败: {e}"))?;
-        msgs.push("已移除脚本标签".into());
-    }
-    for p in [root.join(format!("{HOOK_NAME}.js")), root.join(JSON_IN_GAME)] {
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
+    let target = resolve_html_target(root).map_err(|e| format!("{e}（无法定位注入痕迹，可能本来就未注入）"))?;
+    match target {
+        HtmlTarget::Asar { asar, .. } => {
+            // asar 只增不减，没法「删掉两个条目」还原；但首次注入前整文件备份过，
+            // 直接拷回去是**字节级还原**，也符合「还原到注入前」的语义。
+            let bak = crate::settings::backup_path_for(&asar);
+            if !bak.exists() {
+                return Err(format!(
+                    "未找到 Electron 封包的备份（{}），无法字节级还原。\
+                     若确实要丢弃注入，可手动处理 asar 内的 {HOOK_NAME}.js 与 {JSON_IN_GAME}。",
+                    bak.display()
+                ));
+            }
+            std::fs::copy(&bak, &asar).map_err(|e| format!("还原 asar 失败: {e}"))?;
+            std::fs::remove_file(&bak).map_err(|e| format!("删除备份失败: {e}"))?;
+            Ok("已从备份还原 Electron 封包（asar），注入痕迹全部消失。重启游戏生效。".into())
         }
-    }
-    if msgs.is_empty() {
-        Ok("本来就未注入".into())
-    } else {
-        Ok(format!("{}。刷新/重启游戏生效。", msgs.join("；")))
+        HtmlTarget::File(entry) => {
+            let dir = entry.parent().unwrap_or(root).to_path_buf();
+            let bak = crate::settings::backup_path_for(&entry);
+            let mut msgs: Vec<String> = Vec::new();
+            if bak.exists() {
+                let orig = std::fs::read_to_string(&bak).map_err(|e| format!("读取备份失败: {e}"))?;
+                std::fs::write(&entry, orig).map_err(|e| format!("还原入口 HTML 失败: {e}"))?;
+                std::fs::remove_file(&bak).map_err(|e| format!("删除备份失败: {e}"))?;
+                msgs.push("已从备份还原入口 HTML".into());
+            } else if let Ok(html) = std::fs::read_to_string(&entry) {
+                let tag = format!("<script src=\"{HOOK_NAME}.js\"></script>");
+                let cleaned = html.replace(&tag, "");
+                std::fs::write(&entry, cleaned).map_err(|e| format!("写入入口 HTML 失败: {e}"))?;
+                msgs.push("已移除脚本标签".into());
+            }
+            for p in [dir.join(format!("{HOOK_NAME}.js")), dir.join(JSON_IN_GAME)] {
+                if p.exists() {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+            if msgs.is_empty() {
+                Ok("本来就未注入".into())
+            } else {
+                Ok(format!("{}。刷新/重启游戏生效。", msgs.join("；")))
+            }
+        }
     }
 }
 
 /// 游戏端 Hook 插件（由 Rust 端原样写入 js/plugins/stool_translate.js）。
-const HOOK_JS: &str = r#"/* STool 运行时汉化注入（MTool 式）—— 由 STool 自动生成，请勿手改
- * 读取顺序：<游戏目录>/stool_translate.json → translation.json
- * 格式：{ "原文": "译文" }（也允许分组嵌套，加载时自动拍平）
- * 规则：整句优先；整句没命中时再做「最长片段」贪心替换（与 MTool 同款，因为表里有上千条
- *      片段键，如「は防御の構えを取った！」「のダメージを受けた！」）；都没命中就保留原文。
- *      不修改任何游戏文件。
- *      —— 只替换「给人看的文字」：数据库/地图里的普通字符串 + 事件指令的文字参数（白名单）。
- *      —— 资源名字段（title1Name/faceName/*Name、音频描述符的 name）与路径/备注一律跳过，
- *         否则引擎会按中文名去找图片音频（典型报错 Failed to load img/titles1/中文名.png）。
- */
-(function () {
-    "use strict";
-    var MAP = null;
-
-    function flatten(obj, out) {
-        out = out || {};
-        for (var k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-            var v = obj[k];
-            if (v && typeof v === "object") flatten(v, out);
-            else if (typeof v === "string") out[k] = v;
-        }
-        return out;
-    }
-
-    function parseJsonText(txt) {
-        try { return flatten(JSON.parse(txt.replace(/^\uFEFF/, ""))); } catch (e) { return null; }
-    }
-
-    function loadMap() {
-        var files = ["stool_translate.json", "translation.json"];
-        try {
-            if (typeof require === "function" && typeof process !== "undefined" &&
-                process.versions && process.versions.node && typeof location !== "undefined") {
-                var fs = require("fs");
-                var p = require("path");
-                var root = decodeURIComponent(location.pathname).replace(/\\/g, "/");
-                root = root.slice(0, root.lastIndexOf("/"));
-                if (/^\/[A-Za-z]:/.test(root)) root = root.slice(1); // Windows 下 XHR 风格路径去掉开头斜杠
-                for (var i = 0; i < files.length; i++) {
-                    var f = p.join(root, files[i]);
-                    if (fs.existsSync(f)) {
-                        MAP = parseJsonText(fs.readFileSync(f, "utf8"));
-                        if (MAP) { console.log("[STool] 汉化映射已加载: " + files[i] + " (" + Object.keys(MAP).length + " 条)"); return; }
-                    }
-                }
-            }
-        } catch (e) { console.warn("[STool] 本地读取失败，改用 XHR", e); }
-        for (var j = 0; j < files.length; j++) {
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open("GET", files[j], false);
-                xhr.overrideMimeType("application/json");
-                xhr.send(null);
-                if (xhr.status === 200 || (xhr.status === 0 && xhr.responseText)) {
-                    MAP = parseJsonText(xhr.responseText);
-                    if (MAP) { console.log("[STool] 汉化映射已加载(XHR): " + files[j]); return; }
-                }
-            } catch (e2) { /* 忽略，试下一个 */ }
-        }
-        console.warn("[STool] 未找到翻译 JSON，本次运行不做替换");
-    }
-
-    // ---- 替换规则：整句优先 → 未命中再做「最长片段」贪心替换 -------------------
-    // 为什么需要子串：MTool 的表里有上千条「片段键」（は防御の構えを取った！ / のダメージを受けた！ /
-    // おっぱいですよ」 …），是给「角色名/数字 + 模板」拼出来的句子用的。只做整句匹配的话，
-    // 「SHUは防御の構えを取った！」「\v[61]ダメージを受けた！」这类一句都命中不了（等于整段漏掉）。
-    var TRIE = null;       // 翻译表的前缀树。贪心取最长片段靠它，别退回「逐位×每种键长」的写法
-    var TRIE_END = "\u0000"; // 节点上存译文的键（正文不会含 NUL）
-    var MIN_FRAG = 2;      // 片段最短长度。1 字键会把整段文本改烂，永不参与子串替换
-    var CACHE = Object.create(null); // 输入 → 输出。drawText 每帧重复率高，缓存是性能关键
-    var CACHE_N = 0;
-    var CACHE_MAX = 8192;
-
-    function buildTrie() {
-        var root = {};
-        for (var k in MAP) {
-            if (k.length < MIN_FRAG) continue;
-            var v = MAP[k];
-            if (typeof v !== "string" || v.length === 0) continue;
-            var node = root;
-            for (var i = 0; i < k.length; i++) {
-                var c = k.charAt(i);
-                node = node[c] || (node[c] = {});
-            }
-            node[TRIE_END] = v;
-        }
-        TRIE = root;
-    }
-
-    // 从左到右，每个起点沿 Trie 走到走不动为止，取「命中的最长前缀」。
-    // 一趟走下来只按实际字符推进，不做任何子串分配 —— 早先用「按长度降序逐个 substr 试」
-    // 的写法，实测 2.2ms/串，一屏几百次 drawText 直接把游戏拖垮。
-    function subst(s) {
-        if (!TRIE) return s;
-        var out = "", i = 0, n = s.length;
-        while (i < n) {
-            var node = TRIE, best = null, bestLen = 0;
-            for (var j = i; j < n; j++) {
-                node = node[s.charAt(j)];
-                if (!node) break;
-                var v = node[TRIE_END];
-                if (typeof v === "string") { best = v; bestLen = j - i + 1; }
-            }
-            if (best !== null) { out += best; i += bestLen; }
-            else { out += s.charAt(i); i++; }
-        }
-        return out;
-    }
-
-    function tr(s) {
-        if (!MAP || typeof s !== "string" || s === "") return s;
-        var m = MAP[s];
-        if (typeof m === "string" && m.length > 0) return m; // 整句命中：最准，直接用
-        if (!TRIE) return s;
-        var c = CACHE[s];
-        if (typeof c === "string") return c;
-        var out = subst(s);
-        if (CACHE_N >= CACHE_MAX) { CACHE = Object.create(null); CACHE_N = 0; }
-        CACHE[s] = out;
-        CACHE_N++;
-        return out;
-    }
-
-    // 这些字段存的是「资源文件名」或「引擎/插件备注」——把译文写回去会让引擎按中文名去找
-    // 图片/音频，直接报 "Failed to load img/xxx/中文名.png"。翻译表里的原文常与资源名同形
-    // （本游戏实测 158 个：タイトル画面 / スチル1 / ガーデン・シティ_2 ...），所以按字段跳过。
-    var SKIP_KEYS = {
-        characterName: 1, faceName: 1, battlerName: 1, note: 1, meta: 1,
-        title1Name: 1, title2Name: 1,
-        battleback1Name: 1, battleback2Name: 1,
-        parallaxName: 1, tilesetName: 1, animationName: 1
-    };
-    function looksLikePath(s) {
-        return /[\/\\]/.test(s) ||
-            /\.(png|ogg|m4a|wav|mp3|jpg|jpeg|webp|json|txt|rvdata2?|rpgmvp|rpgmvo|rpgmvm|exe)$/i.test(s);
-    }
-    // 音频描述符 {name, volume, pitch, pan}：这里的 name 是音频文件名（$dataSystem.titleBgm 等）
-    function isSoundDescriptor(o) {
-        return !Array.isArray(o) && typeof o.name === "string" && typeof o.volume === "number";
-    }
-
-    // 事件指令「参数位 → 给人看的文字」白名单。**没列到的一律不动**，这样
-    // 显示图片(231/232)、播放音频(241/245/249/250)、更换战斗背景(132)、更换角色图像(236)、
-    // 脚本(355/655)、注释(108/408) 这些携带资源名或代码的指令就不会被改坏。
-    var TEXT_PARAM = {
-        101: [4], // 显示文字：说话人姓名（[0] 是头像文件名，不能动）
-        102: [0], // 显示选项：选项文本数组
-        401: [0], // 显示文字：正文行
-        402: [0], // 当[选项]：分支标题要跟选项一起变
-        405: [0], // 显示滚动文字：正文行
-        320: [1], // 更改姓名
-        324: [1], // 更改称号
-        325: [1]  // 更改简介
-    };
-    function applyTextParams(cmd) {
-        var idx = TEXT_PARAM[cmd.code];
-        if (!idx) return;
-        var ps = cmd.parameters;
-        if (!Array.isArray(ps)) return;
-        for (var i = 0; i < idx.length; i++) {
-            var v = ps[idx[i]];
-            if (typeof v === "string") ps[idx[i]] = tr(v);
-            else if (Array.isArray(v)) {
-                for (var j = 0; j < v.length; j++) if (typeof v[j] === "string") v[j] = tr(v[j]);
-            }
-        }
-    }
-
-    function walk(v, depth, seen) {
-        if (depth > 8 || !v || typeof v !== "object") return;
-        for (var i = 0; i < seen.length; i++) if (seen[i] === v) return; // 循环引用保护
-        seen.push(v);
-        if (Array.isArray(v)) {
-            for (var a = 0; a < v.length; a++) {
-                var e = v[a];
-                if (e && typeof e === "object") walk(e, depth + 1, seen);
-                else if (typeof e === "string") v[a] = tr(e);
-            }
-        } else if (typeof v.code === "number" && Array.isArray(v.parameters)) {
-            applyTextParams(v); // 事件指令：只碰白名单参数位
-        } else {
-            var sound = isSoundDescriptor(v);
-            for (var k in v) {
-                if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
-                if (SKIP_KEYS[k]) continue;
-                if (sound && k === "name") continue; // 音频文件名
-                var val = v[k];
-                if (val && typeof val === "object") walk(val, depth + 1, seen);
-                else if (typeof val === "string" && !looksLikePath(val)) v[k] = tr(val);
-            }
-        }
-        seen.pop();
-    }
-
-    function walkDatabase() {
-        var names = ["$dataActors", "$dataClasses", "$dataSkills", "$dataItems", "$dataWeapons",
-            "$dataArmors", "$dataEnemies", "$dataTroops", "$dataStates", "$dataSystem",
-            "$dataMapInfos", "$dataCommonEvents"];
-        for (var i = 0; i < names.length; i++) {
-            var d = window[names[i]];
-            if (d) walk(d, 0, []);
-        }
-    }
-
-    function installDataHooks() {
-        // Scene_Boot.start 时全部数据库已加载（MV/MZ 一致）
-        if (typeof Scene_Boot !== "undefined" && Scene_Boot.prototype && Scene_Boot.prototype.start) {
-            var _sb = Scene_Boot.prototype.start;
-            Scene_Boot.prototype.start = function () {
-                var r = _sb.apply(this, arguments);
-                try { walkDatabase(); } catch (e) { console.warn("[STool] 数据库替换出错", e); }
-                return r;
-            };
-        }
-        // 每张地图的事件文本（对话 401 / 选项 102 / 显示滚动文字等）
-        if (typeof Scene_Map !== "undefined" && Scene_Map.prototype && Scene_Map.prototype.start) {
-            var _sms = Scene_Map.prototype.start;
-            Scene_Map.prototype.start = function () {
-                var r = _sms.apply(this, arguments);
-                try { if (typeof $dataMap !== "undefined" && $dataMap) walk($dataMap, 0, []); } catch (e) {}
-                return r;
-            };
-        }
-    }
-
-    // 动态文本（脚本临时拼出来的对话等）显示层兜底；MV/MZ 同签名，改 arguments[0] 即可
-    // 显示层兜底：动态拼出来的文本（含 \v[n] 之类转义码展开后的结果）只能在这里拦。
-    // Window_Base 覆盖常规窗口；Bitmap.drawText 再兜最底层一层 —— DTextPicture / Text2Frame
-    // 这类「把文字直接画进位图」的插件不经过 Window_Base，只挂 Window_Base 会整片漏掉。
-    function patchDrawText(obj, name) {
-        if (!obj || typeof obj[name] !== "function") return;
-        var orig = obj[name];
-        obj[name] = function () {
-            if (arguments.length > 0) arguments[0] = tr(arguments[0]);
-            return orig.apply(this, arguments);
-        };
-    }
-
-    function installTextHooks() {
-        if (typeof Window_Base !== "undefined") {
-            patchDrawText(Window_Base.prototype, "drawText");
-            patchDrawText(Window_Base.prototype, "drawTextEx");
-        }
-        if (typeof Bitmap !== "undefined") patchDrawText(Bitmap.prototype, "drawText");
-    }
-
-    loadMap();
-    if (MAP) {
-        buildTrie(); // 片段替换用的前缀树，装钩子前必须先建好
-        if (typeof DataManager !== "undefined" || typeof Scene_Boot !== "undefined") installDataHooks();
-        installTextHooks();
-    }
-})();
-"#;
+const HOOK_JS: &str = include_str!("../../assets/hooks/mv_mz.js");
 
 /// HTML/Electron 游戏端 Hook：DOM 文本节点运行时替换（MutationObserver）。
-const HTML_HOOK_JS: &str = r#"/* STool HTML 运行时汉化注入 —— 由 STool 自动生成，请勿手改
- * 读取：<入口 HTML 同目录>/stool_translate.json（{"原文":"译文"}，允许分组嵌套）
- * 规则：整句精确匹配；未命中保留原文。注意：Canvas 画面内的文本无法替换。
- */
-(function () {
-    "use strict";
-    var MAP = null;
-
-    function flatten(obj, out) {
-        out = out || {};
-        for (var k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-            var v = obj[k];
-            if (v && typeof v === "object") flatten(v, out);
-            else if (typeof v === "string") out[k] = v;
-        }
-        return out;
-    }
-
-    function parseJsonText(txt) {
-        try { return flatten(JSON.parse(txt.replace(/^\uFEFF/, ""))); } catch (e) { return null; }
-    }
-
-    function loadMap() {
-        var files = ["stool_translate.json", "translation.json"];
-        try {
-            if (typeof require === "function" && typeof process !== "undefined" &&
-                process.versions && process.versions.node && typeof location !== "undefined") {
-                var fs = require("fs");
-                var p = require("path");
-                var root = decodeURIComponent(location.pathname).replace(/\\/g, "/");
-                root = root.slice(0, root.lastIndexOf("/"));
-                if (/^\/[A-Za-z]:/.test(root)) root = root.slice(1);
-                for (var i = 0; i < files.length; i++) {
-                    var f = p.join(root, files[i]);
-                    if (fs.existsSync(f)) {
-                        MAP = parseJsonText(fs.readFileSync(f, "utf8"));
-                        if (MAP) { console.log("[STool] 汉化映射已加载: " + files[i] + " (" + Object.keys(MAP).length + " 条)"); return; }
-                    }
-                }
-            }
-        } catch (e) { /* 转XHR */ }
-        for (var j = 0; j < files.length; j++) {
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open("GET", files[j], true);
-                xhr.overrideMimeType("application/json");
-                xhr.onload = function () {
-                    if (xhr.status === 200 || (xhr.status === 0 && xhr.responseText)) {
-                        MAP = parseJsonText(xhr.responseText);
-                        if (MAP && document.readyState !== "loading") start();
-                    }
-                };
-                xhr.send(null);
-                break; // 异步只挂第一个候选，未命中就不再尝试
-            } catch (e2) { /* 忽略 */ }
-        }
-        if (!MAP) console.warn("[STool] 未找到翻译 JSON，本次运行不做替换");
-    }
-
-    function tr(s) {
-        if (!MAP || typeof s !== "string") return s;
-        var m = MAP[s];
-        return (typeof m === "string" && m.length > 0) ? m : s; // 未命中 → 保留原文
-    }
-
-    function translateNode(n) {
-        var t = n.nodeValue;
-        if (typeof t !== "string" || !t.trim()) return;
-        var m = MAP[t] !== undefined ? MAP[t] : MAP[t.trim()];
-        if (typeof m === "string" && m.length > 0 && n.nodeValue !== m) n.nodeValue = m;
-    }
-
-    function walkDom(root) {
-        try {
-            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
-            var nodes = [];
-            while (walker.nextNode()) nodes.push(walker.currentNode);
-            nodes.forEach(translateNode);
-        } catch (e) { /* 忽略 */ }
-    }
-
-    function start() {
-        if (!MAP) return;
-        walkDom(document.body || document.documentElement || document);
-        var mo = new MutationObserver(function (muts) {
-            muts.forEach(function (m) {
-                if (m.type === "characterData" && m.target.nodeType === 3) translateNode(m.target);
-                m.addedNodes.forEach(function (n) {
-                    if (n.nodeType === 3) translateNode(n);
-                    else if (n.nodeType === 1) walkDom(n);
-                });
-            });
-        });
-        mo.observe(document.documentElement || document, { childList: true, subtree: true, characterData: true });
-    }
-
-    loadMap();
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", function () { start(); });
-    } else {
-        start();
-    }
-})();
-"#;
+const HTML_HOOK_JS: &str = include_str!("../../assets/hooks/html.js");
 
 /// TyranoBuilder / TyranoScript 游戏端 Hook。
 ///
@@ -832,166 +757,13 @@ const HTML_HOOK_JS: &str = r#"/* STool HTML 运行时汉化注入 —— 由 STo
 /// 1. 保留 MutationObserver 的 DOM 文本节点替换（KAG 消息最终落到 DOM，不是 Canvas）；
 /// 2. **额外**包装 jQuery 的 `$.fn.html` / `$.fn.text`，在 Tyrano 用 jQuery 写消息时做整串替换
 ///    —— 这能覆盖"整段文本被一次性 html() 写入"导致文本节点被 `<br>` 拆开、单节点匹配不中的情况；
-/// 3. 对带 `message`/`text` 类名的元素做元素级 textContent 兜底匹配。
-const TYRANO_HOOK_JS: &str = r#"/* STool TyranoBuilder 运行时汉化注入 —— 由 STool 自动生成，请勿手改
- * 读取：<index.html 同目录>/stool_translate.json（{"原文":"译文"}，允许分组嵌套）
- * 规则：整句精确匹配；未命中保留原文；不修改任何游戏文件（仅本脚本 + JSON 是新增的）。
- * 覆盖：DOM 文本节点（MutationObserver）+ jQuery html/text + message 元素 textContent。
- * 注意：Tyrano 若把文字画进 Canvas，则不在覆盖范围内。
- */
-(function () {
-    "use strict";
-    var MAP = null;
-    var DONE = false;
-
-    function flatten(obj, out) {
-        out = out || {};
-        for (var k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-            var v = obj[k];
-            if (v && typeof v === "object") flatten(v, out);
-            else if (typeof v === "string") out[k] = v;
-        }
-        return out;
-    }
-
-    function parseJsonText(txt) {
-        try { return flatten(JSON.parse(txt.replace(/^\uFEFF/, ""))); } catch (e) { return null; }
-    }
-
-    function loadMap() {
-        var files = ["stool_translate.json", "translation.json"];
-        // Electron / node 环境：直接用 fs 同步读，兼容路径里的中文
-        try {
-            if (typeof require === "function" && typeof process !== "undefined" &&
-                process.versions && process.versions.node && typeof location !== "undefined") {
-                var fs = require("fs");
-                var p = require("path");
-                var root = decodeURIComponent(location.pathname).replace(/\\/g, "/");
-                root = root.slice(0, root.lastIndexOf("/"));
-                if (/^\/[A-Za-z]:/.test(root)) root = root.slice(1);
-                for (var i = 0; i < files.length; i++) {
-                    var f = p.join(root, files[i]);
-                    if (fs.existsSync(f)) {
-                        MAP = parseJsonText(fs.readFileSync(f, "utf8"));
-                        if (MAP) { console.log("[STool] Tyrano 汉化映射已加载: " + files[i]); return; }
-                    }
-                }
-            }
-        } catch (e) { /* 转 XHR */ }
-        for (var j = 0; j < files.length; j++) {
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open("GET", files[j], false);
-                xhr.overrideMimeType("application/json");
-                xhr.send(null);
-                if (xhr.status === 200 || (xhr.status === 0 && xhr.responseText)) {
-                    MAP = parseJsonText(xhr.responseText);
-                    if (MAP) return;
-                }
-            } catch (e2) { /* 试下一个 */ }
-        }
-        if (!MAP) console.warn("[STool] 未找到翻译 JSON，本次运行不做替换");
-    }
-
-    function tr(s) {
-        if (!MAP || typeof s !== "string") return s;
-        var m = MAP[s];
-        if (typeof m === "string" && m.length > 0) return m;
-        var t = s.trim();
-        if (t !== s) {
-            var m2 = MAP[t];
-            if (typeof m2 === "string" && m2.length > 0) return m2;
-        }
-        return s;
-    }
-
-    // ---- 1) DOM 文本节点 ----
-
-    function translateNode(n) {
-        var t = n.nodeValue;
-        if (typeof t !== "string" || !t.trim()) return;
-        var m = tr(t);
-        if (m !== t) n.nodeValue = m;
-    }
-
-    function walkDom(root) {
-        if (!root) return;
-        try {
-            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
-            var nodes = [];
-            while (walker.nextNode()) nodes.push(walker.currentNode);
-            nodes.forEach(translateNode);
-        } catch (e) { /* 忽略 */ }
-    }
-
-    // ---- 2) message 元素级兜底（文本被 <br> 拆成多节点时） ----
-
-    function translateElem(el) {
-        if (!el || el.nodeType !== 1) return;
-        var cls = (el.className && typeof el.className === "string") ? el.className : "";
-        if (!/(^|\s|-)(message|text|name|serif|glink|tyrano)(\s|-|$)/i.test(cls)) return;
-        var t = el.textContent;
-        if (typeof t !== "string" || !t.trim()) return;
-        var m = tr(t);
-        if (m !== t) el.textContent = m;
-    }
-
-    function walkElems(root) {
-        if (!root || root.nodeType !== 1) return;
-        var list = root.querySelectorAll ? root.querySelectorAll(".message,[class*=message]") : [];
-        for (var i = 0; i < list.length; i++) translateElem(list[i]);
-    }
-
-    // ---- 3) jQuery html/text 包装（Tyrano KAG 写消息的主通道） ----
-
-    function installJqHook() {
-        if (typeof window.jQuery !== "function") return;
-        var fn = window.jQuery.fn;
-        ["html", "text"].forEach(function (name) {
-            if (typeof fn[name] !== "function" || fn[name].__stool) return;
-            var orig = fn[name];
-            var wrapped = function (v) {
-                // 只有"写入"（带参数）且是字符串时才尝试替换；读取原样透传
-                if (arguments.length > 0 && typeof v === "string") {
-                    var m = tr(v);
-                    if (m !== v) arguments[0] = m;
-                }
-                return orig.apply(this, arguments);
-            };
-            wrapped.__stool = true;
-            fn[name] = wrapped;
-        });
-    }
-
-    function start() {
-        if (DONE || !MAP) return;
-        DONE = true;
-        walkDom(document.body || document.documentElement || document);
-        walkElems(document.body || document.documentElement || document);
-        var mo = new MutationObserver(function (muts) {
-            muts.forEach(function (m) {
-                if (m.type === "characterData" && m.target.nodeType === 3) translateNode(m.target);
-                m.addedNodes.forEach(function (n) {
-                    if (n.nodeType === 3) translateNode(n);
-                    else if (n.nodeType === 1) { walkDom(n); walkElems(n); }
-                });
-            });
-        });
-        mo.observe(document.documentElement || document, { childList: true, subtree: true, characterData: true });
-    }
-
-    loadMap();
-    // jQuery 可能比本脚本晚加载（脚本顺序不保证），DOMContentLoaded 再补挂一次
-    installJqHook();
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", function () { installJqHook(); start(); });
-    } else {
-        installJqHook();
-        start();
-    }
-})();
-"#;
+/// 3. 对带 `message`/`text` 类名的元素做元素级 textContent 兜底匹配；
+/// 4. **额外**接管 `tyrano.plugin.kag.tag.text.buildMessageHTML`（TyranoScript v6 的正文入口）。
+///    v6 会把整行明文逐字包成 `<span class="char">`，DOM 里每个文本节点只剩一个字，
+///    前三招**全都失效**（实测：角色名翻得出、正文一片日文）。第 4 招把译文按整行替换后
+///    仍交给 Tyrano 自己逐字渲染，打字动画/换行/描边/ruby 全部保留。
+///    HTML Hook 里也带了同一份（asar 打包的 Tyrano 游戏按 `html_game` 处理，拿不到本 Hook）。
+const TYRANO_HOOK_JS: &str = include_str!("../../assets/hooks/tyrano.js");
 
 /// 从文本提取的 CSV 生成注入 JSON 骨架（注入 JSON 的"原文"来源）：
 /// 键 = CSV 的 source 列原文；值 = 已有译文（translation 列非空时带入），否则留空串待机翻。
@@ -1031,6 +803,39 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "// Generated by RPG Maker.\n// Do not edit this file directly.\nvar $plugins =\n[\n    {\"name\":\"Core\",\"status\":true,\"description\":\"Core\",\"parameters\":{}},\n    {\"name\":\"MadeWithMv\",\"status\":true,\"description\":\"x\",\"parameters\":{}}\n];\n";
+
+    /// hook 现在是**真 .js 文件**（`assets/hooks/`，由 `include_str!` 内嵌），所以可以做
+    /// **真语法校验**——这在它还是 `const HOOK_JS: &str = r#"..."#` 时做不到（不能 lint、
+    /// 不能单独跑，只能断言几个源码子串；少个括号 / 字符串没闭合，要等真机注入才暴露）。
+    /// 单机快回路是 `node scripts/check_hooks.cjs`（~50ms）；这里给 `cargo test` 兜底，
+    /// 免得有人绕过脚本直接跑测试。找不到 node 就**显式跳过**（不静默当通过）。
+    #[test]
+    fn hook_js_files_pass_node_syntax_check() {
+        let node = std::env::var("STOOL_NODE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "node".to_string());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("hooks");
+        for name in ["mv_mz.js", "html.js", "tyrano.js"] {
+            let path = dir.join(name);
+            assert!(path.is_file(), "hook 源文件缺失: {}", path.display());
+            let out = match std::process::Command::new(&node).arg("--check").arg(&path).output() {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!(
+                        "[skip] hook 语法校验：执行 `{node}` 失败（{e}）。\
+                         指定解释器：STOOL_NODE=<node 的绝对路径>"
+                    );
+                    return;
+                }
+            };
+            assert!(
+                out.status.success(),
+                "`node --check {name}` 未通过：\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 
     #[test]
     fn test_patch_plugins_js() {
@@ -1136,6 +941,25 @@ mod tests {
         // 显示层：Window_Base 三个 + Bitmap 一层
         assert!(HOOK_JS.contains(r#"patchDrawText(Window_Base.prototype, "drawTextEx")"#));
         assert!(HOOK_JS.contains(r#"patchDrawText(Bitmap.prototype, "drawText")"#));
+    }
+
+    /// 回归锁：TyranoScript v6 的正文是「逐字 span」，节点级匹配永远命中不了，
+    /// 必须靠接管 `buildMessageHTML`（明文入口）。**两份 hook 都要带**，别只补一份。
+    ///
+    /// 背景（实测 bug）：asar 打包的 Tyrano 游戏（NTRdemic）注入后角色名翻成中文、
+    /// 正文全是日文 —— 因为 v6 把每个字包成 `<span class="char">`，每个文本节点只剩一个字。
+    #[test]
+    fn test_tyrano_v6_seam_in_both_hooks() {
+        for (name, js) in [("HTML_HOOK_JS", HTML_HOOK_JS), ("TYRANO_HOOK_JS", TYRANO_HOOK_JS)] {
+            assert!(js.contains("buildMessageHTML"), "{name} 缺少 v6 正文入口接管");
+            assert!(js.contains("__stool"), "{name} 缺少防重复包装标记");
+            assert!(
+                js.contains("TY.plugin.kag.tag.text"),
+                "{name} 缺少 tyrano.plugin.kag.tag.text 定位（否则非 Tyrano 页面会误判）"
+            );
+            // 定义了还要真的调用，否则等于没写
+            assert!(js.contains("pollTyranoSeam()"), "{name} 定义了轮询却没调用");
+        }
     }
 
     #[test]
@@ -1312,5 +1136,204 @@ mod tests {
         assert!(is_supported("tyrano") && is_supported("renpy"));
         // 封包型引擎明确不在注入范围内
         assert!(!is_supported("kirikiri") && !is_supported("rpgmaker_rgss"));
+    }
+}
+
+#[cfg(test)]
+mod tests_html_target {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("stool_inject_html_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Electron 包在根目录放的 `LICENSES.chromium.html` 必须被判为非入口。
+    #[test]
+    fn test_is_non_entry_html_name() {
+        for bad in ["LICENSES.chromium.html", "license.html", "third_party.html", "README.html", "changelog.htm"] {
+            assert!(is_non_entry_html_name(bad), "{bad} 应判为非入口");
+        }
+        for ok in ["index.html", "game.html", "main.htm"] {
+            assert!(!is_non_entry_html_name(ok), "{ok} 不该判为非入口");
+        }
+    }
+
+    /// 许可证页没有 `<script>`，据此不能当入口。
+    #[test]
+    fn test_looks_like_entry_html() {
+        assert!(!looks_like_entry_html("<html><body><span>Credits</span></body></html>"));
+        assert!(looks_like_entry_html("<html><body><script src=\"a.js\"></script></body></html>"));
+    }
+
+    #[test]
+    fn test_with_hook_tag_idempotent() {
+        let (p, changed) = with_hook_tag("<html><body>hi</body></html>");
+        assert!(changed && p.contains("stool_translate.js"));
+        assert!(p.find("stool_translate.js").unwrap() < p.find("</body>").unwrap(), "标签应在 </body> 之前");
+        let (p2, changed2) = with_hook_tag(&p);
+        assert!(!changed2, "已挂过就不该再改");
+        assert_eq!(p, p2);
+    }
+
+    /// 有 asar 时不能被根目录的许可证 HTML 抢走 —— 这正是线上那个 bug。
+    #[test]
+    fn test_resolve_prefers_asar_over_license_html() {
+        let g = tmpdir("prefer_asar");
+        std::fs::write(g.join("LICENSES.chromium.html"), "<html><body>Credits</body></html>").unwrap();
+        let src = g.join("app_src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("index.html"), "<html><body><script src=\"x.js\"></script></body></html>").unwrap();
+        std::fs::create_dir_all(g.join("resources")).unwrap();
+        crate::formats::asar::pack(&src, &g.join("resources/app.asar")).unwrap();
+
+        match resolve_html_target(&g).unwrap() {
+            HtmlTarget::Asar { entry, .. } => assert_eq!(entry, "index.html"),
+            HtmlTarget::File(p) => panic!("应选 asar 内的入口，却选了 {}", p.display()),
+        }
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    /// 只有许可证 HTML、没有 asar → 必须报错，不能随便挑个文件就注入。
+    #[test]
+    fn test_resolve_rejects_license_only() {
+        let g = tmpdir("license_only");
+        std::fs::write(g.join("LICENSES.chromium.html"), "<html><body>Credits</body></html>").unwrap();
+        let e = resolve_html_target(&g).unwrap_err();
+        assert!(e.contains("未找到入口 HTML"), "{e}");
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    /// 明文 HTML 游戏（根目录就有 index.html）走老路径，不受影响。
+    #[test]
+    fn test_resolve_plain_index() {
+        let g = tmpdir("plain");
+        std::fs::write(g.join("index.html"), "<html><body><script src=\"a.js\"></script></body></html>").unwrap();
+        match resolve_html_target(&g).unwrap() {
+            HtmlTarget::File(p) => assert_eq!(p, g.join("index.html")),
+            HtmlTarget::Asar { .. } => panic!("无 asar 时不该走 asar 分支"),
+        }
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    /// 端到端：注入 asar → 新档案可读、原条目字节不变、幂等、可一键还原。
+    #[test]
+    fn test_install_and_uninstall_into_asar() {
+        let g = tmpdir("asar_e2e");
+        let src = g.join("app_src");
+        std::fs::create_dir_all(src.join("data")).unwrap();
+        std::fs::write(src.join("index.html"), "<html><body><script src=\"boot.js\"></script></body></html>").unwrap();
+        std::fs::write(src.join("data/blob.bin"), vec![9u8; 700]).unwrap();
+        std::fs::create_dir_all(g.join("resources")).unwrap();
+        let asar = g.join("resources/app.asar");
+        crate::formats::asar::pack(&src, &asar).unwrap();
+        let before = std::fs::read(&asar).unwrap();
+
+        let map = g.join("tr.json");
+        std::fs::write(&map, r#"{"こんにちは":"你好"}"#).unwrap();
+        let msg = install_html(&g, &map).unwrap();
+        assert!(msg.contains("注入完成"), "{msg}");
+        assert!(std::fs::metadata(format!("{}.stool.bak", asar.display())).is_ok(), "首次注入应留下备份");
+
+        // 新 asar：4 个条目；入口页挂上标签；未打补丁的条目逐字节不变
+        let data = std::fs::read(&asar).unwrap();
+        let (files, ds) = crate::formats::asar::parse_bytes(&data).unwrap();
+        assert_eq!(files.len(), 4);
+        let html = String::from_utf8(crate::formats::asar::read_file(&data, ds, &files["index.html"]).unwrap()).unwrap();
+        assert!(html.contains("stool_translate.js"));
+        assert_eq!(crate::formats::asar::read_file(&data, ds, &files["data/blob.bin"]).unwrap(), vec![9u8; 700]);
+        assert!(files.contains_key("stool_translate.js") && files.contains_key("stool_translate.json"));
+
+        let st = status(&g, "html_game");
+        assert!(st.installed, "应报「已注入」");
+        assert_eq!(st.entries, 1);
+
+        // 幂等：再注入一次，标签不重复
+        install_html(&g, &map).unwrap();
+        let data2 = std::fs::read(&asar).unwrap();
+        let (f2, ds2) = crate::formats::asar::parse_bytes(&data2).unwrap();
+        let h2 = String::from_utf8(crate::formats::asar::read_file(&data2, ds2, &f2["index.html"]).unwrap()).unwrap();
+        assert_eq!(h2.matches("stool_translate.js").count(), 1, "脚本标签不该重复：{h2}");
+        // 幂等还要求**不重复追加载荷**：条目数不变、文件不涨。
+        // 曾经的 bug：重复注入把整份 payload 再贴一遍（实测第二次多涨 415 KB），旧副本变成
+        // 无人引用的孤儿字节 → 数据区出现空洞 → **第三次注入直接报「数据区不连续」**。
+        assert_eq!(f2.len(), 4, "重复注入不该新增条目");
+        assert_eq!(data2.len(), data.len(), "重复注入不该让 asar 变大");
+
+        // 还原：asar 逐字节回到注入前
+        uninstall_html(&g).unwrap();
+        assert_eq!(std::fs::read(&asar).unwrap(), before, "还原后应与注入前逐字节一致");
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    /// TyranoScript 被 Electron 打进 asar 的注入/还原：根目录**没有** `tyrano/`，只能在包内看见。
+    ///
+    /// 这是「引擎身份」修复后的关键路径 —— 检测靠包内 `tyrano/` 认出它是 Tyrano（而不是
+    /// `html_game`），注入也随之放行（旧实现硬要求磁盘上有 `tyrano/` 目录，会直接报错）。
+    #[test]
+    fn test_install_tyrano_into_asar() {
+        let g = tmpdir("asar_tyrano");
+        let src = g.join("app_src");
+        std::fs::create_dir_all(src.join("tyrano").join("plugins").join("kag")).unwrap();
+        std::fs::create_dir_all(src.join("data").join("scenario")).unwrap();
+        std::fs::write(src.join("index.html"), "<html><body><script src=\"tyrano/tyrano.js\"></script></body></html>").unwrap();
+        std::fs::write(src.join("tyrano").join("tyrano.js"), "/* tyrano runtime */").unwrap();
+        std::fs::write(src.join("tyrano").join("plugins").join("kag").join("kag.tag.js"), "var x=1;").unwrap();
+        std::fs::write(src.join("data").join("scenario").join("a.ks"), "[scene]\nこんにちは").unwrap();
+        std::fs::create_dir_all(g.join("resources")).unwrap();
+        let asar = g.join("resources/app.asar");
+        crate::formats::asar::pack(&src, &asar).unwrap();
+        let before = std::fs::read(&asar).unwrap();
+
+        // 磁盘上没有 tyrano/，但包内有 → 注入应放行
+        assert!(!g.join("tyrano").is_dir(), "本用例刻意不给磁盘上的 tyrano/");
+
+        let map = g.join("tr.json");
+        std::fs::write(&map, r#"{"こんにちは":"你好"}"#).unwrap();
+        let msg = install_tyrano(&g, &map).unwrap();
+        assert!(msg.contains("注入完成"), "{msg}");
+
+        let data = std::fs::read(&asar).unwrap();
+        let (files, ds) = crate::formats::asar::parse_bytes(&data).unwrap();
+        let hook = crate::formats::asar::read_file(&data, ds, &files["stool_translate.js"]).unwrap();
+        // 不变量：asar 打包下两条路线**产出完全一致**（同一管道 + 同一份 hook）。
+        // 这条不变量就是「修正引擎标签不能改变已注入游戏的字节」的保险 ——
+        // 已验证可用的那份 hook 没被换掉，换的只是检测结果里的引擎名。
+        assert_eq!(hook, HTML_HOOK_JS.as_bytes(), "asar 路线应与 html 路线写入同一份 hook");
+        assert!(
+            String::from_utf8_lossy(&hook).contains("已接管 TyranoScript 逐字文本管线"),
+            "该 hook 必须含 Tyrano v6 逐字正文接缝"
+        );
+        let html = String::from_utf8(
+            crate::formats::asar::read_file(&data, ds, &files["index.html"]).unwrap(),
+        )
+        .unwrap();
+        assert!(html.contains("stool_translate.js"), "入口页应挂上脚本标签：{html}");
+        assert_eq!(status(&g, "tyrano").entries, 1);
+
+        // 卸载：这条路线与 html_game 共用同一份 asar 还原（备份整包拷回）
+        uninstall(&g, "tyrano").unwrap();
+        assert_eq!(std::fs::read(&asar).unwrap(), before, "还原后应与注入前逐字节一致");
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    /// 反例：磁盘上既没有 tyrano/，包内也没有 → 必须报错并给出改法，不能静默乱注。
+    #[test]
+    fn test_install_tyrano_refuses_without_any_tyrano() {
+        let g = tmpdir("asar_notyrano");
+        std::fs::create_dir_all(g.join("resources")).unwrap();
+        let src = g.join("app_src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("index.html"), "<html></html>").unwrap();
+        crate::formats::asar::pack(&src, &g.join("resources/app.asar")).unwrap();
+
+        let map = g.join("tr.json");
+        std::fs::write(&map, r#"{"a":"b"}"#).unwrap();
+        let e = install_tyrano(&g, &map).unwrap_err();
+        assert!(e.contains("tyrano/"), "错误应说清缺什么：{e}");
+        assert!(!g.join("resources/app.asar.stool.bak").exists(), "报错时不该留下备份/改动");
+        let _ = std::fs::remove_dir_all(&g);
     }
 }
