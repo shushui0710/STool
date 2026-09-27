@@ -96,7 +96,7 @@ impl Engine for ArtemisPlugin {
             let split = list_split_pfs(ctx.root);
             if !split.is_empty() {
                 return OpOutcome::fail(format!(
-                    "只发现 Artemis **分卷**封包（{}），STool 暂不支持分卷拼接。\
+                    "只发现 Artemis「分卷」封包（{}），STool 暂不支持分卷拼接。\
                      替代做法：用 GARbro 打开第一个分卷（如 x.pfs.000）导出，或找有现成解包工具的版本。",
                     super::others::file_name(&split[0])
                 ));

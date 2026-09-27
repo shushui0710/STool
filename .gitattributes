@@ -1,0 +1,10 @@
+# 存档固件是**逐字节敏感**的二进制：绝不能做任何行尾转换。
+#
+# 为什么非加不可（2026-09-27 实测）：MZ 的 `.rmmzsave` 在磁盘上带一层 UTF-8 包装，
+# 字节序列常常**恰好是合法 UTF-8**，于是 git 把它误判成文本。而仓库开了
+# `core.autocrlf=true`，checkout 时会把文件里**孤立的 0x0A** 变成 `0D 0A`
+# （实测 `tests/fixtures/mz_save/shared.rmmzsave`：147 字节里 `0D`/`0A` 各一个、不相邻）
+# —— 多一个字节，固件就不是真机那个文件了，`mz_unwrap` 的回归用例会在别人机器上假失败。
+*.rmmzsave binary
+*.rmzsave  binary
+*.rpgsave  binary

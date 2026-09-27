@@ -31,6 +31,67 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+/// 从这一版 NW.js 起，`--remote-debugging-port` **完全开不出端口**（含）。
+///
+/// 上游缺陷：<https://github.com/nwjs/nw.js/issues/8191> —— 0.49.0 正常，
+/// 0.70.0 / 0.85.0 / 0.88.0 全部打不开（**SDK 版同样挂**，所以不是"免费版没带 DevTools"）。
+/// 本机实测（2026-09-27，`verify/nwprobe076` vs `verify/nwprobe_run`）也与之一致：
+/// 0.76.1 无论把参数放命令行、加 `--user-data-dir`、还是写进 `chromium-args`，端口都不开；
+/// 同一装置换 0.48.4 就正常。**所以这不是启动姿势的问题，换任何写法都救不了。**
+const NWJS_BAD_REMOTE_DEBUG_FROM: (u32, u32) = (0, 70);
+
+/// 读游戏目录里 NW.js 运行时的版本（`nw.dll` / `Game.exe` / `nw.exe` 的版本资源）。
+///
+/// `None` = 认不出（不是 NW.js，或读不到版本资源）。**只在连接失败后才调用**，
+/// 不在扫描路径上（那里有"零额外 IO"的硬规矩）。
+pub fn nwjs_version(root: &Path) -> Option<(u32, u32, u32)> {
+    for name in ["nw.dll", "Game.exe", "nw.exe"] {
+        let p = root.join(name);
+        if !p.is_file() {
+            continue;
+        }
+        if let Some(v) = crate::formats::pe::version_info(&p) {
+            if let Some(t) = v
+                .product_version
+                .or(v.file_version)
+                .as_deref()
+                .and_then(crate::formats::pe::parse_triple)
+            {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// 连接失败时的说明文案。
+///
+/// 分两种情形，**别混成一段话**：命中 ≥ 0.70 时那句"用本页的「启动并连接」再试一次"
+/// 是**误导** —— 用户会把同一件事重试到死。此时必须直说上游坏了，并给真出路。
+fn connect_failure_hint(port: u16, last_err: &str, ver: Option<(u32, u32, u32)>) -> String {
+    let mut s = format!("连接调试端口 {port} 失败：{last_err}\n");
+    if let Some((maj, min, patch)) = ver {
+        if (maj, min) >= NWJS_BAD_REMOTE_DEBUG_FROM {
+            s.push_str(&format!(
+                "原因：这个游戏自带 NW.js {maj}.{min}.{patch}，而 NW.js 从 0.70 起就不再打开调试端口\
+                 （上游缺陷 nwjs/nw.js#8191；普通版和 SDK 版都一样）。所以本页的「启动并连接」\
+                 换什么姿势都不会成功，不是你没启动对。\n\
+                 出路：改用「存档编辑」—— 直接打开存档把金币/变量改成想要的值，这一步与 NW.js 版本无关。\n"
+            ));
+            return s;
+        }
+        s.push_str(&format!("（检测到该游戏自带的 NW.js 版本：{maj}.{min}.{patch}）\n"));
+    }
+    s.push_str(&format!(
+        "提示：游戏必须带调试参数启动（Game.exe --remote-debugging-port={port}），且是 NW.js 版 RPG Maker MV/MZ。\n\
+         改法：① 用本页的「启动并连接」，由 STool 带参数把游戏拉起来；\
+         ② 若游戏是你自己双击开的，先完全关掉再点「启动并连接」。\n\
+         注：MV 的网页文件在 www\\ 子目录，MZ 直接放在游戏根目录 —— 两种都支持。"
+    ));
+    s
+}
+
+
 /// 一个已连接的 MV/MZ 调试会话。
 pub struct DebugGame {
     ws: WsConn,
@@ -58,7 +119,10 @@ impl DebugGame {
     ///
     /// 失败文案要能区分「端口没开」和「端口开了但读不出响应」：
     /// 后者曾被 `read_to_end` 等 EOF 误报成连接失败（见 `http_get_json`）。
-    pub fn connect(port: u16) -> Result<DebugGame, String> {
+    ///
+    /// `root` 只用于**失败后的归因**：读游戏自带 NW.js 的版本，把「启动姿势不对（< 0.70，可救）」
+    /// 和「上游坏了（≥ 0.70，换什么姿势都没用）」分开说 —— 详见 [`connect_failure_hint`]。
+    pub fn connect(root: &Path, port: u16) -> Result<DebugGame, String> {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut last_err = String::new();
         while Instant::now() < deadline {
@@ -68,13 +132,7 @@ impl DebugGame {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        Err(format!(
-            "连接调试端口 {port} 失败：{last_err}\n\
-             提示：游戏必须带调试参数启动（Game.exe --remote-debugging-port={port}），且是 NW.js 版 RPG Maker MV/MZ。\n\
-             改法：① 用本页的「启动并连接」，由 STool 带参数把游戏拉起来；\
-             ② 若游戏是你自己双击开的，先完全关掉再点「启动并连接」。\n\
-             注：MV 的网页文件在 www\\ 子目录，MZ 直接放在游戏根目录 —— 两种都支持。"
-        ))
+        Err(connect_failure_hint(port, &last_err, nwjs_version(root)))
     }
 
     /// 重新挑选目标页 —— 会话可能钉在了错页面上，或游戏重启后换了页面。
@@ -908,3 +966,86 @@ mod pick_target_tests {
         assert!(err.contains("没发现可附加的页面"), "实际：{err}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// NW.js 版本归因 —— 「连不上到底是我的姿势不对，还是上游坏了」
+//   背景：NW.js ≥ 0.70 起 --remote-debugging-port 完全不开端口（nwjs/nw.js#8191）。
+//   真实固件在 `formats/pe.rs`；这里测的是**归因文案**与**从目录取版本**这两步。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod nwjs_tests {
+    use super::*;
+    use crate::formats::pe::tests::synthetic_pe;
+
+    /// 真固件：0.76.1（受影响的版本）与 0.48.4（正常的版本），都从真实 `nw.dll` 抠出。
+    const FIX_0761: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pe/nwjs_0_76_1_version_resource.bin"));
+    const FIX_0484: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pe/nwjs_0_48_4_version_resource.bin"));
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("stool-nwjs-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 命中 ≥ 0.70：必须直说"上游坏了、换姿势没用"，并指向「存档编辑」这条真出路。
+    #[test]
+    fn hint_blames_upstream_for_076() {
+        let s = connect_failure_hint(7654, "由于目标计算机积极拒绝，无法连接。(os error 10061)", Some((0, 76, 1)));
+        assert!(s.contains("NW.js 0.76.1"), "应点名版本：{s}");
+        assert!(s.contains("nwjs/nw.js#8191"), "应给出上游出处：{s}");
+        assert!(s.contains("存档编辑"), "应给真出路：{s}");
+        // 关键：**不能再**劝用户去点「启动并连接」重试
+        assert!(!s.contains("由 STool 带参数把游戏拉起来"), "≥0.70 不该再劝重试启动：{s}");
+    }
+
+    /// 边界：0.70 本身就算"坏"（上游是「0.70 起」）。
+    #[test]
+    fn hint_treats_threshold_as_inclusive() {
+        let s = connect_failure_hint(7654, "err", Some((0, 70, 0)));
+        assert!(s.contains("nwjs/nw.js#8191"), "{s}");
+        let s = connect_failure_hint(7654, "err", Some((0, 69, 9)));
+        assert!(!s.contains("nwjs/nw.js#8191"), "0.69.9 还属于「可救」那一档：{s}");
+    }
+
+    /// < 0.70：保留原来的"启动姿势"提示（这类游戏 + 正确姿势是真能连上的）。
+    #[test]
+    fn hint_keeps_launch_advice_for_048() {
+        let s = connect_failure_hint(7654, "err", Some((0, 48, 4)));
+        assert!(s.contains("0.48.4"), "{s}");
+        assert!(s.contains("启动并连接"), "{s}");
+        assert!(!s.contains("nwjs/nw.js#8191"), "{s}");
+    }
+
+    /// 认不出引擎：退回原提示，且不该编造版本号。
+    #[test]
+    fn hint_without_version_falls_back() {
+        let s = connect_failure_hint(7654, "err", None);
+        assert!(s.contains("启动并连接"), "{s}");
+        // 原提示里本来就有「NW.js 版 RPG Maker MV/MZ」这句，所以不能简单断言不含 "NW.js"；
+        // 要断言的是：**没有报出具体版本**、也没把锅甩给上游。
+        assert!(!s.contains("检测到该游戏自带的 NW.js 版本"), "认不出就别报版本号：{s}");
+        assert!(!s.contains("nwjs/nw.js#8191"), "{s}");
+    }
+
+    /// 从目录取版本 —— 走完「找文件 → 解析 PE → 取版本资源」整条路（用合成 PE 当真文件）。
+    #[test]
+    fn nwjs_version_reads_pe_in_dir() {
+        let d = temp_dir("ver");
+        std::fs::write(d.join("nw.dll"), synthetic_pe(FIX_0761)).unwrap();
+        assert_eq!(nwjs_version(&d), Some((0, 76, 1)));
+
+        // Game.exe 是兜底来源（nw.dll 不在时）
+        std::fs::remove_file(d.join("nw.dll")).unwrap();
+        std::fs::write(d.join("Game.exe"), synthetic_pe(FIX_0484)).unwrap();
+        assert_eq!(nwjs_version(&d), Some((0, 48, 4)));
+
+        std::fs::remove_file(d.join("Game.exe")).unwrap();
+        assert_eq!(nwjs_version(&d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+

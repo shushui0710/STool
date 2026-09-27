@@ -366,8 +366,10 @@ fn save_info(doc: &SaveDoc) -> SaveInfo {
 fn load_doc(path: &str) -> Result<(SaveDoc, SaveInfo), String> {
     let doc = SaveDoc::load(Path::new(path)).map_err(|e| {
         format!(
-            "打开存档失败：{e}\n改法：确认选的是存档文件本身。目前只支持明文 JSON、\
-             RPG Maker MV（lz-string）、MZ（zlib）；Ruby Marshal 与 Ren'Py persistent 只能只读查看。"
+            "打开存档失败：{e}\n\
+             改法：要选「存档文件本身」，不是 save/ 目录、也不是别的数据文件。\n\
+             能改的：明文 JSON、RPG Maker MV（.rpgsave）、RPG Maker MZ（.rmmzsave）；\
+             只能看不能改的：Ruby Marshal（.rxdata/.rvdata2）、Ren'Py persistent。"
         )
     })?;
     let info = save_info(&doc);
@@ -1481,9 +1483,13 @@ pub struct UnlockPlan {
     pub default_route_label: String,
 }
 
-/// 判断一条路线是否「推荐」：策略表第一条 = 推荐。
-fn route_recommended(routes: &[stool::features::unlock::UnlockRoute], key: &str) -> bool {
-    routes.first().map(|r| r.key() == key).unwrap_or(false)
+/// 判断一条路线是否「推荐」：**跟真正会走的那条保持一致**。
+///
+/// 以前直接取「策略表第一条」。在 `rpgmaker_mv` 把自动化那条排到第一位之前，
+/// 两种算法恰好一致（因为 `BundledSave` 同时是第一条、也是默认）；
+/// 排完之后就会出现「徽章标 A、`自动` 实际走 B」的错位 —— 所以改成对齐 `pick_route`。
+fn route_recommended(default: stool::features::unlock::UnlockRoute, r: &stool::features::unlock::UnlockRoute) -> bool {
+    *r == default
 }
 
 /// 采集「解锁全CG」的只读预览数据。
@@ -1523,6 +1529,10 @@ fn unlock_plan_core(root: &str, engine_id: &str) -> Result<UnlockPlan, String> {
         }
     }
 
+    // 与内核同一函数算默认路线 —— 前端「自动」选项就用它做预览文案。
+    // **必须先算它再建 routes**：`recommended` 徽章要跟真正会走的那条一致。
+    let default = unlock::pick_route(spec, !bundled.is_empty(), None, false);
+
     let routes: Vec<RouteRow> = spec
         .routes
         .iter()
@@ -1531,12 +1541,9 @@ fn unlock_plan_core(root: &str, engine_id: &str) -> Result<UnlockPlan, String> {
             label: r.label().to_string(),
             desc: r.desc().to_string(),
             automated: r.automated(),
-            recommended: route_recommended(spec.routes, r.key()),
+            recommended: route_recommended(default, r),
         })
         .collect();
-
-    // 与内核同一函数算默认路线 —— 前端「自动」选项就用它做预览文案。
-    let default = unlock::pick_route(spec, !bundled.is_empty(), None, false);
 
     Ok(UnlockPlan {
         engine_id: engine_id.to_string(),
@@ -2118,7 +2125,7 @@ pub async fn runtime_mvmz_connect(
                 format!("启动游戏失败：{e}\n改法：手动双击游戏目录里的启动程序，再回来点「只连接」。")
             })?;
         }
-        let game = runtime::DebugGame::connect(MVMZ_PORT)?;
+        let game = runtime::DebugGame::connect(&root_p, MVMZ_PORT)?;
         Ok(game)
     })
     .await?;

@@ -332,6 +332,51 @@ function ok(cond, msg) {
     });
   }
 
+  // ---------- 7. runtime.js：内核返回的多行文案必须保住换行 ----------
+  //
+  // 背景（2026-09-27）：「方式一 · 启动并连接」失败时，内核会返回**三行**归因
+  // （`runtime::connect_failure_hint`：`连接失败…\n原因：…NW.js ≥0.70…\n出路：改用存档编辑`）。
+  // 这段文案原本渲染在 `<div class="small …">` 里，而 `.small` **只设字号**
+  // （`app.css:312`），没有 `white-space: pre-wrap` → 三行挤成一段。
+  // 后果不是「没提示」，而是**用户读不到「换姿势也没用」这句**，于是把同一件事重试到死。
+  //
+  // 判据两条：①必须落在 `.note`（`app.css:585` 带 pre-wrap）而不是 `.small`；
+  //           ②模板里原样的 `\n` 要还在（别顺手被压成空格）。
+  {
+    const { page } = loadPage("pages/runtime.js", "RuntimePage");
+    const base = {
+      mv: { applicable: true, port_open: false, note: "端口没开" },
+      mvState: null,
+      mvBusy: false,
+    };
+    const inst = Object.assign(Object.create(page), {
+      ...base,
+      mvMsg:
+        "连接调试端口 7654 失败：连接 127.0.0.1:7654 失败: 由于目标计算机积极拒绝，无法连接。 (os error 10061)\n" +
+        "原因：这个游戏自带 NW.js 0.76.1，而 NW.js 从 0.70 起就不再打开调试端口（上游缺陷 nwjs/nw.js#8191）。\n" +
+        "出路：改用「存档编辑」。",
+      mvMsgErr: true,
+    });
+    const html = inst.mvCardHtml();
+    check("runtime.js 方式一的失败文案走 .note（保住换行）", () => {
+      ok(/class="note err/.test(html), '失败文案没进 .note.err —— .small 没有 pre-wrap，三行会被挤成一段');
+      ok(!/class="small[^"]*"[^>]*>\s*连接调试端口/.test(html), "失败文案还在 .small 里");
+      ok(html.includes("原因：这个游戏自带 NW.js 0.76.1"), "文案没渲染出来");
+      ok(html.includes("\n原因："), "换行被吞了（应是原样 \\n，不是空格）");
+      ok(html.includes("\n出路："), "「出路」那一行没保住换行");
+    });
+    check("runtime.js 普通状态不标红（xxErr 要成对复位）", () => {
+      const okInst = Object.assign(Object.create(page), {
+        ...base,
+        mvMsg: "已连上，开始改吧。",
+        mvMsgErr: false,
+      });
+      const h2 = okInst.mvCardHtml();
+      ok(!/class="note err/.test(h2), "正常状态被标成了错误红");
+      ok(/class="note info/.test(h2), "正常状态应走 .note.info");
+    });
+  }
+
   // ---------- 输出 ----------
   const bad = results.filter((r) => r[0] === "FAIL");
   const out = [];

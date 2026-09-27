@@ -538,53 +538,63 @@
       return { done: 96, todo: 0, csv: CSV_STATS };
     },
 
-    // ⑦ 解锁全CG：一个「有自带存档、手段齐全」的典型局面，好把三张卡都填满。
+    // ⑦ 解锁全CG：取**真机**局面 —— MZ 游戏（`rpgmaker_mv`）、目录里没有自带全CG存档。
+    // 这正是 2026-09-27 实测那款游戏的情形，默认落到「改存档里的标志位」（改存档里的 switches）。
+    // 文案全部照抄内核（`features/unlock.rs` 的 spec + `engines/others.rs::unlock_switches`），
+    // 内核改了这里必须跟着改，否则截图上的界面和真实内核说的不是一回事。
     unlock_plan: {
       engine_id: "rpgmaker_mv",
       known: true,
-      basis: "data/Actors.json + js/rpg_core.js（或 game.rpgproject）",
-      action: "替换 www/save/ 下 Save*.rpgsave；或改 js 插件里的回廊开关",
-      note: "存档是明文 JSON（.rpgsave），可直接搜 unlock/gallery 字段",
+      basis: "data/Actors.json（在 data/ 或 www/data/）+ js/ 脚本目录",
+      action: "按 data/System.json 的开关名表，把「画廊 / 回想 / アンロック」这类开关在存档里置为开",
+      note: "MV 存档 .rpgsave 是 lz-string、MZ 的 .rmmzsave 是 zlib（磁盘上还多一层 UTF-8 包装）—— 都不是明文 JSON，但本工具能直接读改；改不了时走「改存档」页",
       routes: [
-        { key: "bundled", label: "替换自带全CG存档", desc: "把网盘包附带的《全CG存档》按同名复制进存档目录（不动游戏文件，与引擎无关）", automated: true, recommended: true },
-        { key: "config", label: "改配置文件开关", desc: "改 json / ini / xml 等配置文件里的解锁开关", automated: true, recommended: false },
+        { key: "savefile", label: "改存档里的标志位", desc: "改存档里的位标志 / 开关 / 计数（二进制存档、pickle persistent、MV/MZ 的 switches）", automated: true, recommended: true },
+        { key: "bundled", label: "替换自带全CG存档", desc: "把网盘包附带的《全CG存档》按同名复制进存档目录（不动游戏文件，与引擎无关）", automated: true, recommended: false },
         { key: "ingame", label: "游戏内全开开关", desc: "不少作品在设置 / 隐藏界面留了 toggle，打开即全解锁（需人工找）", automated: false, recommended: false },
       ],
-      bundled: [
-        "全CG存档\\file1.rpgsave",
-        "全CG存档\\file2.rpgsave",
-        "全CG存档\\global.rpgsave",
-      ],
-      bundled_dirs: [GAME + "\\全CG存档"],
-      save_dirs: [GAME + "\\www\\save", GAME + "\\save"],
-      default_route: "bundled",
-      default_route_label: "替换自带全CG存档",
+      bundled: [],
+      bundled_dirs: [],
+      save_dirs: [GAME + "\\save", GAME + "\\www\\save"],
+      default_route: "savefile",
+      default_route_label: "改存档里的标志位",
     },
     unlock_backups: [
-      GAME + "\\www\\save\\file1.rpgsave.stool.bak",
-      GAME + "\\www\\save\\file2.rpgsave.stool.bak",
+      GAME + "\\save\\file0.rmmzsave.stool.bak",
+      GAME + "\\save\\file1.rmmzsave.stool.bak",
+      GAME + "\\save\\file2.rmmzsave.stool.bak",
+      GAME + "\\save\\shared.rmmzsave.stool.bak",
     ],
-    unlock_restore: "已还原 " + GAME + "\\www\\save\\file1.rpgsave（备份保留，可再次还原）",
+    unlock_restore: "已还原 " + GAME + "\\save\\file0.rmmzsave（备份保留，可再次还原）",
     unlock_run: async (a) => {
       if (!a.apply) {
         return {
           success: true,
           message:
-            "【自带全CG存档 · 只读预览】发现 3 个候选文件（未复制）\n" +
-            "  1. 全CG存档\\file1.rpgsave\n  2. 全CG存档\\file2.rpgsave\n" +
-            "  3. 全CG存档\\global.rpgsave\n" +
-            '目标存档目录: ["' + GAME + '\\\\www\\\\save"]\n' +
-            "→ 确认后加 --opt:apply=1 复制；被覆盖的存档会先备份为 .stool.bak。",
-          files_done: 3,
+            "【全 CG 解锁预览 · 只读】（引擎 rpgmaker_mv）\n" +
+            "判据: data/System.json 的 switches 名字表（下标即开关 ID）—— 游戏作者自己起的名字\n" +
+            "将置为「开」的开关: 10 个\n" +
+            "  ·   65  クリア済／ギャラリー解放\n  ·   66  ハード済／７解放\n  ·   67  コンプ済／８解放\n" +
+            "  ·   69  アンロック小悪魔\n  ·   70  アンロック合体\n  ·   71  アンロックリーダー\n" +
+            "  ·   72  アンロック悪魔\n  ·   73  アンロック擬態\n  ·   74  アンロック巨人\n  ·   75  アンロック竜\n" +
+            "\n将写入的存档: 5 个\n" +
+            "  · save\\file0.rmmzsave  [进度存档（下标即开关 ID）]\n" +
+            "  · save\\file1.rmmzsave  [进度存档（下标即开关 ID）]\n" +
+            "  · save\\file2.rmmzsave  [进度存档（下标即开关 ID）]\n" +
+            "  · save\\global.rmmzsave  [能读，但没有开关表 → 跳过]\n" +
+            "  · save\\shared.rmmzsave  [跨存档共享表（id/value 项）]\n" +
+            "\n→ 确认后加 --opt:apply=1 执行；写前每个文件自动备份 .stool.bak（已存在则不覆盖，保住的始终是最初那份原件）。\n" +
+            "→ 名单里混进了不该翻的开关？用 --opt:filter=<名字里的词> 收窄，或改用「改存档」页精确改。",
+          files_done: 10,
           out_dir: "",
           logs: [],
         };
       }
-      // 勾了确认就演一遍「复制 → 进度 → 完成」
-      for (let i = 0; i < 6; i++) {
+      // 勾了确认就演一遍「改存档 → 进度 → 完成」
+      for (let i = 0; i < 5; i++) {
         emit("op:progress", {
-          frac: (i + 1) / 7,
-          msg: GAME + "\\www\\save\\file" + (i + 1) + ".rpgsave",
+          frac: (i + 1) / 6,
+          msg: GAME + "\\save\\file" + i + ".rmmzsave",
         });
         await sleep(60);
       }
@@ -592,12 +602,19 @@
       return {
         success: true,
         message:
-          "✔ 已替换自带全CG存档：复制 3 个文件（失败 0，覆盖前备份 2 个）\n" +
-          '目标目录: ["' + GAME + '\\\\www\\\\save"]\n' +
-          "提示：启动游戏查看画廊/CG 回廊是否全开；若仍缺项，说明该存档不含全部条目。",
-        files_done: 3,
+          "已解锁：写入 4 个存档，共翻开 27 个开关。\n" +
+          "开关名单（名字取自游戏自己的 data/System.json）:\n" +
+          "  ·   65  クリア済／ギャラリー解放\n  ·   66  ハード済／７解放\n  ·   67  コンプ済／８解放\n" +
+          "  ·   69  アンロック小悪魔\n  ·   70  アンロック合体\n  ·   71  アンロックリーダー\n" +
+          "  ·   72  アンロック悪魔\n  ·   73  アンロック擬態\n  ·   74  アンロック巨人\n  ·   75  アンロック竜\n" +
+          "\n→ 进游戏后「读取」上面写过的某个存档（不是「新游戏」），再看画廊 / 回廊是否全开。\n" +
+          "—— 开关存在进度存档里，只有被读取的那份才生效；上面几份都写了，读哪份都行。\n" +
+          "没开的话：\n" +
+          "· 用 --opt:filter= 收窄或换个词再试；\n" +
+          "· 或去「改存档」页逐个确认开关的值。",
+        files_done: 4,
         out_dir: "",
-        logs: ["已备份 " + GAME + "\\www\\save\\file1.rpgsave → …\\file1.rpgsave.stool.bak"],
+        logs: ["save\\file0.rmmzsave：翻开 10 个开关（写前本就开着 6 个）"],
       };
     },
 
@@ -1101,6 +1118,7 @@
   //   ?scan=1   演一遍「选进程 → 首次扫描 → 再次扫描」（命中列表 + 只读提示）
   //   ?diag=1   演一遍保护诊断（回滚判定 / 方案清单）
   //   ?mv=1     方式一直接显示「已连接」的编辑器 + 变量一览
+  //   ?mverr=nwjs  方式一连不上时的归因条（真机文案：NW.js 0.76.1 打不开调试端口）
   if (page === "runtime") {
     // 注意：这些 hook 必须推迟到 mount 之后执行 —— mount 里会把 mvState/scan
     // 重置并根据后端返回值重画（与 unlock 的 ?bak=1 是同一个坑，见 pitfall ⑤）。
@@ -1122,6 +1140,20 @@
       RuntimePage.mvId = "12";
       RuntimePage.mvVal = "9999";
       RuntimePage.mvMsg = "已连上，开始改吧。";
+    }
+    // ?mverr=nwjs  演「方式一连不上」的归因条（NW.js ≥ 0.70 打不开调试端口）。
+    // 文案**逐字取自真机**：`cdp_probe.exe D:/STool/verify/nwprobe076 7654` 的实际输出
+    //   （0.76.1 的 nw.dll 版本资源被读出来，所以这里不能改成别的版本号，否则就是自造证据）。
+    if (q.get("mverr") === "nwjs") {
+      later(async () => {
+        RuntimePage.mvState = null;
+        RuntimePage.mvMsg =
+          "连接调试端口 7654 失败：连接 127.0.0.1:7654 失败: 由于目标计算机积极拒绝，无法连接。 (os error 10061)\n" +
+          "原因：这个游戏自带 NW.js 0.76.1，而 NW.js 从 0.70 起就不再打开调试端口（上游缺陷 nwjs/nw.js#8191；普通版和 SDK 版都一样）。所以本页的「启动并连接」换什么姿势都不会成功，不是你没启动对。\n" +
+          "出路：改用「存档编辑」—— 直接打开存档把金币/变量改成想要的值，这一步与 NW.js 版本无关。";
+        RuntimePage.mvMsgErr = true;
+        await RuntimePage.render();
+      }, 700);
     }
     if (q.get("scan") === "1") {
       later(async () => {

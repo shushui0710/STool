@@ -83,7 +83,9 @@ const RuntimePage = {
     this.scanMsg = "";
     this.diagMsg = "";
     this.regionsMsg = "";
+    this.regionsMsgErr = false;
     this.patchMsg = "";
+    this.patchMsgErr = false;
     this.optsErr = "";
 
     if (!Store.gameRoot) return this.renderNeedGame();
@@ -233,7 +235,7 @@ const RuntimePage = {
              </div>`
           : this.mvEditorHtml(s, run)
       }
-      ${this.mvMsg ? `<div class="small mt3 ${this.mvMsgErr ? "text-danger" : "dim"}">${esc(this.mvMsg)}</div>` : ""}
+      ${this.mvMsg ? `<div class="note ${this.mvMsgErr ? "err" : "info"} mt3">${esc(this.mvMsg)}</div>` : ""}
       `
     );
   },
@@ -544,7 +546,7 @@ const RuntimePage = {
         <span>我已了解写入内存的风险（可能让游戏状态或当前存档异常）；勾一次之后不用再确认</span>
       </label>
 
-      ${this.scanMsg ? `<div class="small mt3 ${this.scanMsgErr ? "text-danger" : "dim"}">${esc(this.scanMsg)}</div>` : ""}
+      ${this.scanMsg ? `<div class="note ${this.scanMsgErr ? "err" : "info"} mt3">${esc(this.scanMsg)}</div>` : ""}
 
       <div class="mt3">
         ${st.first_done ? foldHtml(`命中列表（${st.hits} 条）`, rows + moreRows + trunc, true) : `<div class="small dim2">还没扫描。选好进程、填上游戏里当前的数值，点「首次扫描」。</div>`}
@@ -691,7 +693,7 @@ const RuntimePage = {
                   .join("")}</div>`
             : `<div class="small dim2 mt3">还没有补丁包。</div>`
         }
-        ${this.patchMsg ? `<div class="small mt3 dim">${esc(this.patchMsg)}</div>` : ""}`;
+        ${this.patchMsg ? `<div class="note ${this.patchMsgErr ? "err" : "info"} mt3">${esc(this.patchMsg)}</div>` : ""}`;
 
     return `
       <div class="seg">
@@ -726,8 +728,8 @@ const RuntimePage = {
               ? `<div class="small dim2 mt2">先在上面「② 搜数值改」做一次扫描，地址可以从命中列表点「诊断」自动填过来。</div>`
               : ""
           }
-          ${this.diagMsg ? `<div class="small mt2 ${this.diagMsgErr ? "text-danger" : "dim"}">${esc(this.diagMsg)}</div>` : ""}
-          ${this.regionsMsg ? `<div class="small mt2 dim">${esc(this.regionsMsg)}</div>` : ""}
+          ${this.diagMsg ? `<div class="note ${this.diagMsgErr ? "err" : "info"} mt2">${esc(this.diagMsg)}</div>` : ""}
+          ${this.regionsMsg ? `<div class="note ${this.regionsMsgErr ? "err" : "info"} mt2">${esc(this.regionsMsg)}</div>` : ""}
           ${facts}
           ${regionsBlock}
         </div>
@@ -1169,15 +1171,18 @@ const RuntimePage = {
   async loadRegions() {
     this.regionsBusy = true;
     this.regionsMsg = "正在只读遍历内存区域…";
+    this.regionsMsgErr = false;
     await this.render();
     const r = await Tauri.call("runtime_regions");
     this.regionsBusy = false;
     if (!r.ok) {
       this.regionsMsg = r.err;
+      this.regionsMsgErr = true;
       this.regions = null;
     } else {
       this.regions = r.data;
       this.regionsMsg = "";
+      this.regionsMsgErr = false;
     }
     await this.render();
   },
@@ -1225,6 +1230,7 @@ const RuntimePage = {
   async buildPatch() {
     this.patchBusy = true;
     this.patchMsg = "正在打包…";
+    this.patchMsgErr = false;
     await this.render();
     const r = await Tauri.call("runtime_patch_build", {
       srcDir: this.patchSrc,
@@ -1234,9 +1240,11 @@ const RuntimePage = {
     this.patchBusy = false;
     if (!r.ok) {
       this.patchMsg = r.err;
+      this.patchMsgErr = true;
       toast("打包失败，原因见页面上提示。", "err");
     } else {
       this.patchMsg = r.data;
+      this.patchMsgErr = false;
       toast("补丁包已生成。");
     }
     await this.loadPatchList();
@@ -1248,6 +1256,7 @@ const RuntimePage = {
     const r = await Tauri.call("runtime_patch_remove", { name });
     if (!r.ok) return toast(r.err, "err");
     this.patchMsg = r.data;
+    this.patchMsgErr = false;
     toast(r.data);
     await this.loadPatchList();
     await this.render();

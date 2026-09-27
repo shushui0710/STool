@@ -10,8 +10,9 @@
 > feature 门控」的表述，请按「迁出前的状态」理解；形态以 `docs/ARCHITECTURE.md` §1 为准。
 > 删除后重跑门禁：`stool-rs` **316 passed / 0 failed**（另有 1 项需联网/真注册表的用例忽略）、
 > `stool-tauri` **51 passed / 0 failed**，两侧 clippy 均零警告。
-> （内核测试数随后续重构继续增长；**当前已增至 334 passed**（lib 299）——316 为本次全量审计时的实测值，
-> 319 / 328 / 329 为随后兼容性修复、注入修复与 hook 抽取阶段的值，330 为 asar 内引擎识别（item #5）落地时的值。
+> （内核测试数随后续重构继续增长；**当前已增至 346 passed**（lib 311）——316 为本次全量审计时的实测值，
+> 319 / 328 / 329 为随后兼容性修复、注入修复与 hook 抽取阶段的值，330 为 asar 内引擎识别（item #5）落地时的值，
+> 334 为随后 v0.2.1 发版时的值，346 为新增 NW.js 版本归因（`formats/pe.rs` + `runtime::nwjs_version`）后的值。
 > ——历史上陆续写过的每个数都按当时实测保留，不做回溯改写。）
 
 ---
@@ -177,7 +178,7 @@ msedge.exe --headless=new --disable-gpu --hide-scrollbars --window-size=1180,190
 
 对应截图：`36-save-undo.png`（写回后就地还原条）、`37-save-backups.png`（备份列表）、`38-save-backup-empty.png`（空状态给出路）、`39-extract-repack-done.png`（打包结果卡的还原入口）、`40-extract-backups.png`（进阶折叠里的常驻入口）、`42-save-undo-dark.png`（深色版）。
 
-**新增预览参数**：`?save=undo` / `?save=bak` / `?save=bakempty` / `?repack=done` / `?repack=bak` / `?engine=unknown`。
+**新增预览参数**：`?save=undo` / `?save=bak` / `?save=bakempty` / `?repack=done` / `?repack=bak` / `?engine=unknown` / `?mverr=nwjs`（见 §8 第 17 条）。
 
 ---
 
@@ -283,8 +284,22 @@ $ stool-cli selfcheck verify/tail_test/unencrypted.xp3 -o <临时目录>
 | 13 | `stool-tauri/src/js/pages/text.js` | 去术语：卡片标题/状态/按钮/折叠标题/空状态 | §5.1 |
 | 14 | `stool-tauri/src/js/pages/detect.js` | 去术语（「运行时汉化」→「不改游戏文件汉化」）；认不出引擎时给出 3 张**真能点**的卡（原来指向一个不存在的入口） | §5.1 |
 | 15 | `stool-tauri/preview.html` | 加 `?save=*` / `?repack=*` / `?engine=unknown` 预览参数 + `restore_list` / `restore_one` 假后端；`text_inject` / `text_uninject` 文案对齐内核真实返回 | 让上面几处能被截图验收；假后端要像真后端 |
+| 16 | `stool-tauri/src/js/pages/runtime.js` | 5 处消息渲染从 `<div class="small …">` 改成 `<div class="note err">` / `<div class="note info">`；`regionsMsg` / `patchMsg` 补 `xxErr` 标志（原来错误只显示灰色 `dim`） | **修一条静默失效的提示**：`.small` 只设字号（`app.css:312`），没有 `white-space: pre-wrap`，内核返回的「原因 / 出路」三行被挤成一段 —— 界面看着「有提示」，用户却读不到「换什么姿势都不会成功」，于是把同一件事重试到死。`.note`（`app.css:585`）才带 pre-wrap |
+| 17 | `stool-tauri/preview.html` + `scripts/verify_page_wiring.cjs` | 加 `?mverr=nwjs` 预览参数（文案**逐字**取自真机 `cdp_probe` 对 `verify/nwprobe076` 的输出）；补 2 条桩断言 | 让这条文案能被截图核对；断言先写「会让旧代码挂掉」的那条（必须落在 `.note`、且不在 `.small`），已单独验过它对旧标记 FAIL |
+| 18 | `stool-tauri/preview.html` | `unlock_plan` 对齐内核**真实**策略表（`savefile` > `bundled` > `ingame`、`recommended=savefile`、`basis` / `action` / `note` 用内核原文）；`unlock_run` 的预览与结果文案**逐字**取自 `stool-cli unlock … --opt:apply=1` 的真机输出 | **mock 是内核的抄件，不同步就是「界面说的和内核做的不是一回事」**。旧 mock 的路线顺序、`recommended`、`basis` 全部过期（还停在 `bundled` 优先、`.rpgsave` 是明文 JSON 那版） |
+| 19 | `stool-tauri/src/js/pages/unlock.js` | **零改动** —— 页面是 `plan.routes` 驱动的（`r.key` / `r.label` / `r.desc` / `r.automated` / `r.recommended`），内核换路线/换文案它自己就跟上了 | 反过来验：改内核策略表后页面确实自动显示新路线（截图 15 首行「推荐 改存档里的标志位」） |
 
-新增截图（均已逐张核对内容）：`shots/tauri/33-tools-nogame.png`、`34-mods-empty.png`、`35-tools-nogame-settings.png`、`36-save-undo.png`、`37-save-backups.png`、`38-save-backup-empty.png`、`39-extract-repack-done.png`、`40-extract-backups.png`、`41-text-channel.png`、`42-save-undo-dark.png`、`43-detect-unknown.png`。
+新增截图（均已逐张核对内容）：`shots/tauri/33-tools-nogame.png`、`34-mods-empty.png`、`35-tools-nogame-settings.png`、`36-save-undo.png`、`37-save-backups.png`、`38-save-backup-empty.png`、`39-extract-repack-done.png`、`40-extract-backups.png`、`41-text-channel.png`、`42-save-undo-dark.png`、`43-detect-unknown.png`、`44-runtime-nwjs-blocked.png`（方式一连不上的归因条，三行换行保住）。
+
+**重新生成**（2026-09-27，mock 改成真机局面后）：`15-unlock.png`、`16-unlock-apply.png`、`17-unlock-dark.png`、`18-unlock-run.png` —— 四张全部反映「默认走法 = 改存档里的标志位」。生成命令：
+
+```bash
+msedge --headless=new --disable-gpu --hide-scrollbars --window-size=1180,1500 \
+  --virtual-time-budget=15000 --user-data-dir=D:/STool/shots/.ep_x \
+  --screenshot=D:/STool/shots/tauri/15-unlock.png \
+  "file:///D:/STool/stool-tauri/preview.html#unlock"
+# 16 加 ?apply=1 ；17 加 ?theme=dark ；18 加 ?apply=1&run=1（窗口 1180×1700）
+```
 
 ---
 

@@ -119,6 +119,9 @@ impl SearchScope {
 pub struct SaveDoc {
     pub path: PathBuf,
     pub format: SaveFormat,
+    /// MZ 专用：磁盘上是不是「UTF-8 包装」形态（见 [`mz_unwrap`]）。
+    /// **回写必须照原样式**，否则游戏读不了。其它格式恒为 `false`。
+    pub mz_wrapped: bool,
     pub root: serde_json::Value,
 }
 
@@ -127,6 +130,7 @@ impl SaveDoc {
     pub fn load(path: &Path) -> Result<SaveDoc, String> {
         let raw = fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
         let fmt = detect_format(path, &raw)?;
+        let mut mz_wrapped = false;
         let root = match fmt {
             SaveFormat::JsonPlain => serde_json::from_slice(&raw).map_err(|e| format!("JSON 解析失败: {e}"))?,
             SaveFormat::MvSave => {
@@ -134,8 +138,9 @@ impl SaveDoc {
                 serde_json::from_str(&text).map_err(|e| format!("MV 存档 JSON 解析失败: {e}"))?
             }
             SaveFormat::MzSave => {
-                let text = decode_mz(&raw)?;
-                serde_json::from_str(&text).map_err(|e| format!("MZ 存档 JSON 解析失败: {e}"))?
+                let (v, wrapped) = decode_mz(&raw)?;
+                mz_wrapped = wrapped;
+                v
             }
             SaveFormat::Marshal => {
                 // Ruby Marshal → JSON（只读视图）
@@ -148,7 +153,7 @@ impl SaveDoc {
                 pickle_value_to_json(&v, 0)
             }
         };
-        Ok(SaveDoc { path: path.to_path_buf(), format: fmt, root })
+        Ok(SaveDoc { path: path.to_path_buf(), format: fmt, mz_wrapped, root })
     }
 
     /// 在树中搜索键名或值包含 `query` 的路径（不区分大小写），返回 JSON Pointer 列表。
@@ -219,26 +224,43 @@ impl SaveDoc {
         }
         let bak = crate::settings::backup_path_for(&self.path);
         fs::copy(&self.path, &bak).map_err(|e| format!("备份失败: {e}"))?;
-        let compact = serde_json::to_string(&self.root).map_err(|e| e.to_string())?;
+        let bytes = self.encode()?;
+        fs::write(&self.path, bytes).map_err(|e| e.to_string())?;
+        Ok(format!("已写回 {}（备份 {}）", self.path.display(), bak.display()))
+    }
+
+    /// 把当前 JSON 树按本格式编码成**磁盘字节**（不写盘）。
+    ///
+    /// 与 [`SaveDoc::save`] 分开是为了**备份语义**：`save` 的备份是
+    /// 「上一次写之前」（无条件覆盖，配界面的「还原到改之前」），
+    /// 而解锁路线那种**可反复执行**的批量写要的是「首次写之前的原件」
+    /// （`settings::backup_once`，已存在就不动）。所以那边先自己备份，再用这里拿字节。
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        if !self.format.writable() {
+            return Err("该格式为只读视图，无法编码回写".into());
+        }
         match self.format {
-            SaveFormat::JsonPlain => {
-                let pretty = serde_json::to_string_pretty(&self.root).map_err(|e| e.to_string())?;
-                fs::write(&self.path, pretty).map_err(|e| e.to_string())?;
-            }
+            SaveFormat::JsonPlain => serde_json::to_string_pretty(&self.root)
+                .map(String::into_bytes)
+                .map_err(|e| e.to_string()),
             SaveFormat::MvSave => {
-                let enc = crate::formats::lzstring::compress_to_base64(&compact)
-                    .ok_or("lz-string 压缩失败")?;
-                fs::write(&self.path, enc).map_err(|e| e.to_string())?;
+                let compact = serde_json::to_string(&self.root).map_err(|e| e.to_string())?;
+                crate::formats::lzstring::compress_to_base64(&compact)
+                    .map(String::into_bytes)
+                    .ok_or_else(|| "lz-string 压缩失败".to_string())
             }
             SaveFormat::MzSave => {
                 use std::io::Write;
+                let compact = serde_json::to_string(&self.root).map_err(|e| e.to_string())?;
                 let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
                 z.write_all(compact.as_bytes()).map_err(|e| e.to_string())?;
-                fs::write(&self.path, z.finish().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                let zlib = z.finish().map_err(|e| e.to_string())?;
+                // 照原样式回写：进来的文件是「UTF-8 包装」形态就再包一次（MZ 在 NW.js 下默认如此），
+                // 是裸 zlib 就保持裸 zlib。**包错方向 = 游戏直接读不了这个存档。**
+                Ok(if self.mz_wrapped { mz_wrap(&zlib) } else { zlib })
             }
-            _ => unreachable!(),
+            _ => Err("该格式为只读视图，无法编码回写".into()),
         }
-        Ok(format!("已写回 {}（备份 {}）", self.path.display(), bak.display()))
     }
 }
 
@@ -299,12 +321,228 @@ fn decode_mv(raw: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "lz-string 解码失败（不是有效的 MV 存档）".into())
 }
 
-fn decode_mz(raw: &[u8]) -> Result<String, String> {
+/// RPG Maker MZ 的存档在磁盘上比「裸 zlib」多一层 **UTF-8 包装** ——
+/// 这是 MZ 的**原生行为，不是加密**。原版 `js/rmmz_managers.js` 就长这样：
+///
+/// ```text
+/// pako.deflate(json, { to: "string", level: 1 })   // 「二进制字符串」，1 字符 = 1 字节
+///   ↓ StorageManager.saveToLocalFile → fs.writeFile(path, zip)   // 字符串按 UTF-8 写盘
+/// ```
+///
+/// 于是每个 ≥ 0x80 的字节被展开成 **2 个**字节（`0xAD` → `C2 AD`）。
+/// 游戏自己读写能 round-trip（读回来 utf8 解码仍是同一个二进制字符串），
+/// 但**外部工具直接 `zlib.inflate` 一定失败** —— 报的就是
+/// `corrupt deflate stream` / `invalid distance too far back`。
+///
+/// 实测（2026-09-27，`save/*.rmmzsave` 共 5 个文件）：直接 inflate **5/5 全挂**，
+/// 先过这一层还原后 **5/5 解开**。所以这一步不是可选项。
+///
+/// 返回 `None` = 不是这层包装（含 >U+00FF 的字符，或压根不是合法 UTF-8）。
+pub fn mz_unwrap(raw: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(raw).ok()?;
+    if s.chars().any(|c| c as u32 > 0xFF) {
+        return None;
+    }
+    Some(s.chars().map(|c| c as u8).collect())
+}
+
+/// [`mz_unwrap`] 的逆：把裸 zlib 字节包成 MZ 在磁盘上的样子。
+///
+/// **回写必须照原样式**，否则游戏按 utf8 读回来拿到的是错的字节，
+/// 直接读不了这个存档（比不写还糟）。
+pub fn mz_wrap(zlib: &[u8]) -> Vec<u8> {
+    let mut s = String::with_capacity(zlib.len() * 2);
+    for &b in zlib {
+        s.push(b as char);
+    }
+    s.into_bytes()
+}
+
+/// 把一段字节当 zlib 流解成字符串。
+fn inflate_to_string(data: &[u8]) -> Result<String, String> {
     use std::io::Read;
-    let mut z = flate2::read::ZlibDecoder::new(raw);
+    let mut z = flate2::read::ZlibDecoder::new(data);
     let mut out = String::new();
-    z.read_to_string(&mut out).map_err(|e| format!("zlib 解码失败: {e}"))?;
+    z.read_to_string(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// MZ 解码：返回 (JSON 树, 磁盘上是否为 UTF-8 包装形态)。
+///
+/// **两种形态都试，谁能解成合法 JSON 就用谁** —— 这样"挑选"和"校验"是同一步，
+/// 不存在「蒙对了一个形态、后面 JSON 才炸」的空档。
+/// 顺序上先裸流后包装：少数工具导出的确实是裸 zlib，先命中最省事。
+fn decode_mz(raw: &[u8]) -> Result<(serde_json::Value, bool), String> {
+    let unwrapped = mz_unwrap(raw);
+    let variants: [(&str, bool, &[u8]); 2] = [
+        ("裸 zlib", false, raw),
+        ("MZ 的 UTF-8 包装", true, unwrapped.as_deref().unwrap_or(&[])),
+    ];
+    let mut errs: Vec<String> = Vec::new();
+    for (label, wrapped, data) in variants {
+        if data.is_empty() {
+            continue;
+        }
+        let parsed = inflate_to_string(data).and_then(|t| {
+            serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string())
+        });
+        match parsed {
+            Ok(v) => return Ok((v, wrapped)),
+            Err(e) => errs.push(format!("[{label}] {e}")),
+        }
+    }
+    Err(format!("MZ 存档解码失败（两种形态都试过）—— {}", errs.join("；")))
+}
+
+// ---------------------------------------------------------------------------
+// MZ 的「开关」读写（全 CG 解锁路线要用）
+// ---------------------------------------------------------------------------
+
+/// MZ 存档里「开关」的两种存放形态 —— **实测都真实存在，必须都支持**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MzSwitchLayout {
+    /// 进度存档 `fileN.rmmzsave`：`switches._data` 是**数组**，**下标 = 开关 ID**
+    /// （`_data[0]` 恒为 `null` 占位，与 `Game_Switches` 一一对应）。
+    Indexed,
+    /// 跨存档共享（插件 `DarkPlasma_SharedSwitchVariable` 等写的 `shared.rmmzsave`）：
+    /// `switches` 是 `[{"id":65,"value":true}, …]` —— **只列插件关心的那几个**。
+    Entries,
+}
+
+impl MzSwitchLayout {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MzSwitchLayout::Indexed => "进度存档（下标即开关 ID）",
+            MzSwitchLayout::Entries => "跨存档共享表（id/value 项）",
+        }
+    }
+}
+
+/// 判定这份 MZ 存档的开关表是哪种形态；`None` = 这份存档里没有开关表。
+pub fn mz_switch_layout(root: &serde_json::Value) -> Option<MzSwitchLayout> {
+    let sw = root.get("switches")?;
+    if sw.get("_data").map(|d| d.is_array()).unwrap_or(false) {
+        return Some(MzSwitchLayout::Indexed);
+    }
+    if sw.is_array() {
+        return Some(MzSwitchLayout::Entries);
+    }
+    None
+}
+
+/// 读出这份存档里**已为真**的开关 ID（升序）。
+pub fn mz_switch_ids_on(root: &serde_json::Value, layout: MzSwitchLayout) -> Vec<u32> {
+    let mut out: Vec<u32> = match layout {
+        MzSwitchLayout::Indexed => root
+            .pointer("/switches/_data")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.as_bool() == Some(true))
+                    .map(|(i, _)| i as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        MzSwitchLayout::Entries => root
+            .pointer("/switches")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|e| e.get("value").and_then(|v| v.as_bool()) == Some(true))
+                    .filter_map(|e| e.get("id").and_then(|i| i.as_u64()))
+                    .map(|i| i as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    out.sort_unstable();
+    out
+}
+
+/// 把这份存档里的指定开关置为 `on`，返回**真正发生改动**的 ID。
+///
+/// 语义上刻意保守：
+/// - `Indexed` 形态下标越界时**补 `null` 扩到该下标**（不静默丢弃 —— 丢了就成了"假装解锁成功"）；
+/// - `Entries` 形态**只改已存在的项**，不往里塞游戏没登记过的 id
+///   （那张表是插件按配置过滤的，塞进去也未必生效，不如老老实实报"未覆盖"）。
+pub fn mz_set_switches(
+    root: &mut serde_json::Value,
+    layout: MzSwitchLayout,
+    ids: &[u32],
+    on: bool,
+) -> Vec<u32> {
+    let mut done: Vec<u32> = Vec::new();
+    match layout {
+        MzSwitchLayout::Indexed => {
+            let Some(arr) = root
+                .pointer_mut("/switches/_data")
+                .and_then(|d| d.as_array_mut())
+            else {
+                return done;
+            };
+            for &id in ids {
+                let i = id as usize;
+                if arr.len() <= i {
+                    arr.resize(i + 1, serde_json::Value::Null);
+                }
+                if arr[i].as_bool() != Some(on) {
+                    arr[i] = serde_json::Value::Bool(on);
+                    done.push(id);
+                }
+            }
+        }
+        MzSwitchLayout::Entries => {
+            let Some(arr) = root.pointer_mut("/switches").and_then(|s| s.as_array_mut()) else {
+                return done;
+            };
+            for &id in ids {
+                let hit = arr
+                    .iter_mut()
+                    .find(|e| e.get("id").and_then(|v| v.as_u64()) == Some(id as u64));
+                if let Some(e) = hit {
+                    if e.get("value").and_then(|v| v.as_bool()) != Some(on) {
+                        e["value"] = serde_json::Value::Bool(on);
+                        done.push(id);
+                    }
+                }
+            }
+        }
+    }
+    done
+}
+
+/// 收集一棵游戏目录里所有 MZ 存档文件（`save/`、`www/save/` 下，含递归一层）。
+///
+/// 只认 `.rmmzsave` / `.rmzsave` —— 与 [`detect_format`] 的扩展名规则一致，
+/// 别在这里另立一套。
+pub fn collect_mz_saves(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for rel in ["save", "www/save", "www/saves", "saves"] {
+        let d = root.join(rel);
+        if d.is_dir() {
+            dirs.push(d);
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if ext == "rmmzsave" || ext == "rmzsave" {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn search_node(node: &serde_json::Value, prefix: &str, q: &str, scope: SearchScope, out: &mut Vec<String>, depth: usize) {
@@ -484,6 +722,7 @@ mod tests {
         let mut doc = SaveDoc {
             path: PathBuf::from("x.json"),
             format: SaveFormat::JsonPlain,
+            mz_wrapped: false,
             root: json!({"arr": [1, 2], "obj": {"a": 1}, "scalar": 5}),
         };
         assert!(doc.set("/arr/5", json!(0)).is_err()); // 越界
@@ -493,7 +732,12 @@ mod tests {
         assert_eq!(doc.root.pointer("/obj/a"), Some(&json!(2)));
 
         // 只读格式拒绝修改
-        let mut ro = SaveDoc { path: PathBuf::from("x"), format: SaveFormat::Marshal, root: json!({}) };
+        let mut ro = SaveDoc {
+            path: PathBuf::from("x"),
+            format: SaveFormat::Marshal,
+            mz_wrapped: false,
+            root: json!({}),
+        };
         assert!(ro.set("/a", json!(1)).is_err());
         assert!(ro.save().is_err());
     }
@@ -514,5 +758,134 @@ mod tests {
         fs::write(&pz, z.finish().unwrap()).unwrap();
         assert_eq!(SaveDoc::load(&pz).unwrap().format, SaveFormat::MzSave);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- RPG Maker MZ 的 UTF-8 包装（2026-09-27 修）--------------------------
+    //
+    // 这批用例的固件**全是真机存档**（`tests/fixtures/mz_save/`，来源见其 README）。
+    // 起因：真实 MZ 存档一律读不出来（`corrupt deflate stream`），而当时这里的单测
+    // 用的是**自己造的裸 zlib 流** —— 测试全绿、真机全挂。所以刻意钉死三件事：
+    //   ① 直接 inflate 必须失败（证明「包装」这层真实存在，别当它可选）；
+    //   ② `mz_unwrap` 之后必须解开；
+    //   ③ 改完回写必须**仍是**包装形态（写反了游戏直接读不了这个存档）。
+
+    fn mz_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("mz_save")
+            .join(name)
+    }
+
+    #[test]
+    fn mz_real_save_needs_utf8_unwrap() {
+        for name in ["shared.rmmzsave", "global.rmmzsave"] {
+            let raw = fs::read(mz_fixture(name)).unwrap();
+            // ①直接 inflate 必须失败 —— 就是用户当初看到的那条报错
+            assert!(
+                inflate_to_string(&raw).is_err(),
+                "{name} 居然能直接 inflate？固件被动过了（它必须保持「包装」形态）"
+            );
+            // ②还原后必须能解成合法 JSON
+            let un = mz_unwrap(&raw).unwrap_or_else(|| panic!("{name} 应是 UTF-8 包装形态"));
+            let text = inflate_to_string(&un).unwrap_or_else(|e| panic!("{name} 还原后仍解不开: {e}"));
+            let v: serde_json::Value = serde_json::from_str(&text).expect("应是合法 JSON");
+            assert!(!v.is_null(), "{name} 解出来是 null");
+            // ③再包装回去要逐字节回原样（回写方向不能反）
+            assert_eq!(mz_wrap(&un), raw, "{name} 包装/还原不是无损往返");
+        }
+    }
+
+    #[test]
+    fn mz_load_edit_write_keeps_wrapper() {
+        // 复制到临时目录再改，别动固件本身
+        let dir = std::env::temp_dir().join(format!("stool_mz_wrap_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("shared.rmmzsave");
+        fs::copy(mz_fixture("shared.rmmzsave"), &p).unwrap();
+
+        let mut doc = SaveDoc::load(&p).unwrap();
+        assert_eq!(doc.format, SaveFormat::MzSave);
+        assert!(doc.mz_wrapped, "从真机存档读出来应记为「包装形态」");
+        assert!(doc.format.writable());
+
+        // 改一个真值（shared 的第 0 个开关 = 65 ギャラリー解放）
+        assert_eq!(doc.get("/switches/0/id"), Some(&json!(65)));
+        doc.set("/switches/0/value", json!(false)).unwrap();
+        doc.save().unwrap();
+        assert!(crate::settings::backup_path_for(&p).exists(), "写前必须留备份");
+
+        // 回写后的文件仍须是「包装」形态 —— 游戏是按 utf8 读回来再 inflate 的
+        let back = fs::read(&p).unwrap();
+        assert!(
+            inflate_to_string(&back).is_err(),
+            "回写成了裸 zlib：游戏读不了这个存档（比不写还糟）"
+        );
+        let un = mz_unwrap(&back).expect("回写后应仍是包装形态");
+        let v: serde_json::Value = serde_json::from_str(&inflate_to_string(&un).unwrap()).unwrap();
+        assert_eq!(v.pointer("/switches/0/value"), Some(&json!(false)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mz_clean_zlib_still_reads_and_stays_clean() {
+        // 少数工具导出的确实是裸 zlib：仍要能读，且回写**保持裸流**（别给它套上包装）
+        let dir = std::env::temp_dir().join(format!("stool_mz_clean_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("slot3.rmmzsave");
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(br#"{"switches":{"_data":[null,false,true]}}"#).unwrap();
+        fs::write(&p, z.finish().unwrap()).unwrap();
+
+        let mut doc = SaveDoc::load(&p).unwrap();
+        assert_eq!(doc.format, SaveFormat::MzSave);
+        assert!(!doc.mz_wrapped, "裸流不该被记成包装形态");
+        doc.set("/switches/_data/1", json!(true)).unwrap();
+        doc.save().unwrap();
+
+        let back = fs::read(&p).unwrap();
+        assert!(mz_unwrap(&back).is_none(), "裸流回写被套上包装了");
+        let v: serde_json::Value = serde_json::from_str(&inflate_to_string(&back).unwrap()).unwrap();
+        assert_eq!(v.pointer("/switches/_data/1"), Some(&json!(true)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mz_switch_ops_cover_both_layouts() {
+        // 形态 A：进度存档 —— `switches._data` 是数组、下标即开关 ID
+        let mut progress = json!({
+            "switches": { "_data": [null, false, true, false], "@": "Game_Switches" }
+        });
+        assert_eq!(mz_switch_layout(&progress), Some(MzSwitchLayout::Indexed));
+        assert_eq!(mz_switch_ids_on(&progress, MzSwitchLayout::Indexed), vec![2]);
+
+        // 越界必须**补 null 扩到该下标**，不能静默丢弃 —— 丢了就成了"假装解锁成功"
+        let flipped = mz_set_switches(&mut progress, MzSwitchLayout::Indexed, &[2, 65], true);
+        assert_eq!(flipped, vec![65], "2 本来就是 true，只有 65 才算改动");
+        assert_eq!(progress.pointer("/switches/_data/65"), Some(&json!(true)));
+        assert_eq!(
+            progress.pointer("/switches/_data").unwrap().as_array().unwrap().len(),
+            66,
+            "应扩到下标 65（长度 66）"
+        );
+
+        // 形态 B：跨存档共享表 —— 直接拿真机 `shared.rmmzsave` 验
+        let raw = fs::read(mz_fixture("shared.rmmzsave")).unwrap();
+        let un = mz_unwrap(&raw).unwrap();
+        let mut shared: serde_json::Value =
+            serde_json::from_str(&inflate_to_string(&un).unwrap()).unwrap();
+        assert_eq!(mz_switch_layout(&shared), Some(MzSwitchLayout::Entries));
+        assert!(
+            mz_switch_ids_on(&shared, MzSwitchLayout::Entries).contains(&65),
+            "固件里 65（ギャラリー解放）本就是 true"
+        );
+        let flipped = mz_set_switches(&mut shared, MzSwitchLayout::Entries, &[66, 999], true);
+        assert_eq!(flipped, vec![66], "66 在表里且原为 false → 翻；999 不在表里 → 不塞进去");
+        assert_eq!(shared.pointer("/switches/1/value"), Some(&json!(true)));
     }
 }

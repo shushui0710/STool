@@ -76,7 +76,9 @@ impl UnlockRoute {
             UnlockRoute::InGameSwitch => "游戏内全开开关",
             UnlockRoute::ConfigFlag => "改配置文件开关",
             UnlockRoute::Registry => "改注册表键位",
-            UnlockRoute::SaveFileFlag => "改存档位 / 计数",
+            // 「标志位」比原来的「存档位 / 计数」准确：走这条路的既有二进制位标志 /
+            // 计数（RGSS、pickle），也有**按名字的开关**（MV/MZ 的 `switches`）。
+            UnlockRoute::SaveFileFlag => "改存档里的标志位",
             UnlockRoute::Manual => "人工分析",
         }
     }
@@ -91,7 +93,9 @@ impl UnlockRoute {
             }
             UnlockRoute::ConfigFlag => "改 json / ini / xml 等配置文件里的解锁开关",
             UnlockRoute::Registry => "写注册表键位（如 Unity PlayerPrefs 的 <键>_h<djb2>）",
-            UnlockRoute::SaveFileFlag => "改二进制 / pickle 存档里的位标志或计数",
+            UnlockRoute::SaveFileFlag => {
+                "改存档里的位标志 / 开关 / 计数（二进制存档、pickle persistent、MV/MZ 的 switches）"
+            }
             UnlockRoute::Manual => "无已知自动化手段，需 Cheat Engine / 内存 hook 等人工处理",
         }
     }
@@ -196,11 +200,18 @@ pub static UNLOCK_CATALOG: &[UnlockSpec] = &[
     },
     UnlockSpec {
         engine_id: "rpgmaker_mv",
-        routes: &[R::BundledSave, R::ConfigFlag, R::InGameSwitch],
-        save_dirs: &["www/save", "save", "www/saves", "www"],
-        basis: "data/Actors.json + js/rpg_core.js（或 game.rpgproject）",
-        action: "替换 www/save/ 下 Save*.rpgsave；或改 js 插件里的回廊开关",
-        note: "存档是明文 JSON（.rpgsave），可直接搜 unlock/gallery 字段",
+        // **顺序有讲究**：`pick_route` 在「没发现自带存档」时取 `routes.first()`，
+        // 所以自动化那条必须排第一；真存在自带全CG存档时它仍会优先选 `BundledSave`
+        // （`pick_route` 的第 3 条规则与顺序无关）。
+        // 2026-09-27 之前这里是 `[BundledSave, ConfigFlag, InGameSwitch]` ——
+        // 两条路都是死的：前者要求目录自带存档，后者没有私有实现，
+        // 用户点下去只能看到「『改配置文件开关』手段没有内置自动实现」。
+        routes: &[R::SaveFileFlag, R::BundledSave, R::InGameSwitch],
+        save_dirs: &["save", "www/save", "www/saves", "saves", "www"],
+        basis: "data/Actors.json（在 data/ 或 www/data/）+ js/ 脚本目录",
+        action: "按 data/System.json 的开关名表，把「画廊 / 回想 / アンロック」这类开关在存档里置为开",
+        note: "MV 存档 .rpgsave 是 lz-string、MZ 的 .rmmzsave 是 zlib（磁盘上还多一层 UTF-8 包装）——\
+               都不是明文 JSON，但本工具能直接读改；改不了时走「改存档」页",
     },
     UnlockSpec {
         engine_id: "rpgmaker_rgss",
@@ -1271,6 +1282,27 @@ mod tests {
         assert_eq!(pick_route(unity, false, None, false), UnlockRoute::Registry);
         // restore → 引擎首选
         assert_eq!(pick_route(unity, false, None, true), UnlockRoute::Registry);
+    }
+
+    #[test]
+    fn rpgmaker_mv_defaults_to_the_implemented_route() {
+        // 回归（2026-09-27）：以前是 `[BundledSave, ConfigFlag, InGameSwitch]`。
+        // 目录里没有自带全CG存档时 `pick_route` 取 `routes.first()` = `BundledSave`
+        // → 「未发现自带全CG存档」；用户手动选下一条 `config` → 那条没有私有实现
+        // → 「『改配置文件开关』手段没有内置自动实现」。**两条都是死的**，
+        // 而这游戏的解法是确定的（改存档里的 switches）。
+        let spec = spec_for("rpgmaker_mv").unwrap();
+        assert_eq!(
+            pick_route(spec, false, None, false),
+            UnlockRoute::SaveFileFlag,
+            "没有自带存档时，默认必须落到「改存档里的标志位」这条**有实现**的路上"
+        );
+        // 目录里真有自带全CG存档时，仍要能走 bundled（与顺序无关）
+        assert_eq!(pick_route(spec, true, None, false), UnlockRoute::BundledSave);
+        assert!(
+            spec.routes.contains(&UnlockRoute::BundledSave),
+            "不要把 bundled 从候选里删掉"
+        );
     }
 
     #[test]

@@ -84,6 +84,12 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │                       `stringLiteral`（`{i32 len; i32 dataIndex}`，len 为**精确字节长度**）+
 │                       `stringLiteralData` 池 + `string` 名字堆；**只接受通过校验的输入**
 │                       （magic / 版本 / 三区首尾相接 / 字面量 UTF-8 可解率 ≥90%），否则退回启发式
+│   └── pe.rs           [新增] PE 的 VERSIONINFO 读取（零依赖、只读，只读文件头 + `.rsrc`）：
+│                       DOS→PE→COFF→节表定位 `.rsrc`，再在节内按 **UTF-16LE 找键名**
+│                       （`FileVersion`/`ProductVersion`/`ProductName`）。**只为一件事故意存在**：
+│                       认出游戏自带 NW.js 的版本 —— ≥0.70 上游坏了 `--remote-debugging-port`
+│                       （nwjs/nw.js#8191），「方式一·改数值」在这些游戏上换任何启动姿势都没用；
+│                       真实固件在 `tests/fixtures/pe/`（从真实 `nw.dll` 抠出的 RT_VERSION）
 ├── features/          横向功能
 │   ├── unlock.rs        [新增] 统一解锁抽象：UnlockRoute / UnlockSpec / UNLOCK_CATALOG /
 │   │                    find_save_dirs / find_bundled_saves / pick_route / run
@@ -101,7 +107,9 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │   │                   显示层挂 `Window_Base.drawText/drawTextEx` 与 `Bitmap.prototype.drawText`
 │   ├── translate.rs    机翻（OpenAI 兼容；术语表、断点续翻、`jobs` 批并发 + 429/5xx 指数退避）
 │   ├── tpack.rs        翻译包导出/导入
-│   ├── saves.rs        存档文档模型（多格式解析 + 指针寻址编辑）
+│   ├── saves.rs        存档文档模型（多格式解析 + 指针寻址编辑）；MZ 读写要做
+│   │                   `mz_unwrap` / `mz_wrap`（磁盘上多一层 UTF-8 包装，见 §3.3 注），
+│   │                   并认 `switches` 的两种布局（`MzSwitchLayout`）
 │   ├── mods.rs         MOD 安装/启停/卸载
 │   ├── runtime.rs      运行时修改（内存/脚本层）：MV/MZ 走 CDP 调试端口
 │   │                   （`Game.exe --remote-debugging-port`），自实现极简 HTTP + WebSocket，
@@ -117,6 +125,12 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │   │                      为真的目标**（不许兜底），并留 `DebugGame::retarget()` 让
 │   │                      「刷新 / 写入」自纠 —— 否则会话钉在后台页上，界面永远
 │   │                      「还没进入存档」、点刷新永远没反应（2026-09 实际发生）。
+│   │                   ⑤ **「连不上」先归因再给建议**（2026-09-27）：NW.js **≥ 0.70** 起上游
+│   │                      坏了 `--remote-debugging-port`（nwjs/nw.js#8191，SDK 版同样挂），
+│   │                      换任何启动姿势都不开端口。所以连接失败时读一下游戏自带 NW.js 的版本
+│   │                      （`nwjs_version` → `formats::pe`）：≥0.70 直说"上游坏了、此路不通"
+│   │                      并指向「存档编辑」；<0.70 才给"启动姿势"那套提示。
+│   │                      **别再让用户对着同一件事重试到死。**
 │   ├── xp3patch.rs     [新增] KiriKiri 运行时补丁包（P2-12）：`list` / `next_name` /
 │   │                   `build`（打 patchN.xp3，原封包不动）/ `remove`（只删自己建的）/
 │   │                   `build_changed`（与现有封包逐字节比对，**只打包改动文件** →
@@ -256,9 +270,17 @@ unlock::run(engine_id, ctx, |route| self.unlock_impl(route, ctx))
    │
    ├─ bundled  → 通用实现（复制自带存档进存档目录，覆盖前 backup_once）
    ├─ registry → Unity 私有实现（gallery.rs）
-   ├─ savefile → Ren'Py 私有实现（persistent）
+   ├─ savefile → 引擎私有实现：Ren'Py（pickle `persistent`）、RPG Maker MV/MZ（`data/System.json` 开关名表 + 存档 `switches`，MZ 存档另有一层 UTF-8 包装）
    └─ 其余     → 诚实告知"无内置自动实现 + 怎么做"
 ```
+
+**注 · MZ 存档的 UTF-8 包装（2026-09-27 实测）**：`rmmz_managers.js` 存盘是
+`pako.deflate(json,{to:"string",level:1})` 再 `fs.writeFile(path, zip)` —— 「binary string」
+被按 **UTF-8** 写出，于是每个 ≥ `0x80` 的字节膨胀成 2 字节（`0xAD` → `C2 AD`）。
+游戏自读自写没问题，但**外部 `zlib.inflate` 恒定失败**（`corrupt deflate stream`），
+文件头却仍看着正常（`78 01`）。**这是 MZ 原生行为，不是加密、不是某家游戏特有。**
+读要 `saves.rs::mz_unwrap`、写回要 `mz_wrap`（`SaveDoc.mz_wrapped` 记住进来的形态），
+否则「读得出来、写回去游戏打不开」。细节与量测见 `docs/引擎识别依据与解锁策略.md` §3.1.1。
 
 **两个入口共用同一份策略表**（CLI `stool-cli unlock` / Tauri 解锁页），
 所以「识别依据 / 可用手段 / 默认走法」两处**必须一致** —— 界面自己另判一遍，

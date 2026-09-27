@@ -6,6 +6,7 @@ pub mod il2cpp;
 pub mod lzstring;
 pub mod marshal;
 pub mod nscript;
+pub mod pe;
 pub mod pfs;
 pub mod pickle;
 pub mod pck;

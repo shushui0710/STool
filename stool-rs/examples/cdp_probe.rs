@@ -62,7 +62,7 @@ fn main() {
         std::thread::sleep(Duration::from_secs(wait));
     }
 
-    let mut g = match DebugGame::connect(port) {
+    let mut g = match DebugGame::connect(&root, port) {
         Ok(g) => {
             println!("[4] 连接成功：http /json 与 WebSocket 都通了");
             g

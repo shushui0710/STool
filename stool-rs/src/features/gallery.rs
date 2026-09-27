@@ -1781,7 +1781,7 @@ fn restore_from(ctx: &Ctx, path: &Path) -> OpOutcome {
     );
     if !extra.is_empty() {
         msg.push_str(&format!(
-            "\n注意：以下 {} 个值是备份**之后**新增的，还原不会自动删除（如需彻底回滚请手动删除）：{}",
+            "\n注意：以下 {} 个值是备份「之后」新增的，还原不会自动删除（如需彻底回滚请手动删除）：{}",
             extra.len(),
             extra.join(", ")
         ));
