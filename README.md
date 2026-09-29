@@ -51,7 +51,7 @@
 | NScripter / ONScripter | 老牌视觉小说引擎 | ✔（解密主脚本） | — | — | ✔（台词提取 + Shift-JIS 校验回填，自动备份） | — | 自动尝试多种解密方式，选效果最好的 |
 | HTML / Electron 网页游戏 | 网页技术做的游戏 | ✔ | ✔ | — | — | — | 资源解出来就是普通网页文件，直接改；**打包进 `app.asar` 的 Electron 游戏**也能就地注入汉化（只补丁入口 HTML，其余条目原样） |
 | Wolf RPG Editor（Wolf 引擎） | 日系 RPG | ✔（借助 WolfDec 工具） | — | — | ✔（从 Game.dat 等提取对话） | — | 需要在设置页填写 WolfDec 的路径 |
-| Unity（Mono / IL2CPP 都支持） | 3D / 手游向游戏 | ✔（借助 AssetRipper 工具） | — | — | — | ✔（可一键全 CG 解锁） | 全 CG 解锁**不需要反编译器、不需要 .NET 运行环境**：直接读 `Managed/Assembly-CSharp*.dll`（Mono 版）或 `il2cpp_data/Metadata/global-metadata.dat`（IL2CPP 版）里的字符串，把画廊的 PlayerPrefs 键名写进注册表——**不动游戏文件**，缺省只读预览、写入前自动备份原值、可一键还原。解包仍需在设置页填写 AssetRipper 的路径 |
+| Unity（Mono / IL2CPP 都支持） | 3D / 手游向游戏 | ✔（借助 AssetRipper 工具） | — | — | — | ✔（可一键全 CG 解锁） | 全 CG 解锁**不需要反编译器、不需要 .NET 运行环境**：直接读 `Managed/Assembly-CSharp*.dll`（Mono 版）或 `il2cpp_data/Metadata/global-metadata.dat`（IL2CPP 版）里的字符串，把画廊的 PlayerPrefs 键名写进注册表——**不动游戏文件**，缺省只读预览、写入前自动备份原值、可一键还原。解包仍需在设置页填写 AssetRipper 的路径。前提是**这个作品真的会读注册表**：名字表里连 `PlayerPrefs` 都没有的作品会被**直接拒绝写入**（不再拿一堆二进制碎片冒充解锁） |
 | 识别不出的游戏 | — | 借助 GARbro 工具兜底 | — | — | — | — | 同时给出文件后缀特征提示，方便人工判断 |
 
 ## MTool 式汉化（JSON 注入，不改游戏文件）
@@ -106,6 +106,13 @@
 | RPG Maker XP/VX/Ace（.rxdata 等） | 经典 RPG | 只能看（老格式很难安全回写） |
 | Ren'Py 进度记录（persistent） | 视觉小说 | 只能看（可用"一键全解锁"） |
 | 未知扩展名 | — | 自动嗅探内容，认得出来就处理 |
+| 加密 / 整体压缩过的存档 | Unity、部分商业 SDK | ✘ **不破解他人加密方案**：报错会说清是加密，并给替代路线 |
+
+> 认不出来的存档不会只丢一句"无法识别"：若内容呈密文特征（长度是 16 的倍数、熵接近满值），
+> 会明确告知**这是保护类加密、本工具不破解**，并给能做的（游戏自带导入/导出、先备份、
+> Unity 注册表路线）。已知实例：Unity 游戏 `SexCP-069` 的存档被 `MarsSDK` 的
+> `AESCryptography` 加密，其 PlayerPrefs 里没有任何进度键 —— 两条路都走不通，所以只给提示。
+> 原因与边界见 `docs/ARCHITECTURE.md` §7。
 
 ## 怎么直接看游戏里的资源？（资源预览）
 

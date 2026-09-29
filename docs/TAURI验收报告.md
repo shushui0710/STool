@@ -288,8 +288,23 @@ $ stool-cli selfcheck verify/tail_test/unencrypted.xp3 -o <临时目录>
 | 17 | `stool-tauri/preview.html` + `scripts/verify_page_wiring.cjs` | 加 `?mverr=nwjs` 预览参数（文案**逐字**取自真机 `cdp_probe` 对 `verify/nwprobe076` 的输出）；补 2 条桩断言 | 让这条文案能被截图核对；断言先写「会让旧代码挂掉」的那条（必须落在 `.note`、且不在 `.small`），已单独验过它对旧标记 FAIL |
 | 18 | `stool-tauri/preview.html` | `unlock_plan` 对齐内核**真实**策略表（`savefile` > `bundled` > `ingame`、`recommended=savefile`、`basis` / `action` / `note` 用内核原文）；`unlock_run` 的预览与结果文案**逐字**取自 `stool-cli unlock … --opt:apply=1` 的真机输出 | **mock 是内核的抄件，不同步就是「界面说的和内核做的不是一回事」**。旧 mock 的路线顺序、`recommended`、`basis` 全部过期（还停在 `bundled` 优先、`.rpgsave` 是明文 JSON 那版） |
 | 19 | `stool-tauri/src/js/pages/unlock.js` | **零改动** —— 页面是 `plan.routes` 驱动的（`r.key` / `r.label` / `r.desc` / `r.automated` / `r.recommended`），内核换路线/换文案它自己就跟上了 | 反过来验：改内核策略表后页面确实自动显示新路线（截图 15 首行「推荐 改存档里的标志位」） |
+| 20 | `stool-rs/src/features/saves.rs` + `stool-tauri/src/js/pages/save.js` | 存档认不出来时分档报错：内核加 `looks_encrypted` / `shannon_entropy` / `is_unity_game_near` / `unrecognized_hint`，密文档明确说「**不破解**他人加密方案」（ARCHITECTURE §7）并给三条出路；页面 `loadSave` 失败时不再只弹 toast → 写 `this.err` + 清 `info` + 回选档视图，让多行文案**常驻**（`noteHtml` → `.note` 带 pre-wrap） | 用户报「无法修改存档（`SexCP-069`）」：该存档是 `MarsSDK` 的 `AESCryptography` 加过密的 `BinaryFormatter` —— **不是 bug，是保护类加密**。旧文案只有一句「无法识别的存档格式」+ 一条误导提示（让人去看 PlayerPrefs，而该作 PlayerPrefs 里零进度键）。只 `toast` 的话 8 秒就没了，而那段「原因 + 出路」是要照着做的。顺带修 `gallery.rs` 5 处跨行字符串里的 `**粗体**` 泄露 |
+| 21 | `stool-rs/src/features/gallery.rs` + `stool-rs/src/formats/dotnet.rs`（**壳与前端零改动**） | 新增「注册表路线的存在性闸门」：`dotnet::refers_to_prefs`（名字表里有没有 `PlayerPrefs`）+ `PreciseScan::prefs_ref: Option<bool>` + `prefs_route_absent()`；`apply=1` 且无现存键族时**直接拒绝**，`--opt:force_heuristic=1` 也无效（`--opt:set=` 在闸门之前，仍可按名写）；预览与 `precise_note` 各加一句警告。顺带把 `is_gallery_like` 的关键词命中改成词边界 | 用户报「`异世界情趣用品店` 一键全解锁报成功、实际未解锁」：该作元数据里 `PlayerPrefs` **0** 次（真画廊是 `HCG*`、真进度在 `MarsSDK` 加密的 `SaveData/*.sav`），旧闸门**把「元数据解析成功」当成了「候选可信」**，于是 3000 条二进制碎片写进注册表还报成功（注册表 3017 值 = 2999 条是它写的 + 18 条真引擎键）。见 `docs/引擎识别依据与解锁策略.md` §4.4 |
 
-新增截图（均已逐张核对内容）：`shots/tauri/33-tools-nogame.png`、`34-mods-empty.png`、`35-tools-nogame-settings.png`、`36-save-undo.png`、`37-save-backups.png`、`38-save-backup-empty.png`、`39-extract-repack-done.png`、`40-extract-backups.png`、`41-text-channel.png`、`42-save-undo-dark.png`、`43-detect-unknown.png`、`44-runtime-nwjs-blocked.png`（方式一连不上的归因条，三行换行保住）。
+**第 21 项的证据分两层，别混用**：
+- **行为证据 = 真机 CLI**（不是截图）：`stool-cli unlock <真实游戏> --opt:apply=1` → `EXIT=1` + 八行「拒绝写入 + 三条出路」；
+  再加 `--opt:force_heuristic=1` 仍 `EXIT=1`；`--opt:set=<键名>=1` 走的是闸门**之前**的分支、预览未被拦。
+  执行前后注册表值数均为 **3017**（没动用户任何数据）。
+- **界面证据 = 截图 `45/46-unlock-blocked{,-dark}.png`**：`preview.html` 新增 `?unlock=blocked`，把假后端换成
+  Unity（IL2CPP）+ 默认 `registry` 的局面，`unlock_run` **抛**真机原文（`UNLOCK_BLOCKED_ERR`，逐字抄自上面那条命令的输出）。
+  截图只证明「这段文案在页面上**常驻**、换行没丢、深浅两版都可读」——页面本身**零改动**，
+  它走的是既有的错误常驻渲染路径（`unlock.js:144` 的 `noteHtml(this.err)`，与第 20 项同一条路径、
+  已被 `verify_page_wiring.cjs` 钉过）。**不要**拿这张截图当「拒绝逻辑生效」的证据。
+
+新增截图（均已逐张核对内容）：`shots/tauri/33-tools-nogame.png`、`34-mods-empty.png`、`35-tools-nogame-settings.png`、`36-save-undo.png`、`37-save-backups.png`、`38-save-backup-empty.png`、`39-extract-repack-done.png`、`40-extract-backups.png`、`41-text-channel.png`、`42-save-undo-dark.png`、`43-detect-unknown.png`、`44-runtime-nwjs-blocked.png`（方式一连不上的归因条，三行换行保住）、`19-save-encrypted.png` / `20-save-encrypted-dark.png`（加密存档的报错常驻卡，7 行文案换行全保住）、`45-unlock-blocked.png` / `46-unlock-blocked-dark.png`（注册表路线存在性闸门的拒绝卡，第 21 项；浅色 md5 `c0780e47…` / 深色 `87b8408c…`，两版不同）。
+
+> **深浅两版截图必须各用全新的 profile**（2026-09-27 踩）：`shots/.ep_x` 是 unlock 那批截图用的目录，里面已经存了 `stool.theme=dark`，
+> 于是新截的「浅色版」出来也是深色 —— 两张 PNG 的 **md5 一模一样**。截完务必 `md5sum` 对一下，别只看文件存在。
 
 **重新生成**（2026-09-27，mock 改成真机局面后）：`15-unlock.png`、`16-unlock-apply.png`、`17-unlock-dark.png`、`18-unlock-run.png` —— 四张全部反映「默认走法 = 改存档里的标志位」。生成命令：
 

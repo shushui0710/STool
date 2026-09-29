@@ -9,11 +9,14 @@
      node D:/STool/scripts/verify_page_wiring.cjs
    （PowerShell 里 stdout 抓不到时：... 2>&1 | Out-File <日志> 再读）
 
-   覆盖的回归点（2026-09 修的两个真 bug）：
+   覆盖的回归点（真 bug，全部有真实用户反馈在后面）：
      1. text.js  「打开表格去翻译」必须调 open_file，不能是 shell_open（后者不是命令）
      2. mods.js  选目录后 srcDir 必须是**路径字符串**，不能是 {ok,data} 包装对象
      3. mods.js  预演失败时必须显示「没能预演冲突」，不能显示「✔ 检查过了」
      4. extract.js render() 在某个 id 缺失时不能抛异常（否则后续绑定整块被跳过）
+     5. runtime.js 内核返回的多行文案必须走 .note（.small 没有 pre-wrap，换行会没了）
+     6. save.js  打开失败必须把内核文案落到 this.err 并回到选档视图
+                 —— 只 toast 的话 8 秒就没了，而那段「原因 + 出路」是要照着做的
 --------------------------------------------------------------------------- */
 
 const fs = require("fs");
@@ -374,6 +377,52 @@ function ok(cond, msg) {
       const h2 = okInst.mvCardHtml();
       ok(!/class="note err/.test(h2), "正常状态被标成了错误红");
       ok(/class="note info/.test(h2), "正常状态应走 .note.info");
+    });
+  }
+
+  // ---------- 8. save.js：打开失败必须常驻显示，不能只弹 toast ----------
+  //
+  // 背景（2026-09-27）：用户报「无法修改存档（Unity 游戏）」。内核已能给出多行的
+  // 「原因 + 出路」（`saves.rs::unrecognized_hint`），但页面只 `return toast(r.err,"err")`
+  // —— toast **8 秒就没了**，而那段文案是要照着做的。等于有提示、读不到。
+  //
+  // 判据三条：
+  //   ① 内核文案必须落到 `this.err`（`renderPicker` 用它渲染 `noteHtml` → `.note` 带 pre-wrap）；
+  //   ② 必须**回到选档视图**（`info` 清空 + 重渲染），不能停在旧存档的编辑界面；
+  //   ③ 仍要发一条 err toast（切页/滚走时的即时反馈）。
+  {
+    const { page, toasts, sandbox } = loadPage("pages/save.js", "SavePage");
+    // `loadSave` 的失败分支会调 `refreshChrome()`（ui.js 的全局量）。
+    sandbox.refreshChrome = () => {};
+    // 逐字取自真机：`stool-cli save-edit <游戏>/SaveData/gamesave_01.sav`
+    const KERNEL_MSG =
+      "无法识别的存档格式（.sav）：内容疑似被加密或整体压过（长度是 16 的倍数、熵接近满值）。\n" +
+      "旁边就是一款 Unity 游戏 —— 进度多半就锁在这份文件里，注册表里通常没有。\n" +
+      "本工具不破解他人的加密方案：这类存档只给提示，不尝试解密、也不注入游戏进程。";
+
+    const inst = Object.create(page);
+    inst.info = { format: "上一个存档" }; // 模拟「已打开过别的存档」
+    inst.err = "";
+    let rendered = 0;
+    inst.renderPicker = async () => {
+      rendered++;
+    };
+    sandbox.__reply = async (cmd) =>
+      cmd === "load_save" ? { ok: false, err: KERNEL_MSG } : { ok: true, data: null };
+
+    await inst.loadSave("D:\\g\\SaveData\\gamesave_01.sav");
+
+    check("save.js 打开失败：内核文案落到 this.err（renderPicker 才渲染得出 .note）", () => {
+      ok(inst.err === KERNEL_MSG, `err=${JSON.stringify(inst.err)}`);
+      ok(inst.err.includes("\n"), "多行文案被压平了 —— 用户读不到「不破解」那一行");
+    });
+    check("save.js 打开失败：回到选档视图，不停在旧存档的编辑界面", () => {
+      ok(inst.info === null, "info 没清空 —— 会继续显示上一个存档的编辑界面");
+      ok(rendered === 1, `没重新渲染选档视图（rendered=${rendered}）`);
+    });
+    check("save.js 打开失败：toast 仍发一条 err，且是内核原文", () => {
+      ok(toasts.length === 1 && String(toasts[0][1]) === "err", "没发 err toast");
+      ok(String(toasts[0][0]).includes("疑似被加密"), "toast 里不是内核原文");
     });
   }
 

@@ -109,7 +109,10 @@ stool-rs/src/           内核库 + CLI（无 UI 依赖）
 │   ├── tpack.rs        翻译包导出/导入
 │   ├── saves.rs        存档文档模型（多格式解析 + 指针寻址编辑）；MZ 读写要做
 │   │                   `mz_unwrap` / `mz_wrap`（磁盘上多一层 UTF-8 包装，见 §3.3 注），
-│   │                   并认 `switches` 的两种布局（`MzSwitchLayout`）
+│   │                   并认 `switches` 的两种布局（`MzSwitchLayout`）。
+│   │                   认不出来时由 `unrecognized_hint` 分档给「原因 + 出路」：
+│   │                   密文特征（`looks_encrypted`）→ 说清不破解他人加密方案；
+│   │                   其它 → 通用提示。`is_unity_game_near` 只增强提示语，不改行为。
 │   ├── mods.rs         MOD 安装/启停/卸载
 │   ├── runtime.rs      运行时修改（内存/脚本层）：MV/MZ 走 CDP 调试端口
 │   │                   （`Game.exe --remote-debugging-port`），自实现极简 HTTP + WebSocket，
@@ -661,3 +664,19 @@ Tauri 会去找前端 dev 服务器 —— 结果是**一个静默的白窗口**
   也在写完后立刻恢复原页保护。**识别到在线反作弊（EAC/BattlEye/Vanguard/ACE…）只列风险提示，
   不提供任何绕过**——这条是硬边界，不许扩展成"对抗反作弊"。
 - **不做非法解密**：保护类加密只给明确报错与替代路线（KiriKiri 加密封包会明确报错并指向 GARbro / KrkrExtract）。
+  同一个口径也覆盖**存档**：认不出来的存档若呈「密文特征」，报错必须**分档说清**并给出路
+  （`features/saves.rs::unrecognized_hint` + `looks_encrypted`）。2026-09-27 实例：
+  Unity 游戏 `SexCP-069` 的 `SaveData/gamesave_01.sav` 是 `MarsSDK`（`Packages/com.mars-sdk-1.0.0/`）
+  的 `AESCryptography` 加密的 .NET `BinaryFormatter` —— 键/IV 由调用方传入，
+  属**他人加密方案**，按本条**不做**，只给提示。
+  ⚠️ `looks_encrypted` 只用来**换提示语**，**不是格式判据**，不许拿它决定是否动文件
+  （标定数据与两个故意留的盲区见该函数文档 + `tests/fixtures/unity_encrypted_sav/README.md`）。
+- **也不许用「一堆猜出来的键」冒充解锁**（与上一条同源的口径，2026-09-28）：注册表路线的前提是
+  **这个作品真的会读注册表**。判据 = 名字表里有没有 `PlayerPrefs`（`formats::dotnet::refers_to_prefs`，
+  Mono 的 `#Strings` 堆 / IL2CPP 的 string 区共用）；读到名字表却没有引用 ⇒
+  `gallery::PreciseScan::prefs_route_absent()`，`--opt:apply=1` **直接拒绝**，且
+  `--opt:force_heuristic=1` 也无效（force 的语义是"来源不可靠但照写"，不是"这游戏不读注册表还照写"）。
+  实例：`异世界情趣用品店`（IL2CPP，`PEROCO WORKS/IsekaiSexBoutique`）元数据里 `PlayerPrefs` 0 次，
+  真画廊是 `HCG*`、真进度在 `MarsSDK` 加密的 `SaveData/*.sav` 里 —— 旧版「元数据解析成功即放行」
+  把 3000 条二进制碎片写进注册表还报成功，用户看到的是「实际未解锁」（见
+  `docs/引擎识别依据与解锁策略.md` §4.4）。

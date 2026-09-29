@@ -265,6 +265,13 @@ pub struct PreciseScan {
     pub keys: Vec<String>,
     /// 命中的画廊类型 / 字段名（如 `GalleryManager`、`_wholeNameList`）。
     pub gallery_types: Vec<String>,
+    /// 解析成功的来源里是否出现过 `UnityEngine.PlayerPrefs`。
+    ///
+    /// `None` = **不知道**（没有来源，或来源里一个名字都没读出来）；`Some(true/false)` =
+    /// 读到了名字表，确实有 / 确实没有。三态是必须的：把「没读到名字」当成「没有引用」
+    /// 会造出假的否定证据，进而错误地拒绝一批本来合法的写入。
+    /// 语义见 [`PreciseScan::prefs_route_absent`]。
+    pub prefs_ref: Option<bool>,
 }
 
 impl PreciseScan {
@@ -276,6 +283,22 @@ impl PreciseScan {
     /// 是否来自 IL2CPP（字面量池里框架串较多，报告里要提示收窄）。
     pub fn is_il2cpp(&self) -> bool {
         self.sources.iter().any(|(_, k)| *k == PreciseKind::Il2Cpp)
+    }
+
+    /// 是否有**否定证据**证明「注册表路线对这个作品不存在」。
+    ///
+    /// 判定＝精确来源的名字表**读到了、且其中没有任何 `PlayerPrefs` 引用**（即
+    /// `prefs_ref == Some(false)`）。「没读到来源」不算 —— 那是不知道，不是没有。
+    /// 判据本身在 [`crate::formats::dotnet::refers_to_prefs`]。
+    ///
+    /// 之所以必须单独分出这一档：`usable == true` 原本被当成"候选可信"所以放行写入，
+    /// 但 `usable` 只说明**元数据解析成功**，不说明**这些字面量是 PlayerPrefs 键**。
+    /// 实测 `异世界情趣用品店`（IL2CPP，`PEROCO WORKS/IsekaiSexBoutique`）：元数据解析
+    /// 得很干净（12.1MB，7298 条候选），可是里面连 `Prefs` 子串都是 0 次 —— 游戏代码
+    /// 从不调用 PlayerPrefs，真画廊是 `HCG*`、真进度在第三方 SDK 加密的
+    /// `SaveData/*.sav` 里。结果 3000 条二进制碎片被写进注册表，画廊照旧全锁。
+    pub fn prefs_route_absent(&self) -> bool {
+        self.prefs_ref == Some(false)
     }
 }
 
@@ -349,6 +372,9 @@ pub fn scan_precise(root: &Path) -> PreciseScan {
     let mut out = PreciseScan::default();
     let mut keys: BTreeSet<String> = BTreeSet::new();
     let mut types: BTreeSet<String> = BTreeSet::new();
+    // 名字表读到过没有（决定 `prefs_ref` 是「不知道」还是「确实没有」）。
+    let mut names_seen = false;
+    let mut prefs_ref = false;
 
     // Mono：`Assembly-CSharp*.dll`
     for p in find_assemblies(root) {
@@ -357,6 +383,10 @@ pub fn scan_precise(root: &Path) -> PreciseScan {
                 collect_literals(s.user_strings.iter(), &mut keys);
                 for t in s.gallery_hits() {
                     types.insert(t);
+                }
+                if !s.names.is_empty() {
+                    names_seen = true;
+                    prefs_ref |= dotnet::refers_to_prefs(&s.names);
                 }
                 out.sources.push((p, PreciseKind::Dotnet));
             }
@@ -373,6 +403,10 @@ pub fn scan_precise(root: &Path) -> PreciseScan {
                     for t in s.gallery_hits() {
                         types.insert(t);
                     }
+                    if !s.names.is_empty() {
+                        names_seen = true;
+                        prefs_ref |= dotnet::refers_to_prefs(&s.names);
+                    }
                     out.sources.push((p, PreciseKind::Il2Cpp));
                 }
                 Err(e) => out.failures.push((p, e)),
@@ -382,6 +416,8 @@ pub fn scan_precise(root: &Path) -> PreciseScan {
 
     out.keys = keys.into_iter().collect();
     out.gallery_types = types.into_iter().collect();
+    // 只在**真的读到名字表**时才敢下结论：否则一律「不知道」，绝不造出假的否定证据。
+    out.prefs_ref = names_seen.then_some(prefs_ref);
     out
 }
 
@@ -421,6 +457,12 @@ fn precise_note(scan: &PreciseScan) -> String {
                 "\n已识别画廊类型/字段 {} 个: {preview:?}",
                 scan.gallery_types.len()
             ));
+        }
+        if scan.prefs_route_absent() {
+            s.push_str(
+                "\n⚠ 这个作品的代码里没有任何 PlayerPrefs 引用 —— 注册表路线对它不存在，\
+                 写进去的键不会被任何人读取。",
+            );
         }
         for (p, e) in &scan.failures {
             s.push_str(&format!("\n⚠ 解析失败 {}: {e}", p.display()));
@@ -1256,6 +1298,33 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
         return set_values(ctx, &key, &info, &existing, spec);
     }
 
+    // 路线缺失闸门：这个作品的代码**从不**调用 PlayerPrefs。
+    //
+    // 与下面的「来源不可靠」是两回事：那一档说的是"候选可能不准"，这一档说的是
+    // "注册表这条路根本不存在"—— 游戏不会去读，写多少键都不会被读到。
+    //
+    // 为什么必须单独一条：`scan.usable()`（元数据解析成功）**不等于**这些字面量是
+    // PlayerPrefs 键。真机 `异世界情趣用品店`（IL2CPP，`PEROCO WORKS/IsekaiSexBoutique`）
+    // 元数据解析得很干净，于是旧的闸门直接放行，3000 条二进制碎片进了注册表
+    // （`CG1V` / `Cg3z` / `Cg5f6dAs` / `cG0` / `UnityAsyncExtensions.AsyncGPUReadback` …），
+    // 画廊照旧全锁 —— 用户看到的是「已写入 3000 个」+「实际未解锁」。
+    //
+    // 这一档**不受 `--opt:force_heuristic=1` 影响**：force 的语义是"我知道来源不可靠，
+    // 照样写"，不是"我知道这游戏不读注册表，照样写"。要按名字写某个真键，用
+    // `--opt:set=`（它不猜名字），那条分支在本闸门**之前**已经返回。
+    // `family_prefix.is_some()` 会推翻本档：注册表里已经有可参照的键族，说明这条路
+    // 确实被用过（可能是原生插件写的），那时"代码里没引用"就不再是否定证据。
+    if ctx.opt("apply") == Some("1") && scan.prefs_route_absent() && family_prefix.is_none() {
+        return OpOutcome::fail(format!(
+            "拒绝写入：这个作品不读注册表，PlayerPrefs 路线对它无效。\n{asm_note}\n\
+             → 先找游戏自带的『全开开关』：回想 / 画廊 / CG 回廊 / Debug 菜单（标题界面与设置里通常有）；\n\
+             → 用 `stool unlock-support <游戏目录>` 看有没有『替换自带全CG存档』这条路；\n\
+             → 确认要按名字写某个真键，用 `--opt:set=<键名>=<值>`（它不猜名字，照写）。\n\
+             这类作品的进度/收集状态一般存在它自己的存档里，注册表里没有。\n\
+             （`--opt:force_heuristic=1` 对这种情况无效：不是候选不可靠，是这条路线不存在。）"
+        ));
+    }
+
     // 启发式候选的写入闸门。
     //
     // 「精确来源」（程序集字符串 / IL2CPP 元数据字面量）解析不出来、注册表里也没有
@@ -1273,7 +1342,7 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
         return OpOutcome::fail(format!(
             "拒绝写入：候选来源不可靠（纯启发式，共 {} 条）。\n{asm_note}\n\
              ⚠ 这些候选是从场景/资源二进制里抽取的字符串，无法与画廊建立可靠对应。\
-             直接写入会塞进大量与画廊无关的整数设置项，而且**改完你无法从报告里看出哪些写错了**。\n\
+             直接写入会塞进大量与画廊无关的整数设置项，而且「改完你无法从报告里看出哪些写错了」。\n\
              → 先收窄再看预览：`--opt:filter=<子串>`（例如 --opt:filter=cg）；\n\
              → 若确认候选没问题，加 `--opt:force_heuristic=1` 强制写入（写前自动备份）；\n\
              → 写错了用 `--opt:undo=1 --opt:apply=1` 删除本工具写过的候选键。",
@@ -1336,6 +1405,10 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
                 "\n注意：IL2CPP 元数据的字面量池含大量引擎/框架字符串，候选里可能混入与画廊无关的名字；\
                  建议配合 `--opt:filter=` 收窄（例如 --opt:filter=cg）",
             );
+        }
+        // 预览就要把「这条路不存在」说出来：别让用户先点了 apply 才看到拒绝。
+        if scan.prefs_route_absent() {
+            msg.push_str("\n⚠ 因此上面的候选不是它的画廊键，加 `--opt:apply=1` 会被直接拒绝。");
         }
         if !candidates.is_empty() {
             let sample: Vec<&String> = candidates.iter().take(20).collect();
@@ -1456,9 +1529,9 @@ pub fn unlock(ctx: &Ctx) -> OpOutcome {
     // 不会读），与游戏真实解锁状态无关。必须说清楚，别让人误以为已经成功。
     if written == 0 && !candidates.is_empty() && unlocked == candidates.len() {
         msg.push_str(&format!(
-            "\n⚠ 本次一条都没写：全部 {} 个候选在注册表里**都已经等于 1**。\
+            "\n⚠ 本次一条都没写：全部 {} 个候选在注册表里「都已经等于 1」。\
              这通常说明这批候选是上一次运行本工具时被整批写进去的（候选名多为二进制里捞出的碎片，\
-             并非游戏真实键），**不代表游戏已经解锁**。\
+             并非游戏真实键），「不代表游戏已经解锁」。\
              建议用 `--opt:undo=1`（先只读预览，确认后加 `--opt:apply=1`）把本工具写过的候选键删干净，再重新评估。",
             unlocked
         ));
@@ -1527,7 +1600,7 @@ fn undo_from(
         );
         if keep.is_empty() {
             msg.push_str(
-                "\n⚠ 未指定 `--opt:keep=` —— 候选里可能混有游戏**真实**按键（例如 GameState_ / Skill_ 族），\
+                "\n⚠ 未指定 `--opt:keep=` —— 候选里可能混有游戏「真实」按键（例如 GameState_ / Skill_ 族），\
                  删掉会重置这些设置。强烈建议先给出游戏自己的键族前缀，例如：\
                  --opt:keep=GameState_,Skill_,FollowerData_,AutoObject_,AutoDevice,Milestone_,Volume_,unity,Screenmanager,Unity",
             );
@@ -1726,7 +1799,7 @@ fn set_values(
         msg.push_str("\n⚠ 有写入项读回校验未通过——请用 `--opt:restore=<备份文件>` 回滚后反馈");
     }
     msg.push_str(
-        "\n提示：注册表是游戏**启动时**才读的，改完请先完全退出游戏再启动；\
+        "\n提示：注册表是游戏「启动时」才读的，改完请先完全退出游戏再启动；\
          若游戏有「设置」界面，进去看一眼再退出，让它把状态写回。",
     );
     OpOutcome {
@@ -2224,6 +2297,69 @@ mod tests {
         assert!(scan.failures.is_empty());
         assert!(precise_note(&scan).contains("已退回场景启发式"));
         assert!(collect_candidate_keys(&dir).contains(&"Orc Kabe".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 「注册表路线是否存在」这条否定证据：三态，且**只有读到名字表**才敢下结论。
+    ///
+    /// 真机样本是 `异世界情趣用品店`：IL2CPP 元数据里连 `Prefs` 子串都没有，于是
+    /// `prefs_route_absent() == true`，写入必须被拒绝，而不是写 3000 条碎片还报成功。
+    #[test]
+    fn prefs_route_absence_is_three_state() {
+        let dir = std::env::temp_dir().join(format!("stool_gal_noprefs_{}", std::process::id()));
+        let meta = dir.join("G_Data").join("il2cpp_data").join("Metadata");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&meta).unwrap();
+
+        // ① 读到名字表、确实没有 PlayerPrefs → 否定证据成立，且预览就要说清「此路不通」
+        let md = crate::formats::il2cpp::tests_support::build_metadata(
+            29,
+            &["CG1", "HCGConfig"],
+            &["mscorlib", "MarsSDK", "HCGConfig", "SetHCGRecord"],
+        );
+        fs::write(meta.join("global-metadata.dat"), &md).unwrap();
+        let scan = scan_precise(&dir);
+        assert!(scan.usable(), "{scan:?}");
+        assert_eq!(scan.prefs_ref, Some(false), "{scan:?}");
+        assert!(scan.prefs_route_absent(), "{scan:?}");
+        assert!(precise_note(&scan).contains("没有任何 PlayerPrefs 引用"), "{scan:?}");
+
+        // ② 名字表里有 PlayerPrefs → 否定证据不成立，照旧放行
+        let md2 = crate::formats::il2cpp::tests_support::build_metadata(
+            29,
+            &["cg_flag_01"],
+            &["mscorlib", "PlayerPrefs", "SetInt"],
+        );
+        fs::write(meta.join("global-metadata.dat"), &md2).unwrap();
+        let scan2 = scan_precise(&dir);
+        assert_eq!(scan2.prefs_ref, Some(true), "{scan2:?}");
+        assert!(!scan2.prefs_route_absent(), "{scan2:?}");
+        assert!(!precise_note(&scan2).contains("没有任何 PlayerPrefs 引用"), "{scan2:?}");
+        let _ = fs::remove_dir_all(&dir);
+
+        // ③ 完全没有来源 → 不知道，绝不许当成「没有」（否则会误拒合法写入）
+        let none = PreciseScan::default();
+        assert_eq!(none.prefs_ref, None);
+        assert!(!none.usable());
+        assert!(!none.prefs_route_absent(), "没读到来源不算否定证据");
+    }
+
+    /// Mono 程序集同样要给出否定证据（`#Strings` 堆里没有 PlayerPrefs）。
+    #[test]
+    fn dotnet_source_reports_prefs_absence_too() {
+        let dir = std::env::temp_dir().join(format!("stool_gal_mono_np_{}", std::process::id()));
+        let managed = dir.join("G_Data").join("Managed");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&managed).unwrap();
+        let dll = crate::formats::dotnet::tests_support::minimal_pe(
+            &["HCGConfig", "GameSaveData"],
+            &["HCG_unlock"],
+        );
+        fs::write(managed.join("Assembly-CSharp.dll"), &dll).unwrap();
+        let scan = scan_precise(&dir);
+        assert!(scan.usable(), "{scan:?}");
+        assert_eq!(scan.prefs_ref, Some(false), "{scan:?}");
+        assert!(scan.prefs_route_absent(), "{scan:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

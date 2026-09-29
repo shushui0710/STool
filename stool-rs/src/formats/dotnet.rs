@@ -58,6 +58,52 @@ pub(crate) fn gallery_hits_of(names: &[String]) -> Vec<String> {
     out
 }
 
+/// 关键词命中：拉丁关键词必须落在「词边界」上，不能是别的单词的后半截。
+///
+/// 朴素的 `contains` 会被 `Collection` 后缀骗到：`.NET` 的
+/// `System.Text.RegularExpressions.CaptureCollection` / `ExpireCollection` 里藏着
+/// `...reCollection`，于是命中 `recollection`。实测某 IL2CPP 作品（`异世界情趣用品店`）
+/// 的报告里因此冒出「已识别画廊类型/字段 2 个: ["CaptureCollection","ExpireCollection"]」
+/// —— 和一个真正的画廊毫无关系，却让报告看起来"确实找到了东西"。
+///
+/// 判据：命中处的**前一个字节**不能是小写 ASCII 字母。于是
+/// `RecollectionScene`（大写边界）、`_recollection`（下划线边界）、`my-recollection`
+/// 都通过，而 `capturecollection`（前面是小写 `e`）落选。
+/// CJK 关键词（`回想`）不受影响：前一字节是 UTF-8 续接字节（≥ 0x80），不是小写字母。
+///
+/// 逐字节扫描而不是 `str::find`：`low` 可能含 CJK，按 `find` 给的下标做 `+1`
+/// 会落到多字节字符中间，切片直接 panic。这里只做等长字节比较，永不越界。
+fn keyword_hits(low: &str, kw: &str) -> bool {
+    let (lb, kb) = (low.as_bytes(), kw.as_bytes());
+    if kb.is_empty() || lb.len() < kb.len() {
+        return false;
+    }
+    let last = lb.len() - kb.len();
+    for i in 0..=last {
+        if &lb[i..i + kb.len()] == kb && !(i > 0 && lb[i - 1].is_ascii_lowercase()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 一组名字里是否出现过 `UnityEngine.PlayerPrefs`。
+///
+/// `PlayerPrefs` 是 Unity 的**托管** API：只要作品代码真的读写过 PlayerPrefs 注册表，
+/// 这个类型名就必然留在元数据里（Mono 的 `#Strings` 堆 / IL2CPP 的 string 区，两者
+/// 用的都是 [`parse_strings_heap`]）。反过来，**没有**它就说明整个程序集都不碰
+/// PlayerPrefs —— Unity 的托管链接器会把未被引用的类型整块裁掉，所以这是
+/// 「没被引用」，不是「没扫到」。
+///
+/// 用途见 `features::gallery`：这条是**否定证据**，用来判定「注册表路线对这个作品
+/// 在原理上就不可能生效」，从而拒绝把一堆二进制碎片写进注册表冒充解锁。
+///
+/// 注意 `unity.player_session_count` / `Screenmanager *` 这些键是 `UnityPlayer.dll`
+/// 里的**原生**代码写的，不经过 IL2CPP，所以它们的出现不代表本判据失灵。
+pub(crate) fn refers_to_prefs(names: &[String]) -> bool {
+    names.iter().any(|n| n == "PlayerPrefs" || n.ends_with(".PlayerPrefs"))
+}
+
 /// 单个名字是否"像全 CG 画廊"的标识。
 ///
 /// 判据保守，避免把 `CgColor`、`Camera` 这类常见名当命中。
@@ -84,7 +130,7 @@ pub(crate) fn is_gallery_like(name: &str) -> bool {
         // Unity 画廊组件里最常见的字段名（`_wholeNameList` / `wholeNameList`）
         "wholename",
     ] {
-        if low.contains(kw) {
+        if keyword_hits(&low, kw) {
             return true;
         }
     }
@@ -443,6 +489,10 @@ mod tests {
                 "albumView",
                 "CG01",
                 "Name",
+                // .NET 正则类：`...reCollection` 曾被 `recollection` 关键词误命中，
+                // 实测在真机报告里冒充成「已识别画廊类型」。见 `keyword_hits`。
+                "CaptureCollection",
+                "ExpireCollection",
             ],
             &[],
         );
@@ -455,7 +505,57 @@ mod tests {
         for bad in ["CgColor", "CgProgram", "CgShader", "Camera", "Name"] {
             assert!(!hits.iter().any(|h| h == bad), "不该误报 {bad}: {hits:?}");
         }
+        // `Collection` 后缀不该被当成 `recollection`
+        for bad in ["CaptureCollection", "ExpireCollection"] {
+            assert!(!hits.iter().any(|h| h == bad), "不该误报 {bad}: {hits:?}");
+        }
         assert!(got.has_gallery_type());
+    }
+
+    /// 关键词边界判据：词首命中通过，词尾命中落选；CJK 关键词不受大小写边界影响。
+    #[test]
+    fn gallery_keyword_needs_word_boundary() {
+        for ok in [
+            "RecollectionScene",
+            "_recollection",
+            "my_recollection",
+            "GalleryManager",
+            "albumView",
+            "回想モード",
+        ] {
+            assert!(is_gallery_like(ok), "应命中 {ok}");
+        }
+        for bad in [
+            "CaptureCollection",
+            "ExpireCollection",
+            "capturecollection",
+            "CgColor",
+            "Camera",
+        ] {
+            assert!(!is_gallery_like(bad), "不该命中 {bad}");
+        }
+    }
+
+    /// `refers_to_prefs`：只认 `PlayerPrefs` 类型名本身（含带命名空间的情形）。
+    #[test]
+    fn prefs_reference_detection() {
+        let yes = [
+            vec!["PlayerPrefs".to_string(), "SetInt".to_string()],
+            vec!["UnityEngine.PlayerPrefs".to_string()],
+        ];
+        for names in yes {
+            assert!(refers_to_prefs(&names), "应判定为引用了 PlayerPrefs: {names:?}");
+        }
+        let no = [
+            // 真机 `异世界情趣用品店`：12.1MB 元数据里连 `Prefs` 子串都没有
+            vec!["MarsSDK".to_string(), "HCGConfig".to_string(), "SetHCGRecord".to_string()],
+            // 名字里带 "Prefs" 但不是那个类型（防宽匹配）
+            vec!["PrefsHelper".to_string(), "MyPrefs".to_string()],
+            vec![],
+        ];
+        for names in no {
+            assert!(!refers_to_prefs(&names), "不该判定为引用: {names:?}");
+        }
     }
 
     #[test]

@@ -186,7 +186,18 @@ const SavePage = {
 
   async loadSave(path) {
     const r = await Tauri.call("load_save", { path });
-    if (!r.ok) return toast(r.err, "err");
+    if (!r.ok) {
+      // 打开失败**不能只弹 toast** —— 它 8 秒就没了，而内核给的是
+      // 「为什么打不开 + 还能做什么」，是要照着做的。所以退回选档视图，
+      // 让这条常驻在页面上（`renderPicker` 渲染 `this.err`，见下方 seg）。
+      // `locs` / `files` / `curLoc` 保持原样：用户多半想接着试列表里的另一个文件。
+      this.info = null;
+      this.err = r.err;
+      refreshChrome();
+      await this.renderPicker();
+      return toast(r.err, "err");
+    }
+    this.err = "";
     this.info = r.data;
     this.rows = [];
     this.selected = null;

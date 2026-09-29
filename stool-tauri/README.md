@@ -110,7 +110,11 @@ cargo test
 #   可选：#extract 直接停在某页；?theme=dark 看深色；?autorun=1 自动跑一次看进度条
 #   看素材专有：?kind=image|audio|text 预选类型；?pick=N 预选第几个文件
 #   翻译文字专有：?fold=1 展开表格预览；?mtl=1 展开机翻设置
-#   解锁全CG专有：?apply=1 勾上「确认写入」；?bak=1 展开备份列表；?run=1 直接跑一次
+#   解锁全CG专有：?apply=1 勾上「确认写入」；?bak=1 展开备份列表；?run=1 直接跑一次；
+#                ?unlock=blocked 演「注册表路线的存在性闸门拒绝写入」——把假后端换成
+#                Unity（IL2CPP）+ 默认 registry 的局面，拒绝文案逐字取自
+#                `stool-cli unlock "D:/baidudownload/异世界情趣用品店" --opt:apply=1`
+#                （该作元数据里 `PlayerPrefs` 命中 0 次 ⇒ 这条路在原理上不存在）
 #   游戏里改数值专有：?mv=1 方式一显示「已连接」编辑器；?scan=1 演一遍搜数值（命中列表）；
 #                     ?diag=1 演一遍回滚诊断（含方案清单）；?procs=1 展开进程列表；
 #                     ?mverr=nwjs 演「方式一连不上」的归因条（NW.js ≥0.70 打不开调试端口，
@@ -121,7 +125,10 @@ cargo test
 #   工具箱专有：?tools=settings|help 切到设置/帮助分区（默认诊断）；
 #              ?check=bad 演一遍「体检有问题」；?check=selfcheck 演封包自检；?diag=1 演「已导出诊断包」
 #   改存档专有：?save=undo 演「刚写回一次」（就地还原条）；?save=bak 展开备份列表；
-#              ?save=bakempty 同上但目录里没有备份（验空状态给出路）
+#              ?save=bakempty 同上但目录里没有备份（验空状态给出路）；
+#              ?save=enc 演「打开失败」——存档被第三方加密（文案逐字取自
+#              `stool-cli save-edit <SexCP-069>/SaveData/gamesave_01.sav`），
+#              验「原因 + 出路」是否常驻在选档视图上、而不是只闪一下 toast
 #   取出素材专有：?repack=done 跑一遍「重新打包」（看结果卡里的还原入口）；
 #                ?repack=bak 只展开进阶里的备份列表
 #   选游戏专有：?engine=unknown 演「认不出引擎」——验这一页给出的出路是否真能点
@@ -151,7 +158,9 @@ msedge.exe --headless=new --disable-gpu --hide-scrollbars --window-size=1180,900
 
 > ① `--screenshot` 必须**绝对路径** —— 给相对路径会报「拒绝访问 (0x5)」，而 Edge 退出码仍是 0，不看文件根本发现不了；
 > ② `--user-data-dir` 指向**项目内固定目录**，别用 `mktemp -d` 造的临时目录（headless 会起不来、静默不写文件）；
-> ③ 深浅两版**各用一份干净 profile** —— 主题存在 `localStorage` 里，共用 profile 会让「深色版」截得和亮色**一模一样（MD5 都相同）**；
+> ③ 深浅两版**各用一份干净 profile** —— 主题存在 `localStorage` 里，共用会让「深色版」截得和亮色**一模一样（MD5 都相同）**。
+>    ⚠️「干净」是指**没用过**的目录名，不是「以前建过」就行：`shots/.ep_x` 被 unlock 那批截图写进过 `stool.theme=dark`，
+>    拿它截「浅色版」出来仍是深色 —— 2026-09-27 就是这么中招的。**截完一定 `md5sum` 对一下**，别只看文件存在；
 > ④ URL **必须带 `#page`**，否则截出来是默认页、和上一张完全相同；
 > ⑤ `--virtual-time-budget` 给到 **12000** —— 太小的话异步 hook 还没跑完就截，只会截到空态。
 

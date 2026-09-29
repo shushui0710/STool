@@ -343,6 +343,37 @@
     "[20:26:58] ✔ 回填完成，原文件已备份为 data.xp3.stool.bak",
   ];
 
+  // 「这款游戏的存档打不开」用的文案 —— **逐字**取自真机，不许手打（手打就是
+  // 拿自己构造的 mock 当证据，判不出来还给人虚假把握）：
+  //   cd D:/STool/stool-rs
+  //   ./target/release/stool-cli.exe save-edit "<SexCP-069>/SaveData/gamesave_01.sav"
+  // 场景见文件末尾的预览 hook（`?save=enc`）。
+  const SAVE_LOAD_ERR =
+    "无法识别的存档格式（.sav）：内容疑似被加密或整体压过（长度是 16 的倍数、熵接近满值）。\n" +
+    "旁边就是一款 Unity 游戏 —— 进度多半就锁在这份文件里，注册表里通常没有。\n" +
+    "本工具不破解他人的加密方案：这类存档只给提示，不尝试解密、也不注入游戏进程。\n" +
+    "可以做的：\n" +
+    "· 游戏若自带「导入 / 导出存档」或调试菜单，走它自己的出口（唯一不改格式的路）；\n" +
+    "· 若是 Unity 游戏，先试「全CG解锁」页的注册表路线（部分作品把 CG / 进度放在 PlayerPrefs）；\n" +
+    "· 改之前自己再留一份原文件 —— 本工具写文件前也会自动备份成 .stool.bak。";
+
+  // 「注册表路线的存在性闸门」拒绝写入时的原文。**逐字**取自真机：
+  //   cd D:/STool/stool-rs
+  //   ./target/release/stool-cli.exe unlock "D:/baidudownload/异世界情趣用品店" --opt:apply=1
+  // （退出码 1）。该作是 Unity IL2CPP，元数据 12.1MB 里 `PlayerPrefs` 命中 0 次，
+  // 真画廊是 `HCG*`、真进度在第三方 SDK 加密的 SaveData/*.sav 里 —— 所以注册表路线
+  // 在原理上就不存在。背景见 docs/引擎识别依据与解锁策略.md §4.4。
+  // 场景见文件末尾的预览 hook（`?unlock=blocked`）。
+  const UNLOCK_BLOCKED_ERR =
+    "拒绝写入：这个作品不读注册表，PlayerPrefs 路线对它无效。\n" +
+    "精确字符串来源: 1 个（global-metadata.dat(IL2CPP 元数据)）→ 候选 7298 条\n" +
+    "⚠ 这个作品的代码里没有任何 PlayerPrefs 引用 —— 注册表路线对它不存在，写进去的键不会被任何人读取。\n" +
+    "→ 先找游戏自带的『全开开关』：回想 / 画廊 / CG 回廊 / Debug 菜单（标题界面与设置里通常有）；\n" +
+    "→ 用 `stool unlock-support <游戏目录>` 看有没有『替换自带全CG存档』这条路；\n" +
+    "→ 确认要按名字写某个真键，用 `--opt:set=<键名>=<值>`（它不猜名字，照写）。\n" +
+    "这类作品的进度/收集状态一般存在它自己的存档里，注册表里没有。\n" +
+    "（`--opt:force_heuristic=1` 对这种情况无效：不是候选不可靠，是这条路线不存在。）";
+
   const MOCK = {
     app_info: { name: "STool", version: "预览", core_version: "假数据" },    log_line: null,
     // 预览时直接给一个游戏，省得每次先点一遍「选游戏」（真实运行下这两个是环境变量钩子）
@@ -438,11 +469,19 @@
       { name: "file2.rpgsave", path: GAME + "\\save\\file2.rpgsave", size: "19.8 KB", age: "1 天前" },
       { name: "global.rpgsave", path: GAME + "\\save\\global.rpgsave", size: "2.1 KB", age: "1 天前" },
     ],
-    load_save: {
-      path: GAME + "\\save\\file1.rpgsave",
-      format: "RPG Maker MV 存档（lz-string）",
-      writable: true,
-      top_fields: 8,
+    // 正常返回「打开成功」。`?save=enc` 时改成**抛异常** —— `Tauri.call` 只在
+    // invoke 抛错时才产出 `{ok:false, err}`（见 bridge.js），返回 `{ok:false}`
+    // 是没用的（会被当成 data）。
+    load_save: () => {
+      if (new URLSearchParams(location.search).get("save") === "enc") {
+        throw SAVE_LOAD_ERR;
+      }
+      return {
+        path: GAME + "\\save\\file1.rpgsave",
+        format: "RPG Maker MV 存档（lz-string）",
+        writable: true,
+        top_fields: 8,
+      };
     },
     pick_and_load_save: null,
     search_save: (a) => {
@@ -567,6 +606,9 @@
     ],
     unlock_restore: "已还原 " + GAME + "\\save\\file0.rmmzsave（备份保留，可再次还原）",
     unlock_run: async (a) => {
+      // `?unlock=blocked`：演「注册表路线的存在性闸门」拒绝写入（真机文案见 UNLOCK_BLOCKED_ERR）。
+      // 抛错是唯一能产出 `{ok:false, err}` 的方式（见 bridge.js），返回 `{ok:false}` 会被当成 data。
+      if (window.__MOCK_UNLOCK_BLOCKED__) throw UNLOCK_BLOCKED_ERR;
       if (!a.apply) {
         return {
           success: true,
@@ -918,6 +960,11 @@
   };
   window.__MOCK_MODS__ = { state: MODS, conflicts: CONFLICT_ROWS };
   window.__MOCK_TOOLS__ = { settings: TOOLS, health: "ok", log: LOG_LINES };
+  // 只暴露**计划对象本身**（hook 要就地改它的 routes / engine_id 等字段）。
+  // `unlock_run` 的替换走 `window.__MOCK_UNLOCK_BLOCKED__` 标志 —— 因为
+  // `MOCK.unlock_run` 已被 `window.__TAURI__.core.invoke` 按 cmd 名现取，
+  // 换掉副本不会影响实际调用。
+  window.__MOCK_UNLOCK__ = { plan: MOCK.unlock_plan };
 
   window.__TAURI__ = {
     core: {
@@ -1028,6 +1075,75 @@
   //   ?run=1        直接跑一次写入（看进度条与结果卡）
   if (page === "unlock") {
     if (q.get("apply") === "1") UnlockPage.apply = true;
+    // ?unlock=blocked  演「注册表路线的存在性闸门」拒绝写入：把计划换成 Unity（IL2CPP）
+    //                  局面 + 默认走 registry，并让 unlock_run 抛真机原文。
+    //                  GAME / OUT 拿不到（坑⑩），只能经 window.__MOCK_DETECT__.root 取根目录。
+    if (q.get("unlock") === "blocked") {
+      const ROOT = window.__MOCK_DETECT__.root;
+      // 顶部「当前游戏」也要跟着换成 Unity，否则截图自相矛盾（卡片写 MV、计划写 Unity）。
+      // `__MOCK_DETECT__` 与 `Store.detect` 是同一个对象，就地改字段即生效（render 时重读）。
+      const d = window.__MOCK_DETECT__;
+      d.engine_id = "unity";
+      d.engine_name = "Unity (IL2CPP)";
+      d.score = 88;
+      d.level = "high";
+      d.confidence = "高置信";
+      d.summary = "Unity 游戏（IL2CPP）";
+      d.verdict = "没问题，这个游戏 STool 能处理。下面是可以直接做的事。";
+      d.evidence = [
+        "找到 UnityPlayer.dll（Unity 运行时）",
+        "找到 <游戏>_Data/（Unity 数据目录）",
+        "找到 GameAssembly.dll + il2cpp_data/Metadata/global-metadata.dat（IL2CPP）",
+      ];
+      d.capabilities = [
+        { id: "extract", label: "资源解包" },
+        { id: "save", label: "存档编辑" },
+        { id: "unlock", label: "解锁辅助" },
+      ];
+      d.alternatives = [];
+      const p = window.__MOCK_UNLOCK__.plan;
+      p.engine_id = "unity";
+      p.known = true;
+      p.basis = "UnityPlayer.dll + <游戏>_Data/app.info（Mono / IL2CPP 通用）";
+      p.action = "写 PlayerPrefs 注册表 HKCU\\Software\\<company>\\<product> 的 <键>_h<djb2>=1";
+      p.note = "不动游戏文件、无完整性校验风险；很多作品自带 Gallery Open 开关更彻底";
+      p.routes = [
+        {
+          key: "registry",
+          label: "改注册表键位",
+          desc: "写注册表键位（如 Unity PlayerPrefs 的 <键>_h<djb2>）",
+          automated: true,
+          recommended: true,
+        },
+        {
+          key: "bundled",
+          label: "替换自带全CG存档",
+          desc: "把网盘包附带的《全CG存档》按同名复制进存档目录（不动游戏文件，与引擎无关）",
+          automated: true,
+          recommended: false,
+        },
+        {
+          key: "ingame",
+          label: "游戏内全开开关",
+          desc: "不少作品在设置 / 隐藏界面留了 toggle，打开即全解锁（需人工找）",
+          automated: false,
+          recommended: false,
+        },
+      ];
+      p.save_dirs = [ROOT + "\\SaveData"];
+      p.bundled = [];
+      p.bundled_dirs = [];
+      p.default_route = "registry";
+      p.default_route_label = "改注册表键位";
+      window.__MOCK_UNLOCK_BLOCKED__ = true;
+      UnlockPage.apply = true;
+      // 让「跑一次」自己发生，好把拒绝文案截到（点按钮后就是这个结果）。
+      setTimeout(() => {
+        try {
+          UnlockPage.run();
+        } catch (_) {}
+      }, 120);
+    }
     // showBackups 必须在 mount() 之后设 —— mount 会把它重置为 false（每次进页面重采）。
     if (q.get("bak") === "1") {
       const orig = UnlockPage.mount.bind(UnlockPage);
@@ -1062,12 +1178,23 @@
   //   ?save=undo     演「刚写回一次」—— 写回卡片下面出现就地还原条
   //   ?save=bak      展开「备份与还原」并列出备份
   //   ?save=bakempty 同上，但目录里没有备份（验空状态给出路）
+  //   ?save=enc      演「打开失败」—— 存档被第三方加密（真机文案见 SAVE_LOAD_ERR），
+  //                  验「原因 + 出路」是否常驻在选档视图上、而不是只闪一下 toast
   //
   // 注意 GAME / OUT 都是上面那个脚本块里的 IIFE 局部变量，这里拿不到（坑⑩），
   // 只能经 window 上的假检测结果取根目录。
   if (page === "save") {
     const mode = q.get("save");
-    if (mode) {
+    if (mode === "enc") {
+      // 打开失败：内核那段「原因 + 出路」必须**常驻在页面上**，不能只弹一个
+      // 8 秒就没了的 toast（这段文案是要照着做的）。
+      // 先 openLoc 把文件列表填出来，再点开其中一个 —— 与真实操作顺序一致。
+      const ROOT = window.__MOCK_DETECT__.root;
+      later(async () => {
+        await SavePage.openLoc(ROOT + "\\save");
+        await SavePage.loadSave(ROOT + "\\save\\file1.rpgsave");
+      }, 700);
+    } else if (mode) {
       const ROOT = window.__MOCK_DETECT__.root;
       later(async () => {
         await SavePage.loadSave(ROOT + "\\save\\file1.rpgsave");

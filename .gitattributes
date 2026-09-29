@@ -8,3 +8,6 @@
 *.rmmzsave binary
 *.rmzsave  binary
 *.rpgsave  binary
+# 密文固件同理，而且更必然：加密数据里**一定**含 0x0A（1 - (255/256)^4096 ≈ 1）。
+# 见 `tests/fixtures/unity_encrypted_sav/README.md`。
+*.sav      binary

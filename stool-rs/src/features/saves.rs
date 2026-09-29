@@ -296,10 +296,122 @@ fn detect_format(path: &Path, raw: &[u8]) -> Result<SaveFormat, String> {
     if raw.first() == Some(&0x04) {
         return Ok(SaveFormat::Marshal);
     }
-    Err(format!(
-        "无法识别的存档格式（.{}）。\n提示：Flash .sol 请用 JPEGS Free（JPEXS）；注册表存档请用 regedit；Unity 可先解包看 PlayerPrefs。",
-        ext
-    ))
+    Err(unrecognized_hint(path, raw, &ext))
+}
+
+/// 认不出来时给「原因 + 出路」，而不是一句干巴巴的报错。
+///
+/// 分两档，因为**对策完全不同**：
+///
+/// - **疑似加密 / 整体压缩**：说清本工具**不破解他人加密方案**
+///   （`docs/ARCHITECTURE.md` §7），只给能做的（游戏自带导入导出、备份、
+///   Unity 注册表路线）。不要在这里给出任何"我可以试着解一下"的暗示。
+/// - 其它未知格式：给通用提示。
+///
+/// 起因（2026-09-27）：用户报「无法修改存档 <Unity 游戏>」，查实是
+/// `MarsSDK` 的 `AESCryptography` 把存档包住了 —— 这不是 bug，是**保护类加密**。
+/// 旧文案只有一句「无法识别的存档格式（.sav）」+ 一条误导性提示
+/// （建议去看 PlayerPrefs，而该作的 PlayerPrefs 里一个进度键都没有）。
+fn unrecognized_hint(path: &Path, raw: &[u8], ext: &str) -> String {
+    let what = if ext.is_empty() { "无扩展名".to_string() } else { format!(".{ext}") };
+    if looks_encrypted(raw) {
+        let unity = if is_unity_game_near(path) {
+            "旁边就是一款 Unity 游戏 —— 进度多半就锁在这份文件里，注册表里通常没有。\n"
+        } else {
+            ""
+        };
+        return format!(
+            "无法识别的存档格式（{what}）：内容疑似被加密或整体压过（长度是 16 的倍数、熵接近满值）。\n\
+             {unity}本工具不破解他人的加密方案：这类存档只给提示，不尝试解密、也不注入游戏进程。\n\
+             可以做的：\n\
+             · 游戏若自带「导入 / 导出存档」或调试菜单，走它自己的出口（唯一不改格式的路）；\n\
+             · 若是 Unity 游戏，先试「全CG解锁」页的注册表路线（部分作品把 CG / 进度放在 PlayerPrefs）；\n\
+             · 改之前自己再留一份原文件 —— 本工具写文件前也会自动备份成 .stool.bak。"
+        );
+    }
+    format!(
+        "无法识别的存档格式（{what}）。\n\
+         提示：Flash .sol 用 JPEXS Free；注册表存档用 regedit；若是 Unity 游戏，\
+         先看「全CG解锁」页的注册表路线。"
+    )
+}
+
+/// 「疑似被加密或整体压缩」的**保守**粗判：长度是 16 的倍数 + 熵接近满值。
+///
+/// ⚠️ 用途**只有一个**：换一条更准确的提示语。它**不是格式判据**，绝不能
+/// 拿它去决定「要不要动手改这个文件」—— 真正的写入口径仍由 `SaveFormat` 决定。
+///
+/// 实测标定（2026-09-27，见 `tests/fixtures/unity_encrypted_sav/`）：
+///
+/// | 样本 | 长度 | 前 4096 熵 |
+/// |---|---|---|
+/// | Unity 加密存档（真机） | 117200 | 7.955 |
+/// | 同上，截前 1024 | 1024 | 7.831 |
+/// | 真随机（`os.urandom`） | 4096 | 7.952 |
+/// | MZ 存档 `shared.rmmzsave` | 147 | 5.467 |
+/// | `System.json` | 9823 | 5.409 |
+/// | `README.md` | 44316 | 6.371 |
+///
+/// 所以 `7.5` 这个阈值两头都有 ~1.1 bit 的余量。**故意留的两个盲区**（宁可漏判）：
+///
+/// - **小于 1024 字节的文件不判**：`system.sav`(192 B) 与
+///   `settings.conf`(144 B) 其实同样是密文，但小样本的熵估计天然偏低
+///   （实测只有 6.85 / 6.75），要收进来就得把阈值降到 6.5 —— 那时
+///   `README.md`(6.371) 只差 0.13 就误判了。不值当。
+/// - **长度不是 16 的倍数就不判**：真加密（PKCS7 填充）必然是 16 的倍数；
+///   这条能挡掉一批「高熵但其实是压缩」的误判。代价是流密码 / 无填充的
+///   方案认不出（那也只是退回通用提示，不会出错）。
+fn looks_encrypted(raw: &[u8]) -> bool {
+    // 最小长度：1024 字节时随机数据实测熵 7.831，离 7.5 有 0.33 的余量；
+    // 再短（如 256 B 的 ~7.28）就会掉到阈值以下、判不准。
+    const ENCRYPT_MIN_LEN: usize = 1024;
+    // 只看开头这一段：密文的熵不需要整个文件来证明，而大存档读全量是浪费。
+    const WINDOW: usize = 4096;
+    // 阈值：见上方标定表。
+    const ENTROPY_LINE: f64 = 7.5;
+
+    // 长度不是 16 的倍数 → 不判（真加密有 PKCS7 填充，长度必然是 16 的倍数）。
+    // 用 `is_multiple_of` 而不是 `% 16 == 0`：clippy 的 `manual_is_multiple_of`
+    // 在 `-D warnings` 下会直接失败（2026-09-27 踩）。
+    if raw.len() < ENCRYPT_MIN_LEN || !raw.len().is_multiple_of(16) {
+        return false;
+    }
+    shannon_entropy(&raw[..raw.len().min(WINDOW)]) > ENTROPY_LINE
+}
+
+/// 香农熵（bits/byte，0..=8）。8.0 附近 ≈ 加密或已压缩。
+fn shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut hist = [0usize; 256];
+    for &b in data {
+        hist[b as usize] += 1;
+    }
+    let n = data.len() as f64;
+    let mut ent = 0.0f64;
+    for &c in hist.iter() {
+        if c > 0 {
+            let p = c as f64 / n;
+            ent -= p * p.log2();
+        }
+    }
+    ent
+}
+
+/// 存档附近是不是 Unity 游戏：往上找 `UnityPlayer.dll` 或 `*_Data` 目录。
+///
+/// 复用 [`super::gallery::find_data_dir`]（`_Data` 目录的唯一判据就是它，
+/// 别再写第二份）。纯粹是**提示语增强**：任何 IO 失败都当作「不是」，
+/// **绝不**因为这个判断改变行为。
+fn is_unity_game_near(path: &Path) -> bool {
+    /// 只往上找 3 层：`<root>/SaveData/x.sav` 是 2 层，`<root>/a/b/x.sav` 也够。
+    /// 存档在 `AppData\LocalLow\<公司>\<产品>\` 时找不到，这是已知的漏判。
+    const UP: usize = 3;
+    path.ancestors()
+        .skip(1)
+        .take(UP)
+        .any(|dir| dir.join("UnityPlayer.dll").is_file() || super::gallery::find_data_dir(dir).is_some())
 }
 
 fn trim_bom(raw: &[u8]) -> &[u8] {
@@ -887,5 +999,132 @@ mod tests {
         let flipped = mz_set_switches(&mut shared, MzSwitchLayout::Entries, &[66, 999], true);
         assert_eq!(flipped, vec![66], "66 在表里且原为 false → 翻；999 不在表里 → 不塞进去");
         assert_eq!(shared.pointer("/switches/1/value"), Some(&json!(true)));
+    }
+
+    // ---- 认不出来的存档：报错必须「分档 + 有出路」（2026-09-27 加）----------
+    //
+    // 起因：用户报「无法修改存档（Unity 游戏）」，查实是第三方 SDK 的 AES 把
+    // 存档包住了 —— 不是 bug，是保护类加密。旧文案只有一句「无法识别的存档格式」
+    // 加一条误导性提示（让去看 PlayerPrefs，而该作 PlayerPrefs 里一个进度键都没有）。
+    //
+    // 固件是**真机存档**的前 4096 字节（来源 / sha256 见其 README）。
+    // 这批用例钉死三件事：
+    //   ① 高熵密文要认出来，并**明说不破解**（ARCHITECTURE §7）；
+    //   ② 小文件（<1024 B）与长度不合规的宁可退回通用提示，也不许瞎定性；
+    //   ③ Unity 上下文只从路径推、且只影响提示语，不改变任何行为。
+
+    /// 固件路径的**唯一**取法（改名就只改这里）。
+    fn enc_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("unity_encrypted_sav")
+            .join("gamesave_01_head4096.sav")
+    }
+
+    fn enc_fixture() -> Vec<u8> {
+        fs::read(enc_fixture_path()).unwrap()
+    }
+
+    /// 每个用例一个干净的临时目录（同名先清掉，避免上一轮残留影响断言）。
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("stool_saves_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 断言加载**必须失败**并返回内核文案。
+    ///
+    /// `SaveDoc` 没实现 `Debug`，用不了 `unwrap_err()`；而且成功时也不该把
+    /// 整棵 JSON 树打到测试输出里 —— 这两个理由都指向这个助手，别改回 `unwrap_err`。
+    fn load_err(p: &Path) -> String {
+        match SaveDoc::load(p) {
+            Ok(_) => panic!("{} 不该被识别成功", p.display()),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn looks_encrypted_only_fires_where_it_should() {
+        let real = enc_fixture();
+        assert!(looks_encrypted(&real), "真机密文必须判为疑似加密（熵 7.955）");
+        assert!(looks_encrypted(&real[..1024]), "1024 字节窗口仍判得出（熵 7.831）");
+        assert!(!looks_encrypted(&real[..512]), "低于 1024 字节不判（小样本熵估不准）");
+        assert!(!looks_encrypted(&real[..4095]), "长度不是 16 的倍数不判");
+        assert!(!looks_encrypted(&vec![0u8; 4096]), "全 0：长度合规但熵为 0");
+
+        // 明文对照：长度凑成 16 的倍数的 JSON 也不能误判（熵 ~4.5）
+        let mut plain = Vec::new();
+        while plain.len() < 4096 {
+            plain.extend_from_slice(b"{\"gold\":1000,\"name\":\"alice\"}  ");
+        }
+        plain.truncate(4096);
+        assert!(!looks_encrypted(&plain), "明文 JSON 绝不能判成密文");
+    }
+
+    #[test]
+    fn encrypted_save_says_so_and_that_we_wont_crack_it() {
+        let dir = tmp_dir("enc_hint");
+        let p = dir.join("gamesave_01.sav");
+        fs::write(&p, enc_fixture()).unwrap();
+
+        let err = load_err(&p);
+        assert!(err.contains("疑似被加密"), "要说清是加密，而不是泛泛的『无法识别』：{err}");
+        assert!(err.contains("不破解"), "必须写明不破解他人加密方案（ARCHITECTURE §7）：{err}");
+        assert!(err.contains(".stool.bak"), "要给「先备份」这条真能做的出路：{err}");
+        assert!(!err.contains("JPEXS"), "走了加密那一档就不该再给 Flash 提示：{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unity_context_is_read_from_the_path_only() {
+        let dir = tmp_dir("enc_unity");
+        // 独特措辞：通用提示里也含「Unity」二字，不能拿它当判据。
+        let marker = "旁边就是一款 Unity 游戏";
+
+        // 正向：`<game>/SaveData/x.sav` + 兄弟目录 `<game>/<game>_Data`（Unity 的目录特征）
+        let game = dir.join("FakeGame");
+        fs::create_dir_all(game.join("FakeGame_Data")).unwrap();
+        let sd = game.join("SaveData");
+        fs::create_dir_all(&sd).unwrap();
+        let p = sd.join("gamesave_01.sav");
+        fs::write(&p, enc_fixture()).unwrap();
+        let err = load_err(&p);
+        assert!(err.contains(marker), "存档就在 Unity 游戏目录里，应当点名：{err}");
+
+        // 反向对照：同样的字节换个位置就不许点名。
+        // 刻意埋深两层 —— `is_unity_game_near` 只往上找 3 层，这样它的候选
+        // 目录全在我们自己的临时目录内，断言不会被 %TEMP% 里别人的 `*_Data` 干扰。
+        let plain = dir.join("NoGame").join("deep");
+        fs::create_dir_all(&plain).unwrap();
+        let q = plain.join("gamesave_01.sav");
+        fs::write(&q, enc_fixture()).unwrap();
+        let err2 = load_err(&q);
+        assert!(!err2.contains(marker), "没有 Unity 特征就不许乱点名：{err2}");
+        assert!(err2.contains("疑似被加密"), "但加密判定本身不能跟着丢：{err2}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn small_or_unaligned_ciphertext_falls_back_to_generic_hint() {
+        let dir = tmp_dir("enc_small");
+        let real = enc_fixture();
+
+        // 小加密文件：真机上 `system.sav`(192 B) / `settings.conf`(144 B) 正是这种形态。
+        // 熵估不准 → 宁可退回通用提示，也不许瞎定性。
+        let ps = dir.join("system.sav");
+        fs::write(&ps, &real[..512]).unwrap();
+        let err = load_err(&ps);
+        assert!(err.contains("JPEXS"), "小文件应走通用提示：{err}");
+        assert!(!err.contains("疑似被加密"), "小文件不许被定性成加密：{err}");
+
+        // 高熵、但长度不是 16 的倍数（PKCS7 之后不可能出现这种长度）
+        let pu = dir.join("odd.sav");
+        fs::write(&pu, &real[..4095]).unwrap();
+        let err = load_err(&pu);
+        assert!(err.contains("JPEXS"), "长度不合规应走通用提示：{err}");
+        assert!(!err.contains("疑似被加密"), "长度不合规不许被定性成加密：{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
